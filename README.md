@@ -1,4 +1,4 @@
-# Discord Bot
+# CalmBot
 
 A feature-rich Discord bot with server management capabilities, including AMP (Application Management Panel) integration for Minecraft server control, auto-send functionality, modpack management, and role management.
 
