@@ -95,6 +95,71 @@ https://discord.com/oauth2/authorize?client_id=REPLACE_WITH_CLIENT_ID&permission
 - cc-ampapi (for AMP integration)
 - AMP (Application Management Panel) server for Minecraft management features
 
+## 🧪 Testing
+
+### Running Tests
+```bash
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# Run all tests
+pytest
+
+# Run with coverage
+pytest --cov=src
+
+# Run specific test file
+pytest tests/test_permissions.py
+```
+
+### Test Coverage
+- Unit tests for core utilities
+- Service layer testing
+- Permission system validation
+- Storage functionality
+- Input validation
+
+# 📁 Project Structure
+
+```
+src/
+├── core/           # Core functionality (storage, permissions)
+├── cogs/           # Discord command handlers
+├── services/       # Business logic
+├── models/         # Data structures
+└── utils/          # Utility functions
+
+tests/
+├── test_services/  # Service layer tests
+├── test_cogs/      # Command handler tests
+└── conftest.py     # Test configuration
+```
+
+## 🔧 Development
+
+### Code Quality
+```bash
+# Format code
+black src/ tests/
+
+# Lint code
+flake8 src/ tests/
+
+# Type checking
+mypy src/
+```
+
+### Adding Features
+1. Create data models in `src/models/`
+2. Implement business logic in `src/services/`
+3. Add command handlers in `src/cogs/`
+4. Write tests in `tests/`
+
+
+
+
 ## License
 
 This project is provided as-is for educational and personal use.
+
+
