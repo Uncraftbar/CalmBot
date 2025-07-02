@@ -134,7 +134,7 @@ class ModpackService:
         # Delete category
         try:
             await category.delete(reason="Modpack deletion")
-            deletion_log.appendf"✅ Deleted category **{category.name}**")
+            deletion_log.append(f"✅ Deleted category **{category.name}**")
         except Exception as e:
             deletion_log.append(f"❌ Failed to delete category: {str(e)}")
             success = False
