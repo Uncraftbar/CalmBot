@@ -1,40 +1,49 @@
+#!/usr/bin/env python3
+"""
+Main entry point for the Discord bot.
+"""
+
+import asyncio
 import discord
 from discord.ext import commands
-from discord import app_commands
-import os
-from cogs.utils import load_json, save_json
-import importlib.util
+from pathlib import Path
+import sys
+
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from core.bot import MainBot
+from core.storage import StorageManager
+
+# Import config - you'll need to create this file
+try:
+    import config
+    GUILD_IDS = config.GUILD_IDS
+    BOT_TOKEN = config.BOT_TOKEN
+except ImportError:
+    print("Please create config.py with your bot settings!")
+    print("Required variables: GUILD_IDS, BOT_TOKEN, AMP_API_URL, AMP_USER, AMP_PASS")
+    sys.exit(1)
 
 
-config_file = "config.py"
+async def main():
+    """Main function to run the bot."""
+    # Initialize storage
+    storage = StorageManager()
+    
+    # Create bot instance
+    bot = MainBot(guild_ids=GUILD_IDS, storage=storage)
+    
+    # Run the bot
+    try:
+        await bot.start(BOT_TOKEN)
+    except KeyboardInterrupt:
+        print("\nShutting down bot...")
+        await bot.close()
 
-spec = importlib.util.spec_from_file_location("config", config_file)
-config = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(config)
-GUILD_IDS = config.GUILD_IDS
-BOT_TOKEN = config.BOT_TOKEN
-
-class MainBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.reactions = True
-        intents.members = True
-        intents.message_content = True  # Enable message content intent for keyword triggers
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        await self.load_extension("cogs.roles_board")
-        await self.load_extension("cogs.modpack")
-        await self.load_extension("cogs.autosend")
-        await self.load_extension("cogs.amp")
-        for guild_id in GUILD_IDS:
-            guild_obj = discord.Object(id=guild_id)
-            self.tree.copy_global_to(guild=guild_obj)
-            await self.tree.sync(guild=guild_obj)
-
-    async def on_ready(self):
-        print(f"?? Logged in as {self.user}")
 
 if __name__ == "__main__":
-    bot = MainBot()
-    bot.run(BOT_TOKEN)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBot stopped.")
