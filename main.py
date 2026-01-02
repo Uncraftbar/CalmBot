@@ -23,11 +23,15 @@ class MainBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.load_extension("cogs.roles_board")
-        await self.load_extension("cogs.modpack")
-        await self.load_extension("cogs.autosend")
-        await self.load_extension("cogs.amp")
-        await self.load_extension("cogs.embed_builder")
+        for filename in os.listdir("./cogs"):
+            if filename.endswith(".py") and filename != "utils.py":
+                cog_name = f"cogs.{filename[:-3]}"
+                try:
+                    await self.load_extension(cog_name)
+                    print(f"Loaded extension: {cog_name}")
+                except Exception as e:
+                    print(f"Failed to load extension {cog_name}: {e}")
+
         for guild_id in GUILD_IDS:
             guild_obj = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild_obj)
