@@ -5,6 +5,83 @@ from discord import app_commands
 
 REACTION_ROLES_FILE = "reaction_roles.json"
 
+class SyncRolesView(discord.ui.View):
+    def __init__(self, bot, roles_board_data, invalid_roles):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.roles_board_data = roles_board_data
+        self.invalid_roles = invalid_roles
+        
+        # Max select options is 25. If more, we might need a different approach,
+        # but for now we assume <25 invalid roles.
+        options = []
+        for i, role_data in enumerate(invalid_roles):
+             # Value is index in the invalid_roles list
+            label = f"{role_data['name']} ({role_data['emoji']})"
+            desc = role_data.get("error", f"ID: {role_data['role_id']}")
+            options.append(discord.SelectOption(label=label[:100], value=str(i), description=desc[:100]))
+            if len(options) >= 25:
+                break
+        
+        self.select = discord.ui.Select(placeholder="Select roles to remove from board", options=options, min_values=1, max_values=len(options))
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+        self.add_item(self.CancelButton())
+
+    async def select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        indices_to_remove = [int(v) for v in self.select.values]
+        
+        # Determine actual roles to remove based on indices
+        roles_to_remove = [self.invalid_roles[i] for i in indices_to_remove]
+        
+        # Filter main roles list
+        new_roles_list = []
+        for role_data in self.roles_board_data["roles"]:
+            should_keep = True
+            for r_rem in roles_to_remove:
+                if r_rem["role_id"] == role_data["role_id"] and r_rem["emoji"] == role_data["emoji"]:
+                    should_keep = False
+                    break
+            if should_keep:
+                new_roles_list.append(role_data)
+        
+        self.roles_board_data["roles"] = new_roles_list
+        save_json(ROLES_BOARD_FILE, self.roles_board_data)
+        
+        # Remove reactions from the actual message
+        roles_cog = self.bot.get_cog("RolesBoard")
+        if roles_cog and self.roles_board_data["channel_id"] and self.roles_board_data["message_id"]:
+            try:
+                channel = self.bot.get_channel(self.roles_board_data["channel_id"])
+                if channel:
+                    message = await channel.fetch_message(self.roles_board_data["message_id"])
+                    if message:
+                        for role_rem in roles_to_remove:
+                            try:
+                                await message.clear_reaction(role_rem["emoji"])
+                            except Exception:
+                                pass # Ignore if reaction removal fails (e.g., already gone)
+            except Exception:
+                pass # Ignore channel/message fetch errors here, update_roles_board will handle the rest
+
+        # Update the actual message content
+        if roles_cog:
+            if await roles_cog.update_roles_board():
+                 await interaction.followup.send(f"✅ Removed {len(roles_to_remove)} invalid roles and updated the board.", ephemeral=True)
+            else:
+                 await interaction.followup.send(f"✅ Removed {len(roles_to_remove)} invalid roles from config, but could not update the board message (channel/message might be missing).", ephemeral=True)
+        else:
+             await interaction.followup.send(f"✅ Removed {len(roles_to_remove)} invalid roles from config.", ephemeral=True)
+        self.stop()
+
+    class CancelButton(discord.ui.Button):
+        def __init__(self):
+            super().__init__(label="Cancel", style=discord.ButtonStyle.secondary)
+        async def callback(self, interaction: discord.Interaction):
+            await interaction.response.send_message("Sync cancelled.", ephemeral=True)
+            self.view.stop()
+
 class RolesBoard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -13,6 +90,86 @@ class RolesBoard(commands.Cog):
 
     def reload_roles_board(self):
         self.roles_board = load_json(ROLES_BOARD_FILE, {"channel_id": None, "message_id": None, "roles": []})
+
+    @app_commands.command(name="sync_roles_board", description="Check for missing roles/channels and clean up the roles board")
+    async def sync_roles_board(self, interaction: discord.Interaction):
+        from cogs.utils import has_admin_or_mod_permissions, find_category_by_name
+        if not await has_admin_or_mod_permissions(interaction):
+            return
+        
+        self.reload_roles_board()
+        guild = interaction.guild
+        
+        # 1. Check Channel/Message
+        channel_id = self.roles_board.get("channel_id")
+        message_id = self.roles_board.get("message_id")
+        
+        channel_status = "✅ Found"
+        message_status = "✅ Found"
+        
+        channel = guild.get_channel(channel_id) if channel_id else None
+        
+        if not channel:
+            channel_status = "❌ Missing (Configured ID not found)"
+            message_status = "❌ Missing (Channel not found)"
+        else:
+            try:
+                message = await channel.fetch_message(message_id) if message_id else None
+                if not message:
+                     message_status = "❌ Missing (ID not found in channel)"
+            except:
+                message_status = "❌ Missing (Fetch failed)"
+
+        # 2. Check Roles & Modpacks
+        invalid_roles = []
+        valid_roles_count = 0
+        
+        for role_data in self.roles_board["roles"]:
+            role = guild.get_role(role_data["role_id"])
+            if not role:
+                role_data["error"] = "Role deleted from server"
+                invalid_roles.append(role_data)
+                continue
+            
+            # Check for associated modpack category
+            # Heuristic: Role name "Name Updates" -> Category "Name [LOADER]" or "Name"
+            role_name = role.name
+            if role_name.lower().endswith(" updates"):
+                modpack_name = role_name[:-8].strip() # Remove " Updates"
+                
+                # Search for category
+                found_category = False
+                for cat in guild.categories:
+                    if cat.name == modpack_name:
+                        found_category = True
+                        break
+                    if "[" in cat.name and "]" in cat.name:
+                        base_name = cat.name.split("[")[0].strip()
+                        if base_name.lower() == modpack_name.lower():
+                            found_category = True
+                            break
+                
+                if not found_category:
+                    role_data["error"] = f"Orphaned (No category found for '{modpack_name}')"
+                    invalid_roles.append(role_data)
+                    continue
+
+            valid_roles_count += 1
+                
+        # Report
+        report = f"**Roles Board Status**\n"
+        report += f"• Channel: {channel_status}\n"
+        report += f"• Message: {message_status}\n"
+        report += f"• Valid Roles: {valid_roles_count}\n"
+        report += f"• Invalid/Orphaned Roles: {len(invalid_roles)}\n"
+        
+        if not invalid_roles:
+            await interaction.response.send_message(report + "\n✅ All roles are synced!", ephemeral=True)
+            return
+            
+        report += "\n**Invalid/Orphaned Roles found!** Select the ones you want to remove:"
+        view = SyncRolesView(self.bot, self.roles_board, invalid_roles)
+        await interaction.response.send_message(report, view=view, ephemeral=True)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
