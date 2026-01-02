@@ -27,6 +27,7 @@ class MainBot(commands.Bot):
         await self.load_extension("cogs.modpack")
         await self.load_extension("cogs.autosend")
         await self.load_extension("cogs.amp")
+        await self.load_extension("cogs.embed_builder")
         for guild_id in GUILD_IDS:
             guild_obj = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild_obj)
