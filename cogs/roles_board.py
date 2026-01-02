@@ -132,27 +132,34 @@ class RolesBoard(commands.Cog):
                 continue
             
             # Check for associated modpack category
-            # Heuristic: Role name "Name Updates" -> Category "Name [LOADER]" or "Name"
+            # Heuristic: 
+            # 1. "Name Updates" -> Category "Name [LOADER]" or "Name"
+            # 2. "Name" -> Category "Name [LOADER]" or "Name"
+            
             role_name = role.name
+            modpack_name = role_name
+            
             if role_name.lower().endswith(" updates"):
                 modpack_name = role_name[:-8].strip() # Remove " Updates"
-                
-                # Search for category
-                found_category = False
-                for cat in guild.categories:
-                    if cat.name == modpack_name:
+            
+            # Search for category
+            found_category = False
+            for cat in guild.categories:
+                # Check exact match
+                if cat.name == modpack_name:
+                    found_category = True
+                    break
+                # Check "Name [LOADER]" format
+                if "[" in cat.name and "]" in cat.name:
+                    base_name = cat.name.split("[")[0].strip()
+                    if base_name.lower() == modpack_name.lower():
                         found_category = True
                         break
-                    if "[" in cat.name and "]" in cat.name:
-                        base_name = cat.name.split("[")[0].strip()
-                        if base_name.lower() == modpack_name.lower():
-                            found_category = True
-                            break
-                
-                if not found_category:
-                    role_data["error"] = f"Orphaned (No category found for '{modpack_name}')"
-                    invalid_roles.append(role_data)
-                    continue
+            
+            if not found_category:
+                role_data["error"] = f"Orphaned (No category '{modpack_name}')"
+                invalid_roles.append(role_data)
+                continue
 
             valid_roles_count += 1
                 
