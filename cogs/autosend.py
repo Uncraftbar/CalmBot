@@ -65,7 +65,8 @@ class AutoSendEditDeleteView(discord.ui.View):
                     "url": self.view.entry.get("url"),
                     "timestamp": self.view.entry.get("timestamp"),
                     "fields": self.view.entry.get("fields"),
-                }
+                },
+                "conditions": self.view.entry.get("conditions", {}).copy()
             }
             live_edit_view = AutoSendLiveEditView(self.view.bot, self.view.autosend_data, state)
             if state["message_type"] == "plain":
@@ -554,6 +555,7 @@ class AutoSendLiveEditView(discord.ui.View):
         self.add_item(self.EditColorButton(self))
         self.add_item(self.EditFooterButton(self))
         self.add_item(self.EditImageButton(self))
+        self.add_item(self.ConditionsButton(self))  # Add conditions button
         self.add_item(self.AdvancedButton(self))  # Add advanced options button to live editor
         self.add_item(self.SaveButton(self))
         # Add more edit buttons for advanced fields as needed
@@ -588,6 +590,12 @@ class AutoSendLiveEditView(discord.ui.View):
         async def callback(self, interaction: discord.Interaction):
             await interaction.response.send_modal(EditFieldModal(self.view, "image_url", "Edit Image URL"))
 
+    class ConditionsButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="Edit Conditions", style=discord.ButtonStyle.primary, row=3)
+        async def callback(self, interaction: discord.Interaction):
+            await interaction.response.send_message("Select a condition to edit:", view=ConditionEditView(self.view.bot, self.view.state), ephemeral=True)
+
     class AdvancedButton(discord.ui.Button):
         def __init__(self, parent_view):
             super().__init__(label="Advanced Options", style=discord.ButtonStyle.secondary, row=3)
@@ -603,9 +611,117 @@ class AutoSendLiveEditView(discord.ui.View):
                 entry = {"message": state.get("plain_message", "")}
             else:
                 entry = {"embed": {k: v for k, v in state["embed"].items() if v}}
+            
+            # Save conditions if any exist
+            if "conditions" in state and state["conditions"]:
+                entry["conditions"] = state["conditions"]
+
             self.view.autosend_data.setdefault(state["trigger_type"], {})[state["trigger_value"]] = entry
             save_json(AUTOSEND_FILE, self.view.autosend_data)
             await interaction.response.send_message(f"Auto-send for {state['trigger_type']} '{state['trigger_value']}' saved!", ephemeral=True)
+
+class ConditionEditView(discord.ui.View):
+    def __init__(self, bot, state):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.state = state
+        self.state.setdefault("conditions", {})
+        
+        self.add_item(self.ChannelSelect(self))
+        self.add_item(self.RoleSelect(self))
+        self.add_item(self.SetRegexButton(self))
+        self.add_item(self.SetLengthButton(self))
+        self.add_item(self.ClearConditionsButton(self))
+
+    class ChannelSelect(discord.ui.ChannelSelect):
+        def __init__(self, parent_view):
+            super().__init__(placeholder="Restrict to specific channel...", channel_types=[discord.ChannelType.text], min_values=0, max_values=1, row=0)
+            self.parent_view = parent_view
+        async def callback(self, interaction: discord.Interaction):
+            if self.values:
+                self.parent_view.state["conditions"]["channel_id"] = self.values[0].id
+                await interaction.response.send_message(f"Restricted to channel: {self.values[0].mention}", ephemeral=True)
+            else:
+                self.parent_view.state["conditions"].pop("channel_id", None)
+                await interaction.response.send_message("Channel restriction removed.", ephemeral=True)
+
+    class RoleSelect(discord.ui.RoleSelect):
+        def __init__(self, parent_view):
+            super().__init__(placeholder="Restrict to specific role...", min_values=0, max_values=1, row=1)
+            self.parent_view = parent_view
+        async def callback(self, interaction: discord.Interaction):
+            if self.values:
+                self.parent_view.state["conditions"]["role_id"] = self.values[0].id
+                await interaction.response.send_message(f"Restricted to users with role: {self.values[0].mention}", ephemeral=True)
+            else:
+                self.parent_view.state["conditions"].pop("role_id", None)
+                await interaction.response.send_message("Role restriction removed.", ephemeral=True)
+
+    class SetRegexButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="Set Regex Trigger", style=discord.ButtonStyle.secondary, row=2)
+            self.parent_view = parent_view
+        async def callback(self, interaction: discord.Interaction):
+            await interaction.response.send_modal(RegexConditionModal(self.parent_view))
+
+    class SetLengthButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="Set Min/Max Length", style=discord.ButtonStyle.secondary, row=2)
+            self.parent_view = parent_view
+        async def callback(self, interaction: discord.Interaction):
+            await interaction.response.send_modal(LengthConditionModal(self.parent_view))
+
+    class ClearConditionsButton(discord.ui.Button):
+        def __init__(self, parent_view):
+            super().__init__(label="Clear All Conditions", style=discord.ButtonStyle.danger, row=3)
+            self.parent_view = parent_view
+        async def callback(self, interaction: discord.Interaction):
+            self.parent_view.state["conditions"] = {}
+            await interaction.response.send_message("All conditions cleared.", ephemeral=True)
+
+class RegexConditionModal(discord.ui.Modal, title="Regex Trigger Condition"):
+    regex_pattern = discord.ui.TextInput(label="Regex Pattern", placeholder="e.g. ^Hello.*", required=False)
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        if "regex" in self.parent_view.state["conditions"]:
+            self.regex_pattern.default = self.parent_view.state["conditions"]["regex"]
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.regex_pattern.value:
+            self.parent_view.state["conditions"]["regex"] = self.regex_pattern.value
+            await interaction.response.send_message(f"Regex pattern set: `{self.regex_pattern.value}`", ephemeral=True)
+        else:
+            self.parent_view.state["conditions"].pop("regex", None)
+            await interaction.response.send_message("Regex condition removed.", ephemeral=True)
+
+class LengthConditionModal(discord.ui.Modal, title="Message Length Conditions"):
+    min_len = discord.ui.TextInput(label="Min Length", placeholder="0", required=False, style=discord.TextStyle.short)
+    max_len = discord.ui.TextInput(label="Max Length", placeholder="2000", required=False, style=discord.TextStyle.short)
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        if "min_length" in self.parent_view.state["conditions"]:
+            self.min_len.default = str(self.parent_view.state["conditions"]["min_length"])
+        if "max_length" in self.parent_view.state["conditions"]:
+            self.max_len.default = str(self.parent_view.state["conditions"]["max_length"])
+    async def on_submit(self, interaction: discord.Interaction):
+        msg = []
+        if self.min_len.value and self.min_len.value.isdigit():
+            self.parent_view.state["conditions"]["min_length"] = int(self.min_len.value)
+            msg.append(f"Min Length: {self.min_len.value}")
+        else:
+            self.parent_view.state["conditions"].pop("min_length", None)
+        
+        if self.max_len.value and self.max_len.value.isdigit():
+            self.parent_view.state["conditions"]["max_length"] = int(self.max_len.value)
+            msg.append(f"Max Length: {self.max_len.value}")
+        else:
+            self.parent_view.state["conditions"].pop("max_length", None)
+
+        if msg:
+            await interaction.response.send_message(f"Length conditions set: {', '.join(msg)}", ephemeral=True)
+        else:
+            await interaction.response.send_message("Length conditions cleared.", ephemeral=True)
 
     async def send_initial(self, interaction):
         if self.state["message_type"] == "plain":
