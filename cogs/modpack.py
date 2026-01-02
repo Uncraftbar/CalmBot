@@ -2,7 +2,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from cogs.utils import has_admin_or_mod_permissions, find_category_by_name, load_json, save_json
-from cogs.roles_board import RolesBoard
 
 ROLES_BOARD_FILE = "roles_board.json"
 
