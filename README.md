@@ -1,28 +1,30 @@
 # CalmBot
 
-A feature-rich Discord bot with server management capabilities, including AMP (Application Management Panel) integration for Minecraft server control, auto-send functionality, modpack management, and role management.
+A feature-rich Discord bot designed for Minecraft server communities. It offers deep integration with **AMP (Application Management Panel)**, advanced auto-responders, and automated modpack category management.
 
 ## Features
 
 ### 🎮 AMP Server Management
-- **Instance Control**: Start, stop, and restart Minecraft server applications
-- **TPS Monitoring**: Real-time server performance reporting using Spark profiler
-- **Performance Profiling**: 30-second server profiling with detailed reports
-- **Instance Status**: View current state of all managed server instances
+- **Instance Control**: Start, stop, and restart Minecraft server instances directly from Discord.
+- **TPS Monitoring**: Real-time server performance reporting using the Spark profiler.
+- **Performance Profiling**: Run 30-second profiles and get detailed analysis links.
+- **Instance Status**: View the live state of all managed server instances.
 
-### 📝 Auto-Send System
-- **Keyword Triggers**: Automatically send messages based on configurable triggers
-- **Rich Embeds**: Support for custom embeds with titles, descriptions, colors, and images
-- **Live Editing**: Interactive message editor with real-time preview
+### 📝 Advanced Auto-Send
+- **Interactive Editor**: Create and edit auto-responses with a live preview UI.
+- **Rich Embeds**: Design beautiful messages with titles, colors, images, and footers.
+- **Smart Triggers**: Trigger by keywords, user mentions, or role mentions.
+- **Conditional Logic**: Restrict responses to specific **channels**, **roles**, **message lengths**, or use **Regex** patterns.
 
 ### 🎯 Modpack Management
-- **Category Setup**: Automated Discord category and channel creation for modpacks
-- **Connection Info**: Manage server connection details and modpack links
-- **Role Integration**: Automatic role assignment and management
+- **One-Click Setup**: Automatically create categories, channels (`#general`, `#technical-help`, `#connection-info`), and notification roles for new modpacks.
+- **Migration**: Easily convert existing manual categories into the bot's managed system.
+- **Connection Info**: Manage server IP and modpack link embeds with a simple command.
 
 ### 🛡️ Role Management
-- **Interactive Role Board**: User-friendly role selection interface
-- **Custom Emojis**: Configurable emoji reactions for role assignment
+- **Reaction Roles Board**: Create a self-updating "Roles Board" where users can react to get modpack update roles.
+- **Auto-Sync**: The bot automatically adds new modpack roles to the board.
+- **Robust Synchronization**: Detects and cleans up "orphaned" roles (where the modpack was deleted) to keep your roles board tidy.
 
 ## Installation
 
@@ -38,62 +40,54 @@ A feature-rich Discord bot with server management capabilities, including AMP (A
    ```
 
 3. **Configure the bot**
-   Create a `config.py` file with the following structure:
+   Create a `config.py` file in the root directory:
    ```python
    # config.py
    
-   GUILD_IDS = [YOUR_GUILD_ID_HERE]  # List of Discord server IDs
-   BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Discord bot token
-   AMP_API_URL = "http://your-amp-server:port"  # AMP server URL
-   AMP_USER = "your_amp_username"  # AMP username
-   AMP_PASS = "your_amp_password"  # AMP password
+   GUILD_IDS = [123456789012345678]  # Your Discord Server ID(s)
+   BOT_TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+   
+   # AMP Configuration
+   AMP_API_URL = "http://localhost:8080"  # Your AMP instance URL
+   AMP_USER = "admin"
+   AMP_PASS = "password"
    ```
 
-4. **Run main.py!**
-
+4. **Run the bot**
+   ```bash
+   python main.py
+   ```
 
 ## Commands
 
-### AMP Commands
-- `/amp` - Display all AMP instances with management controls
+### AMP Management
+- `/amp` - Open the server management dashboard.
 
-### Auto-Send Commands
-- `/autosend` - Manage automatic message triggers and responses
+### Auto-Send
+- `/autosend add` - Create a new auto-responder.
+- `/autosend list` - View, edit, or delete existing auto-responders.
+- `/autosend help` - View detailed help for the system.
 
-### Modpack Commands
-- `/create_modpack` - Set up a new modpack category with channels and roles
-- `/edit_connection_info` - Update modpack connection details
+### Modpack Tools
+- `/setup_modpack` - Create a new modpack category with channels and a role.
+- `/migrate_modpack` - Convert an existing category to be managed by the bot.
+- `/delete_modpack` - safely delete a modpack category, channels, and role.
+- `/edit_connection_info` - Update the connection info message in a modpack channel.
 
-### Role Commands
-- `/roles_board` - Create an interactive role selection interface
-
-
-## Permissions
-
-The bot requires the following Discord permissions:
-- Send Messages
-- Use Slash Commands
-- Manage Roles
-- Manage Channels
-- Embed Links
-- Add Reactions
-- Read Message History
-
-# You can use this link to invite the bot with the right permissions
-https://discord.com/oauth2/authorize?client_id=REPLACE_WITH_CLIENT_ID&permissions=1126194380794992&integration_type=0&scope=bot 
-
-## Security Notes
-
-- Never commit `config.py` to version control
-- Keep your bot token and AMP credentials secure
-- Restrict admin commands to appropriate roles/users
+### Role System
+- `/setup_roles_board` - Create or update the message for role reactions.
+- `/sync_roles_board` - Scan for missing/deleted modpacks and clean up the roles board.
 
 ## Requirements
 
 - Python 3.8+
-- discord.py
-- cc-ampapi (for AMP integration)
-- AMP (Application Management Panel) server for Minecraft management features
+- `discord.py`
+- `cc-ampapi`
+
+## Security
+
+- **Never** commit your `config.py` to GitHub or share it publicly.
+- Ensure the bot has the `Administrator` permission or specific rights to Manage Channels, Manage Roles, and Manage Messages.
 
 ## License
 
