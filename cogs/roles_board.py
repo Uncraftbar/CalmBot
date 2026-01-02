@@ -1,10 +1,9 @@
 import discord
 from discord.ext import commands
-from cogs.utils import load_json, save_json
+from cogs.utils import load_json, save_json, ROLES_BOARD_FILE
 from discord import app_commands
 
 REACTION_ROLES_FILE = "reaction_roles.json"
-ROLES_BOARD_FILE = "roles_board.json"
 
 class RolesBoard(commands.Cog):
     def __init__(self, bot):

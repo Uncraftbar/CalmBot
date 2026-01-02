@@ -1,9 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from cogs.utils import has_admin_or_mod_permissions, find_category_by_name, load_json, save_json
-
-ROLES_BOARD_FILE = "roles_board.json"
+from cogs.utils import has_admin_or_mod_permissions, find_category_by_name, load_json, save_json, ROLES_BOARD_FILE
 
 class Modpack(commands.Cog):
     def __init__(self, bot):

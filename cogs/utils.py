@@ -1,6 +1,8 @@
 import json
 import os
 
+ROLES_BOARD_FILE = "roles_board.json"
+
 def load_json(filename, default):
     if os.path.exists(filename):
         try:
