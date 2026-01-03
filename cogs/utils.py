@@ -2,6 +2,8 @@ import json
 import os
 
 ROLES_BOARD_FILE = "roles_board.json"
+CHAT_BRIDGE_FILE = "chat_bridge.json"
+
 
 def load_json(filename, default):
     if os.path.exists(filename):
