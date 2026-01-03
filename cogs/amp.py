@@ -4,13 +4,13 @@ from discord import app_commands
 from ampapi import Bridge, AMPControllerInstance
 from ampapi.dataclass import APIParams
 import config
-from cogs.utils import has_admin_or_mod_permissions
+from cogs.utils import has_admin_or_mod_permissions, fetch_valid_instances
 
 class InstanceActionView(discord.ui.View):
     def __init__(self, instances, bot):
         super().__init__(timeout=120)
         self.bot = bot
-        self.instances = [i for i in instances if (getattr(i, 'module_display_name', '').lower() not in ['application deployment service', 'ads module', 'controller']) and (str(i.friendly_name).strip().lower() != 'ads')]
+        self.instances = instances
         options = []
         for i in self.instances:
             label = i.friendly_name or i.instance_name
@@ -230,18 +230,13 @@ class AMP(commands.Cog):
         if not await has_admin_or_mod_permissions(interaction):
             return
         try:
-            await self.ads.get_instances(format_data=True)
-            instances = list(self.ads.instances)
+            instances = await fetch_valid_instances()
             if not instances:
                 embed = discord.Embed(title="AMP Instances", description="No AMP instances found.", color=discord.Color.red())
                 await interaction.response.send_message(embed=embed, ephemeral=True)
             else:
                 embed = discord.Embed(title="AMP Instances", color=discord.Color.blue())
                 for i in instances:
-                    # Skip the global ADS container (controller instance or named 'ADS')
-                    if (getattr(i, 'module_display_name', '').lower() in ['application deployment service', 'ads module', 'controller']) or \
-                       (str(i.friendly_name).strip().lower() == 'ads'):
-                        continue
                     state = "Unknown"
                     try:
                         status = await i.get_instance_status()

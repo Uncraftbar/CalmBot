@@ -4,7 +4,7 @@ from discord import app_commands
 from ampapi import Bridge as AMPBridge, AMPControllerInstance
 from ampapi.dataclass import APIParams
 import config
-from cogs.utils import load_json, save_json, CHAT_BRIDGE_FILE, has_admin_or_mod_permissions
+from cogs.utils import load_json, save_json, CHAT_BRIDGE_FILE, has_admin_or_mod_permissions, fetch_valid_instances
 import asyncio
 import re
 import traceback
@@ -42,15 +42,7 @@ class ChatBridge(commands.Cog):
 
     async def _refresh_instances(self):
         try:
-            # Re-create controller to ensure fresh state
-            self.ads = AMPControllerInstance()
-            
-            # Force session clear to prevent server-side caching per session
-            if hasattr(self.ads, '_bridge') and hasattr(self.ads._bridge, '_sessions'):
-                self.ads._bridge._sessions.clear()
-
-            # Capture the returned instances directly
-            fetched_instances = await self.ads.get_instances(format_data=True)
+            fetched_instances = await fetch_valid_instances()
             
             if not fetched_instances:
                 print("[Bridge] No instances returned from API.")
@@ -58,19 +50,6 @@ class ChatBridge(commands.Cog):
 
             self.instances = {}
             for inst in fetched_instances:
-                # Exclude ADS/Controller instances
-                # Use safe getattr just in case it's a raw dict or unexpected object
-                mod_name = str(getattr(inst, 'module_display_name', '')).lower()
-                friendly_name = str(getattr(inst, 'friendly_name', '')).strip().lower()
-                
-                if (mod_name in ['application deployment service', 'ads module', 'controller']) or \
-                   (friendly_name == 'ads'):
-                    continue
-                
-                # Check for required attributes
-                if not hasattr(inst, 'instance_name'):
-                    continue
-
                 name = inst.friendly_name or inst.instance_name
                 self.instances[name] = inst
             

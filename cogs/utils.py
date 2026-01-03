@@ -1,8 +1,45 @@
 import json
 import os
+from ampapi import AMPControllerInstance
 
 ROLES_BOARD_FILE = "roles_board.json"
 CHAT_BRIDGE_FILE = "chat_bridge.json"
+
+
+async def fetch_valid_instances():
+    """
+    Fetches and filters AMP instances, excluding ADS/Controller.
+    Returns a list of valid instances.
+    """
+    ads = AMPControllerInstance()
+    
+    # Force session clear to prevent server-side caching per session
+    if hasattr(ads, '_bridge') and hasattr(ads._bridge, '_sessions'):
+        ads._bridge._sessions.clear()
+
+    fetched_instances = await ads.get_instances(format_data=True)
+    
+    if not fetched_instances:
+        return []
+
+    valid_instances = []
+    for inst in fetched_instances:
+        # Use safe getattr
+        mod_name = str(getattr(inst, 'module_display_name', '')).lower()
+        friendly_name = str(getattr(inst, 'friendly_name', '')).strip().lower()
+        
+        # Filter ADS/Controller
+        if (mod_name in ['application deployment service', 'ads module', 'controller']) or \
+           (friendly_name == 'ads'):
+            continue
+        
+        # Check required attributes
+        if not hasattr(inst, 'instance_name'):
+            continue
+            
+        valid_instances.append(inst)
+        
+    return valid_instances
 
 
 def load_json(filename, default):
