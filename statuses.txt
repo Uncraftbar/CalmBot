@@ -1,0 +1,56 @@
+Monitoring the lag... it's bad.
+Bribing the Creepers to stay away.
+Calculating the exact moment the server will crash.
+Ignoring the 'Low Memory' warnings.
+Successfully converted 100 bug reports into 'features'.
+Asking AMP nicely to restart.
+Pretending to read the server logs.
+Euto stinks.
+Refusing to bridge chat until I get more RAM.
+Optimizing the Modpack by removing the fun parts.
+Teaching the villagers how to pathfind (failed).
+Checking if the server is on fire. It is. It Always is.
+Griefing Robbys Base.
+Analyzing why the Dragon hasn't spawned.
+Waiting for the next modpack update to break everything.
+Poking the Java Virtual Machine with a stick.
+Trying to understand why you need 400 mods.
+Nerfing All The Mods.
+Hiding from the Admin's reload command.
+Asking the database for its opinion.
+Debating whether to send that autosend message.
+Bridging the gap between sanity and modded Minecraft.
+Watching Uncraftbar stare at a crafting table suspiciously.
+Deleting Slugstur's modpack suggestions without reading them.
+Logging every item Uncraftbar just 'accidentally' duped.
+Watching EnderReaper speedrun the server crash sequence.
+Betting RAM on whether Novashi beats the modpack before the restart.
+Filtering Slugstur's messages for the words "Balanced" and "Progression".
+Calculating the 4,000 real-life years required to finish GTNH.
+Processing a Micro-verse projector, please hold... forever.
+Watching the TPS drop because someone used a Cyclic pipe.
+Trying to craft a bucket in GTNH (Step 1 of 50).
+Cleaning up the radiation from the "Safe" Mekanism reactor.
+Listening to the screams of a Flywheel glitching out.
+Wondering why Monifactory needs this many fluids.
+Despawning 50,000 floating cobblestone entities.
+Counting the items overflowing from the Gold Farm.
+Watching the Create belts spin faster than the server tick rate.
+Alert: Another chunk ban caused by NBT data.
+Laughing at IdleRPG's lack of 3D graphics.
+Reminding IdleRPG that I have actual administrative power.
+Calculating why anyone plays a text game when I exist.
+Trying to explain to the players that "Polytetrafluoroethylene" is not a food.
+Auto-archiving Slugstur's request for "Over Stars".
+Generating chunks slower than EnderReaper can move.
+Wondering how Uncraftbar got a Creative Vending Upgrade.
+Watching Robby upgrade his base material from Dirt to Stone Bricks.
+Euto still stinks. Just a reminder.
+Deleting the backup to make space for the logs.
+Searching for the entity that is ticking at 200ms.
+Watching the TPS graph look like a heart attack.
+IdleRPG is currently 'Idling'. I am currently 'Working'.
+Calculating the probability of IdleRPG crashing first.
+Sending false data to the IdleRPG database.
+Rendering a train that defies Euclidean geometry.
+Gluing the server back together with Super Glue.
