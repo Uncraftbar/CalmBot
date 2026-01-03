@@ -62,6 +62,39 @@ class ChatBridge(commands.Cog):
             # Log error but don't crash; return None updates
             return name, None
 
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot: return
+        if not self.bridge_data.get("groups"): return
+
+        for group_name, group_data in self.bridge_data["groups"].items():
+            if not group_data.get("active", True): continue
+            
+            # Check if this channel is linked to the group
+            linked_channel_id = group_data.get("channel_id")
+            if not linked_channel_id or message.channel.id != linked_channel_id: continue
+
+            # Broadcast to all servers in the group
+            instance_names = group_data.get("servers", [])
+            if not instance_names: continue
+
+            user = message.author.display_name
+            msg = message.content
+            
+            # Simple sanitization for tellraw JSON
+            safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
+            safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
+            
+            cmd = f'tellraw @a ["",{{"text":"[Discord] ", "color": "blue"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+
+            for target_name in instance_names:
+                target = self.instances.get(target_name)
+                if target:
+                    asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+            
+            # We found the group, no need to check others (assuming 1:1 mapping preference)
+            break
+
     @tasks.loop(seconds=2.0)
     async def sync_loop(self):
         if not self.bridge_data.get("groups"): return
@@ -114,10 +147,8 @@ class ChatBridge(commands.Cog):
                     latest_ts, latest_entry = parsed_entries[-1]
                     latest_hash = hash(f"{str(getattr(latest_entry, 'source', ''))}:{str(getattr(latest_entry, 'contents', ''))}")
                     self.high_water_marks[source_name] = {'ts': latest_ts, 'hashes': {latest_hash}}
-                    print(f"[Bridge] Initialized {source_name} watermark to {latest_ts}")
                 else:
                     self.high_water_marks[source_name] = {'ts': datetime.now(timezone.utc), 'hashes': set()}
-                    print(f"[Bridge] Initialized {source_name} watermark to NOW")
                 continue
 
             watermark = self.high_water_marks[source_name]
@@ -157,18 +188,26 @@ class ChatBridge(commands.Cog):
             if valid_new:
                 new_messages_per_server[source_name] = valid_new
 
-        # 4. Second Pass: Dispatch messages to groups
+        # 4. Second Pass: Dispatch messages to groups AND Discord
         for group_name, group_data in self.bridge_data["groups"].items():
             if not group_data.get("active", True): continue
             
             instance_names = group_data.get("servers", [])
-            if len(instance_names) < 2: continue
+            discord_channel_id = group_data.get("channel_id")
+            
+            # Skip if no servers and no discord (need at least 2 endpoints effectively)
+            if len(instance_names) < 1: continue
+
+            discord_channel = None
+            if discord_channel_id:
+                discord_channel = self.bot.get_channel(discord_channel_id)
 
             for source_name in instance_names:
                 messages = new_messages_per_server.get(source_name)
                 if not messages: continue
 
                 for user, msg in messages:
+                    # Send to other Minecraft Servers
                     for target_name in instance_names:
                         if target_name == source_name: continue
                         target = self.instances.get(target_name)
@@ -179,6 +218,21 @@ class ChatBridge(commands.Cog):
                             
                             cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
                             asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+                    
+                    # Send to Discord
+                    if discord_channel:
+                        # Escape markdown in user/msg to prevent abuse
+                        safe_user_discord = discord.utils.escape_markdown(user)
+                        safe_msg_discord = discord.utils.escape_markdown(msg)
+                        discord_content = f"**[{source_name}]** <{safe_user_discord}> {safe_msg_discord}"
+                        asyncio.create_task(self._send_discord_message_safe(discord_channel, discord_content))
+
+    async def _send_discord_message_safe(self, channel, content):
+        try:
+            await channel.send(content)
+        except Exception:
+            print(f"Failed to send message to Discord channel {channel.id}")
+            traceback.print_exc()
 
     async def _send_message_safe(self, target, cmd, target_name):
         try:
@@ -233,7 +287,16 @@ class BCC_StatusButton(discord.ui.Button):
             status = "🟢 Active" if info.get("active", True) else "🔴 Disabled"
             servers = info.get("servers", [])
             server_text = ", ".join(servers) if servers else "*No servers linked*"
-            embed.add_field(name=f"{name} ({status})", value=server_text, inline=False)
+            
+            # Add Discord channel status
+            channel_id = info.get("channel_id")
+            channel_text = ""
+            if channel_id:
+                channel = self.cog.bot.get_channel(channel_id)
+                channel_name = channel.mention if channel else f"Unknown Channel ({channel_id})"
+                channel_text = f"\n**Discord:** {channel_name}"
+            
+            embed.add_field(name=f"{name} ({status})", value=f"**Servers:** {server_text}{channel_text}", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 class BCC_GroupSelect(discord.ui.Select):
@@ -264,6 +327,12 @@ class GroupManageView(discord.ui.View):
         self.add_item(GM_ToggleActiveButton(cog, group_name, label, style))
         self.add_item(GM_LinkServerButton(cog, group_name))
         self.add_item(GM_UnlinkServerButton(cog, group_name))
+        
+        # Add Link/Unlink Discord Channel Buttons
+        self.add_item(GM_LinkChannelButton(cog, group_name))
+        if group_data.get("channel_id"):
+            self.add_item(GM_UnlinkChannelButton(cog, group_name))
+            
         self.add_item(GM_DeleteGroupButton(cog, group_name))
 
 class GM_ToggleActiveButton(discord.ui.Button):
@@ -313,9 +382,30 @@ class GM_UnlinkServerButton(discord.ui.Button):
         options = [discord.SelectOption(label=name[:100], value=name) for name in current_links]
         await interaction.response.send_message(f"Remove server from **{self.group_name}**:", view=UnlinkInstanceView(self.cog, self.group_name, options[:25]), ephemeral=True)
 
+class GM_LinkChannelButton(discord.ui.Button):
+    def __init__(self, cog, group_name):
+        super().__init__(label="Link Discord Channel", style=discord.ButtonStyle.blurple, row=1)
+        self.cog = cog
+        self.group_name = group_name
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message("Select a text channel to link:", view=LinkChannelView(self.cog, self.group_name), ephemeral=True)
+
+class GM_UnlinkChannelButton(discord.ui.Button):
+    def __init__(self, cog, group_name):
+        super().__init__(label="Unlink Discord Channel", style=discord.ButtonStyle.secondary, row=1)
+        self.cog = cog
+        self.group_name = group_name
+    async def callback(self, interaction: discord.Interaction):
+        if "channel_id" in self.cog.bridge_data["groups"][self.group_name]:
+            del self.cog.bridge_data["groups"][self.group_name]["channel_id"]
+            save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
+            await interaction.response.edit_message(content=f"Unlinked Discord channel from **{self.group_name}**.", view=GroupManageView(self.cog, self.group_name))
+        else:
+            await interaction.response.send_message("No channel linked.", ephemeral=True)
+
 class GM_DeleteGroupButton(discord.ui.Button):
     def __init__(self, cog, group_name):
-        super().__init__(label="Delete Group", style=discord.ButtonStyle.danger, row=1)
+        super().__init__(label="Delete Group", style=discord.ButtonStyle.danger, row=2)
         self.cog = cog
         self.group_name = group_name
     async def callback(self, interaction: discord.Interaction):
@@ -327,6 +417,25 @@ class GM_DeleteGroupButton(discord.ui.Button):
             await interaction.response.send_message("Group already deleted.", ephemeral=True)
 
 # --- Modals & Select Views ---
+
+class LinkChannelView(discord.ui.View):
+    def __init__(self, cog, group_name):
+        super().__init__(timeout=60)
+        self.add_item(LinkChannelSelect(cog, group_name))
+
+class LinkChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, cog, group_name):
+        self.cog = cog
+        self.group_name = group_name
+        # Only allow text channels
+        super().__init__(placeholder="Select a channel...", channel_types=[discord.ChannelType.text])
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        self.cog.bridge_data["groups"][self.group_name]["channel_id"] = channel.id
+        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
+        await interaction.response.send_message(f"✅ Linked {channel.mention} to **{self.group_name}**.", ephemeral=True)
+        # We can't easily refresh the previous view here without passing the original interaction, but users can re-open or click other buttons.
 
 class CreateGroupModal(discord.ui.Modal, title="Create Bridge Group"):
     name = discord.ui.TextInput(label="Group Name", placeholder="e.g. Survival", required=True)
