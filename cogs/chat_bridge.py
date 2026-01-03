@@ -37,133 +37,6 @@ class ChatBridge(commands.Cog):
 
     async def cog_unload(self):
         self.sync_loop.cancel()
-# ... (inside sync_loop dispatch phase) ...
-            for source_name in instance_names:
-                messages = new_messages_per_server.get(source_name)
-                if not messages: continue
-                
-                # Get Instance Settings
-                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
-                display_name = settings.get("alias", source_name)
-                color = settings.get("color", "aqua")
-
-                for user, msg in messages:
-                    # Send to other Minecraft Servers
-                    for target_name in instance_names:
-                        if target_name == source_name: continue
-                        target = self.instances.get(target_name)
-                        if target:
-                            safe_user = user.replace('\\', '\\\\').replace('"', '\"')
-                            safe_msg = msg.replace('\\', '\\\\').replace('"', '\"')
-                            safe_source = display_name.replace('\\', '\\\\').replace('"', '\"')
-                            
-                            cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
-                            asyncio.create_task(self._send_message_safe(target, cmd, target_name))
-                    
-                    # Send to Discord
-                    if discord_channel:
-                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name))
-
-# ... (UI Classes) ...
-
-class BridgeControlView(discord.ui.View):
-    def __init__(self, cog):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.add_item(BCC_CreateGroupButton(cog))
-        self.add_item(BCC_InstanceSettingsButton(cog)) # New Button
-        self.add_item(BCC_GroupSelect(cog))
-        self.add_item(BCC_StatusButton(cog))
-
-class BCC_InstanceSettingsButton(discord.ui.Button):
-    def __init__(self, cog):
-        super().__init__(label="Instance Settings", style=discord.ButtonStyle.secondary, row=0)
-        self.cog = cog
-    async def callback(self, interaction: discord.Interaction):
-        await self.cog._refresh_instances()
-        options = [discord.SelectOption(label=name[:100], value=name) for name in self.cog.instances.keys()]
-        if not options:
-            await interaction.response.send_message("No instances found.", ephemeral=True)
-            return
-        await interaction.response.send_message("Select an instance to configure:", view=InstanceSettingsSelector(self.cog, options[:25]), ephemeral=True)
-
-class InstanceSettingsSelector(discord.ui.View):
-    def __init__(self, cog, options):
-        super().__init__(timeout=60)
-        self.add_item(InstanceSelect(cog, options))
-
-class InstanceSelect(discord.ui.Select):
-    def __init__(self, cog, options):
-        self.cog = cog
-        super().__init__(placeholder="Select instance...", options=options)
-    async def callback(self, interaction: discord.Interaction):
-        server_name = self.values[0]
-        await interaction.response.send_message(f"Configuring **{server_name}**:", view=InstanceEditView(self.cog, server_name), ephemeral=True)
-
-class InstanceEditView(discord.ui.View):
-    def __init__(self, cog, server_name):
-        super().__init__(timeout=180)
-        self.cog = cog
-        self.server_name = server_name
-        
-        # Get current settings
-        settings = self.cog.bridge_data.get("instance_settings", {}).get(server_name, {})
-        alias = settings.get("alias", server_name)
-        color = settings.get("color", "aqua")
-        
-        self.add_item(IE_SetAliasButton(cog, server_name, alias))
-        self.add_item(IE_ColorSelect(cog, server_name, color))
-
-class IE_SetAliasButton(discord.ui.Button):
-    def __init__(self, cog, server_name, current_alias):
-        super().__init__(label=f"Alias: {current_alias}", style=discord.ButtonStyle.primary, row=0)
-        self.cog = cog
-        self.server_name = server_name
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(AliasModal(self.cog, self.server_name))
-
-class IE_ColorSelect(discord.ui.Select):
-    def __init__(self, cog, server_name, current_color):
-        self.cog = cog
-        self.server_name = server_name
-        
-        colors = ["black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white"]
-        options = []
-        for c in colors:
-            options.append(discord.SelectOption(label=c.replace("_", " ").title(), value=c, default=(c==current_color)))
-            
-        super().__init__(placeholder="Select Name Color...", options=options, row=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        color = self.values[0]
-        if "instance_settings" not in self.cog.bridge_data:
-            self.cog.bridge_data["instance_settings"] = {}
-        if self.server_name not in self.cog.bridge_data["instance_settings"]:
-            self.cog.bridge_data["instance_settings"][self.server_name] = {}
-            
-        self.cog.bridge_data["instance_settings"][self.server_name]["color"] = color
-        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
-        
-        await interaction.response.send_message(f"🎨 Color for **{self.server_name}** set to `{color}`.", ephemeral=True)
-
-class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
-    alias = discord.ui.TextInput(label="Display Name", required=True, max_length=20)
-    
-    def __init__(self, cog, server_name):
-        super().__init__()
-        self.cog = cog
-        self.server_name = server_name
-        
-    async def on_submit(self, interaction: discord.Interaction):
-        alias = self.alias.value.strip()
-        if "instance_settings" not in self.cog.bridge_data:
-            self.cog.bridge_data["instance_settings"] = {}
-        if self.server_name not in self.cog.bridge_data["instance_settings"]:
-            self.cog.bridge_data["instance_settings"][self.server_name] = {}
-            
-        self.cog.bridge_data["instance_settings"][self.server_name]["alias"] = alias
-        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
-        await interaction.response.send_message(f"🏷️ Alias for **{self.server_name}** set to **{alias}**.", ephemeral=True)
 
     async def _refresh_instances(self):
         try:
@@ -189,6 +62,13 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
             # Log error but don't crash; return None updates
             return name, None
 
+    def _sanitize_for_minecraft(self, text):
+        if not text: return ""
+        # 1. Remove newlines/returns to prevent console command injection
+        text = text.replace('\n', ' ').replace('\r', '')
+        # 2. Escape backslashes first, then quotes for valid JSON
+        return text.replace('\\', '\\\\').replace('"', '\"')
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
@@ -208,9 +88,9 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
             user = message.author.display_name
             msg = message.content
             
-            # Simple sanitization for tellraw JSON
-            safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
-            safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
+            # SECURITY: Sanitize to prevent command injection
+            safe_user = self._sanitize_for_minecraft(user)
+            safe_msg = self._sanitize_for_minecraft(msg)
             
             cmd = f'tellraw @a ["",{{"text":"[Discord] ", "color": "blue"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
 
@@ -299,7 +179,7 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
                 msg_type = str(getattr(entry, 'type', '')).lower()
                 if not user or not msg: continue
                 if "chat" not in msg_type: continue
-                if re.match(r"^\[.+?\] <.+?> .+", msg): continue
+                if re.match(r"^\\[.+?\\] <.+?> .+", msg): continue
                 if msg.startswith("[") and "]" in msg: continue
                 if len(user) < 3 or len(user) > 16: continue
                 
@@ -330,8 +210,13 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
                 discord_channel = self.bot.get_channel(discord_channel_id)
 
             for source_name in instance_names:
-                messages = new_messages_per_server.get(source_name)
+                messages = new_messages_per_per_server.get(source_name)
                 if not messages: continue
+                
+                # Get Instance Settings
+                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
+                display_name = settings.get("alias", source_name)
+                color = settings.get("color", "aqua")
 
                 for user, msg in messages:
                     # Send to other Minecraft Servers
@@ -339,16 +224,17 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
                         if target_name == source_name: continue
                         target = self.instances.get(target_name)
                         if target:
-                            safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
-                            safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
-                            safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
+                            # SECURITY: Sanitize to prevent command injection
+                            safe_user = self._sanitize_for_minecraft(user)
+                            safe_msg = self._sanitize_for_minecraft(msg)
+                            safe_source = self._sanitize_for_minecraft(display_name)
                             
-                            cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                            cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
                             asyncio.create_task(self._send_message_safe(target, cmd, target_name))
                     
                     # Send to Discord
                     if discord_channel:
-                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, source_name))
+                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name))
 
     async def _send_discord_message_webhook(self, channel, user, msg, source_name):
         try:
@@ -436,6 +322,7 @@ class BridgeControlView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.add_item(BCC_CreateGroupButton(cog))
+        self.add_item(BCC_InstanceSettingsButton(cog))
         self.add_item(BCC_GroupSelect(cog))
         self.add_item(BCC_StatusButton(cog))
 
@@ -445,6 +332,18 @@ class BCC_CreateGroupButton(discord.ui.Button):
         self.cog = cog
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(CreateGroupModal(self.cog))
+
+class BCC_InstanceSettingsButton(discord.ui.Button):
+    def __init__(self, cog):
+        super().__init__(label="Instance Settings", style=discord.ButtonStyle.secondary, row=0)
+        self.cog = cog
+    async def callback(self, interaction: discord.Interaction):
+        await self.cog._refresh_instances()
+        options = [discord.SelectOption(label=name[:100], value=name) for name in self.cog.instances.keys()]
+        if not options:
+            await interaction.response.send_message("No instances found.", ephemeral=True)
+            return
+        await interaction.response.send_message("Select an instance to configure:", view=InstanceSettingsSelector(self.cog, options[:25]), ephemeral=True)
 
 class BCC_StatusButton(discord.ui.Button):
     def __init__(self, cog):
@@ -660,6 +559,84 @@ class UnlinkInstanceSelect(discord.ui.Select):
         else:
             await interaction.response.send_message("Server was not linked.", ephemeral=True)
         self.view.stop()
+
+class InstanceSettingsSelector(discord.ui.View):
+    def __init__(self, cog, options):
+        super().__init__(timeout=60)
+        self.add_item(InstanceSelect(cog, options))
+
+class InstanceSelect(discord.ui.Select):
+    def __init__(self, cog, options):
+        self.cog = cog
+        super().__init__(placeholder="Select instance...", options=options)
+    async def callback(self, interaction: discord.Interaction):
+        server_name = self.values[0]
+        await interaction.response.send_message(f"Configuring **{server_name}**:", view=InstanceEditView(self.cog, server_name), ephemeral=True)
+
+class InstanceEditView(discord.ui.View):
+    def __init__(self, cog, server_name):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.server_name = server_name
+        
+        # Get current settings
+        settings = self.cog.bridge_data.get("instance_settings", {}).get(server_name, {})
+        alias = settings.get("alias", server_name)
+        color = settings.get("color", "aqua")
+        
+        self.add_item(IE_SetAliasButton(cog, server_name, alias))
+        self.add_item(IE_ColorSelect(cog, server_name, color))
+
+class IE_SetAliasButton(discord.ui.Button):
+    def __init__(self, cog, server_name, current_alias):
+        super().__init__(label=f"Alias: {current_alias}", style=discord.ButtonStyle.primary, row=0)
+        self.cog = cog
+        self.server_name = server_name
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AliasModal(self.cog, self.server_name))
+
+class IE_ColorSelect(discord.ui.Select):
+    def __init__(self, cog, server_name, current_color):
+        self.cog = cog
+        self.server_name = server_name
+        
+        colors = ["black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red", "light_purple", "yellow", "white"]
+        options = []
+        for c in colors:
+            options.append(discord.SelectOption(label=c.replace("_", " ").title(), value=c, default=(c==current_color)))
+            
+        super().__init__(placeholder="Select Name Color...", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        color = self.values[0]
+        if "instance_settings" not in self.cog.bridge_data:
+            self.cog.bridge_data["instance_settings"] = {}
+        if self.server_name not in self.cog.bridge_data["instance_settings"]:
+            self.cog.bridge_data["instance_settings"][self.server_name] = {}
+            
+        self.cog.bridge_data["instance_settings"][self.server_name]["color"] = color
+        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
+        
+        await interaction.response.send_message(f"🎨 Color for **{self.server_name}** set to `{color}`.", ephemeral=True)
+
+class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
+    alias = discord.ui.TextInput(label="Display Name", required=True, max_length=20)
+    
+    def __init__(self, cog, server_name):
+        super().__init__()
+        self.cog = cog
+        self.server_name = server_name
+        
+    async def on_submit(self, interaction: discord.Interaction):
+        alias = self.alias.value.strip()
+        if "instance_settings" not in self.cog.bridge_data:
+            self.cog.bridge_data["instance_settings"] = {}
+        if self.server_name not in self.cog.bridge_data["instance_settings"]:
+            self.cog.bridge_data["instance_settings"][self.server_name] = {}
+            
+        self.cog.bridge_data["instance_settings"][self.server_name]["alias"] = alias
+        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
+        await interaction.response.send_message(f"🏷️ Alias for **{self.server_name}** set to **{alias}**.", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(ChatBridge(bot))
