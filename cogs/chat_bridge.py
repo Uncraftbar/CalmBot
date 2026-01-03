@@ -84,108 +84,101 @@ class ChatBridge(commands.Cog):
         # Map: server_name -> updates_object
         updates_map = {name: updates for name, updates in results if updates}
 
-        # 3. Process groups using the fetched data
-        for group_name, group_data in list(self.bridge_data["groups"].items()):
+        # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
+        new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
+
+        for source_name, updates in updates_map.items():
+            if not updates.console_entries: continue
+
+            # Pre-process and sort entries by timestamp
+            parsed_entries = []
+            for entry in updates.console_entries:
+                ts = getattr(entry, 'timestamp', None)
+                if not ts: continue
+                
+                # If timestamp is already a datetime (converted by ampapi), use it.
+                if not isinstance(ts, datetime):
+                    try:
+                        ts = datetime.fromisoformat(str(ts))
+                    except ValueError:
+                        continue
+                
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                parsed_entries.append((ts, entry))
+            
+            parsed_entries.sort(key=lambda x: x[0])
+
+            # Initialization (High-Water Mark)
+            if source_name not in self.high_water_marks:
+                if parsed_entries:
+                    latest_ts, latest_entry = parsed_entries[-1]
+                    latest_hash = hash(f"{str(getattr(latest_entry, 'source', ''))}:{str(getattr(latest_entry, 'contents', ''))}")
+                    self.high_water_marks[source_name] = {'ts': latest_ts, 'hashes': {latest_hash}}
+                    print(f"[Bridge] Initialized {source_name} watermark to {latest_ts}")
+                else:
+                    self.high_water_marks[source_name] = {'ts': datetime.now(timezone.utc), 'hashes': set()}
+                    print(f"[Bridge] Initialized {source_name} watermark to NOW")
+                continue
+
+            watermark = self.high_water_marks[source_name]
+            valid_new = []
+
+            for ts, entry in parsed_entries:
+                if ts < watermark['ts']: continue
+                
+                msg = str(getattr(entry, 'contents', ''))
+                user = str(getattr(entry, 'source', ''))
+                msg_hash = hash(f"{user}:{msg}")
+
+                if ts == watermark['ts']:
+                    if msg_hash in watermark['hashes']: continue
+                    watermark['hashes'].add(msg_hash)
+                elif ts > watermark['ts']:
+                    watermark['ts'] = ts
+                    watermark['hashes'] = {msg_hash}
+
+                # Filters
+                msg_type = str(getattr(entry, 'type', '')).lower()
+                if not user or not msg: continue
+                if "chat" not in msg_type: continue
+                if re.match(r"^\[.+?\] <.+?> .+", msg): continue
+                if msg.startswith("[") and "]" in msg: continue
+                if len(user) < 3 or len(user) > 16: continue
+                
+                msg_lower = msg.lower()
+                if "tps" in msg_lower and "ms/tick" in msg_lower: continue
+                if msg_lower.startswith("private_for_"): continue
+                
+                system_users = {"server", "console", "rcon", "tip", "ftbteambases", "dimdungeons", "compactmachines", "storage", "twilight", "the", "overworld", "nether", "end", "irons_spellbooks", "ftb", "irregular_implements", "spatial"}
+                if user.lower() in system_users: continue
+
+                valid_new.append((user, msg))
+            
+            if valid_new:
+                new_messages_per_server[source_name] = valid_new
+
+        # 4. Second Pass: Dispatch messages to groups
+        for group_name, group_data in self.bridge_data["groups"].items():
             if not group_data.get("active", True): continue
             
             instance_names = group_data.get("servers", [])
             if len(instance_names) < 2: continue
 
             for source_name in instance_names:
-                # We already fetched this above
-                updates = updates_map.get(source_name)
-                if not updates or not updates.console_entries: continue
-                
-                # Pre-process and sort entries by timestamp to ensure chronological handling
-                parsed_entries = []
-                for entry in updates.console_entries:
-                    ts_str = str(getattr(entry, 'timestamp', ''))
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                        # Ensure UTC
-                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
-                        parsed_entries.append((ts, entry))
-                    except ValueError:
-                        continue # Skip entries with invalid timestamps
-                
-                # Sort ascending (oldest -> newest)
-                parsed_entries.sort(key=lambda x: x[0])
+                messages = new_messages_per_server.get(source_name)
+                if not messages: continue
 
-                # --- Initialization Check (High-Water Mark) ---
-                if source_name not in self.high_water_marks:
-                    if parsed_entries:
-                        # Set watermark to the latest message in this batch
-                        # This efficiently ignores all "history" on startup/reload
-                        latest_ts = parsed_entries[-1][0]
-                        self.high_water_marks[source_name] = {'ts': latest_ts, 'hashes': set()}
-                    else:
-                        # If no messages, default to NOW
-                        self.high_water_marks[source_name] = {'ts': datetime.now(timezone.utc), 'hashes': set()}
-                    continue # Skip processing this batch as it is considered history
-
-                # --- Message Processing ---
-                watermark = self.high_water_marks[source_name]
-                new_messages = []
-
-                for ts, entry in parsed_entries:
-                    # Logic: Is this message newer than our watermark?
-                    
-                    if ts < watermark['ts']:
-                        # Strictly older: Ignore
-                        continue
-                    
-                    msg = str(getattr(entry, 'contents', ''))
-                    user = str(getattr(entry, 'source', ''))
-                    msg_hash = hash(f"{user}:{msg}") # Simple hash for duplicate check at exact same second
-
-                    if ts == watermark['ts']:
-                        # Exact same microsecond timestamp: Check secondary hash cache
-                        if msg_hash in watermark['hashes']:
-                            continue
-                        # New message at same timestamp
-                        watermark['hashes'].add(msg_hash)
-                    
-                    elif ts > watermark['ts']:
-                        # Strictly newer: Update watermark, clear hash cache
-                        watermark['ts'] = ts
-                        watermark['hashes'] = {msg_hash}
-
-                    # --- If we reached here, the message is NEW. Proceed to filters. ---
-                    
-                    msg_type = str(getattr(entry, 'type', '')).lower()
-                    if not user or not msg: continue
-
-                    if "chat" not in msg_type: continue
-                    
-                    # Avoid looping bridge messages: [Source] <User> Msg
-                    if re.match(r"^\[.+?\] <.+?> .+", msg): continue
-
-                    if msg.startswith("[") and "]" in msg: continue
-                    if len(user) < 3 or len(user) > 16: continue
-                    
-                    msg_lower = msg.lower()
-                    if "tps" in msg_lower and "ms/tick" in msg_lower: continue
-                    if msg_lower.startswith("private_for_"): continue
-                    
-                    system_users = {"server", "console", "rcon", "tip", "ftbteambases", "dimdungeons", "compactmachines", "storage", "twilight", "the", "overworld", "nether", "end", "irons_spellbooks", "ftb", "irregular_implements", "spatial"}
-                    if user.lower() in system_users: continue
-
-                    new_messages.append((user, msg))
-
-                if new_messages:
-                    for user, msg in new_messages:
-                        for target_name in instance_names:
-                            if target_name == source_name: continue
-                            target = self.instances.get(target_name)
-                            if target:
-                                safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
-                                safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
-                                safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
-                                
-                                cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
-                                
-                                # Send concurrently/non-blocking
-                                asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+                for user, msg in messages:
+                    for target_name in instance_names:
+                        if target_name == source_name: continue
+                        target = self.instances.get(target_name)
+                        if target:
+                            safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
+                            safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
+                            safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
+                            
+                            cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                            asyncio.create_task(self._send_message_safe(target, cmd, target_name))
 
     async def _send_message_safe(self, target, cmd, target_name):
         try:
