@@ -221,18 +221,62 @@ class ChatBridge(commands.Cog):
                     
                     # Send to Discord
                     if discord_channel:
-                        # Escape markdown in user/msg to prevent abuse
-                        safe_user_discord = discord.utils.escape_markdown(user)
-                        safe_msg_discord = discord.utils.escape_markdown(msg)
-                        discord_content = f"**[{source_name}]** <{safe_user_discord}> {safe_msg_discord}"
-                        asyncio.create_task(self._send_discord_message_safe(discord_channel, discord_content))
+                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, source_name))
 
-    async def _send_discord_message_safe(self, channel, content):
+    async def _send_discord_message_webhook(self, channel, user, msg, source_name):
         try:
-            await channel.send(content)
+            # Clean content
+            safe_msg = discord.utils.escape_markdown(msg)
+            
+            # Try to get or create a webhook
+            webhook = await self._get_or_create_webhook(channel)
+            
+            if webhook:
+                # Use webhook to impersonate player
+                await webhook.send(
+                    content=safe_msg,
+                    username=f"{user} [{source_name}]",
+                    avatar_url=f"https://mc-heads.net/avatar/{user}",
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            else:
+                # Fallback if webhook creation failed
+                safe_user = discord.utils.escape_markdown(user)
+                await channel.send(f"**[{source_name}]** <{safe_user}> {safe_msg}")
+
         except Exception:
-            print(f"Failed to send message to Discord channel {channel.id}")
-            traceback.print_exc()
+            # Fallback for any other error (permissions, rate limits)
+            try:
+                print(f"[Bridge] Webhook failed for {channel.id}, falling back to standard message.")
+                # traceback.print_exc() 
+                safe_user = discord.utils.escape_markdown(user)
+                await channel.send(f"**[{source_name}]** <{safe_user}> {safe_msg}")
+            except Exception:
+                print(f"[Bridge] Failed to send message to Discord channel {channel.id}")
+
+    async def _get_or_create_webhook(self, channel):
+        # Check cache or fetch
+        # Note: We don't cache webhooks persistently in this simplistic approach to handle deletions, 
+        # but for a high-traffic bot you might want to cache 'webhook_id' in bridge_data.
+        # For now, fetching listing is reasonably cheap (1 API call per message batch if not cached).
+        
+        if not isinstance(channel, discord.TextChannel):
+            return None
+
+        try:
+            webhooks = await channel.webhooks()
+            for wh in webhooks:
+                # Use existing webhook if it belongs to the bot or has a generic name we recognize
+                if wh.user == self.bot.user or wh.name == "CalmBot Bridge":
+                    return wh
+            
+            # Create new one
+            return await channel.create_webhook(name="CalmBot Bridge")
+        except discord.Forbidden:
+            print(f"[Bridge] Missing Manage Webhooks permission in {channel.name}")
+            return None
+        except Exception:
+            return None
 
     async def _send_message_safe(self, target, cmd, target_name):
         try:
