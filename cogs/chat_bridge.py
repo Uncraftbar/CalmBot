@@ -110,15 +110,9 @@ class ChatBridge(commands.Cog):
             # We found the group, no need to check others (assuming 1:1 mapping preference)
             break
 
-    async def _update_channel_topic(self, group_name, group_data):
-        linked_channel_id = group_data.get("channel_id")
-        if not linked_channel_id: return
-        
-        channel = self.bot.get_channel(linked_channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel): return
-
+    async def _get_online_players(self, group_data):
         instance_names = group_data.get("servers", [])
-        if not instance_names: return
+        if not instance_names: return {}
         
         # Parse AMP URL for hostname
         try:
@@ -128,20 +122,19 @@ class ChatBridge(commands.Cog):
         except:
             hostname = "localhost"
 
-        total_players = 0
-        all_player_names = set()
+        online_data = {} # { "Server Alias": [player1, player2] }
 
         for server_name in instance_names:
             inst = self.instances.get(server_name)
             if not inst or not inst.running: continue
+            
+            # Get Display Name
+            settings = self.bridge_data.get("instance_settings", {}).get(server_name, {})
+            display_name = settings.get("alias", server_name)
 
-            # Get port from endpoints if available, otherwise fallback to instance.port (management port - usually wrong for MC)
-            # We rely on application_endpoints being populated.
             mc_port = None
             if hasattr(inst, 'application_endpoints'):
                  for ep in inst.application_endpoints:
-                     # Check for "Minecraft Server Address" or similar if possible, but structure is list of dicts
-                     # [{'display_name': 'Minecraft Server Address', 'endpoint': '0.0.0.0:25569', 'uri': ''}]
                      if ep.get('display_name') == 'Minecraft Server Address':
                          endpoint_str = ep.get('endpoint', '')
                          if ':' in endpoint_str:
@@ -150,62 +143,137 @@ class ChatBridge(commands.Cog):
                              except: pass
                          break
             
-            # If we couldn't find it in endpoints, we might have to skip or guess. 
-            # Ideally AMP populates this. If not, we can't query via mcstatus easily without port.
             if not mc_port: continue
 
             try:
-                # Resolve address
                 address = f"{hostname}:{mc_port}"
                 server = await JavaServer.async_lookup(address)
                 status = await server.async_status()
                 
-                if status.players.online > 0:
-                    total_players += status.players.online
-                    if status.players.sample:
-                        for p in status.players.sample:
-                            all_player_names.add(p.name)
+                players = []
+                if status.players.sample:
+                    players = [p.name for p in status.players.sample]
+                
+                # Sort players
+                players.sort()
+                online_data[display_name] = players
+                
             except Exception:
-                # Server might be starting up or unreachable
                 pass
+        
+        return online_data
+
+    async def _update_channel_topic(self, group_name, group_data):
+        linked_channel_id = group_data.get("channel_id")
+        if not linked_channel_id: return
+        
+        channel = self.bot.get_channel(linked_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel): return
+
+        online_data = await self._get_online_players(group_data)
+        
+        total_players = 0
+        all_player_names = set()
+
+        for players in online_data.values():
+            total_players += len(players)
+            for p in players:
+                all_player_names.add(p)
 
         # Construct Topic
-        # Example: "Online Players (3): Player1, Player2, Player3"
         topic = f"Online Players ({total_players})"
         if all_player_names:
-             # Sort and join
              sorted_names = sorted(list(all_player_names))
-             # Truncate if too long for topic (1024 char limit usually, but keep it shorter)
              names_str = ", ".join(sorted_names)
              topic += f": {names_str}"
         
         if len(topic) > 1000:
             topic = topic[:1000] + "..."
 
-        # Update Topic if changed
-        # We need to be careful with rate limits (2 per 10 minutes per channel).
-        # So we only update if it changed AND enough time has passed.
-        # Check last update time
         last_update = group_data.get("last_topic_update", 0)
         current_time = datetime.now().timestamp()
         
-        # 5 minutes cooldown (300 seconds) to be safe
         if current_time - last_update < 300:
-             # Exception: if topic is drastically different? No, stick to rate limit safe.
-             # Unless we cache the current topic locally to compare.
              if channel.topic == topic: return
-             # If different, we still wait for cooldown.
              pass
         else:
              if channel.topic != topic:
                  try:
                      await channel.edit(topic=topic)
                      group_data["last_topic_update"] = current_time
-                     # We don't save to file every time to avoid disk I/O spam, 
-                     # but we could if we wanted persistence across restarts. 
-                     # For now, memory cache is fine.
                  except Exception as e:
                      print(f"[Bridge] Failed to update topic for {channel.name}: {e}")
+
+    async def handle_minecraft_command(self, source_name, user, msg, group_data):
+        command = msg.split(" ")[0].lower()
+        
+        if command == "!online":
+            online_data = await self._get_online_players(group_data)
+            
+            # Construct Tellraw Message
+            # Header
+            json_msg = ['["",{"text":"[System] ", "color": "gold"}, {"text": "Online Players:", "color": "yellow"}']
+            
+            if not online_data:
+                json_msg.append(',{"text":"\\nNo players online.", "color": "gray"}]')
+            else:
+                for server_alias, players in online_data.items():
+                    p_list = ", ".join(players) if players else "None"
+                    json_msg.append(f', {{"text": "\\n{server_alias}: ", "color": "aqua"}}, {{"text": "{p_list}", "color": "white"}}')
+                json_msg.append(']')
+            
+            full_cmd = "".join(json_msg)
+            target = self.instances.get(source_name)
+            if target:
+                # Target the specific user
+                final_cmd = f"tellraw {user} {full_cmd}"
+                await self._send_message_safe(target, final_cmd, source_name)
+
+        elif command == "!help":
+            target = self.instances.get(source_name)
+            if target:
+                help_msg = '["",{"text":"[System] ", "color": "gold"}, {"text": "Available Commands:\\n", "color": "yellow"}, {"text": "!online ", "color": "aqua"}, {"text": "- List online players", "color": "white"}]'
+                final_cmd = f"tellraw {user} {help_msg}"
+                await self._send_message_safe(target, final_cmd, source_name)
+
+    @app_commands.command(name="online", description="List online players across the bridged servers.")
+    async def online_command(self, interaction: discord.Interaction):
+        # Determine group based on channel
+        target_group = None
+        target_group_name = None
+        
+        if self.bridge_data.get("groups"):
+            for name, data in self.bridge_data["groups"].items():
+                if data.get("channel_id") == interaction.channel_id:
+                    target_group = data
+                    target_group_name = name
+                    break
+        
+        if not target_group:
+            await interaction.response.send_message("This channel is not linked to any bridge group.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        
+        online_data = await self._get_online_players(target_group)
+        
+        total_count = sum(len(p) for p in online_data.values())
+        
+        embed = discord.Embed(title=f"Online Players - {target_group_name}", description=f"**Total:** {total_count}", color=discord.Color.green())
+        
+        if not online_data:
+            embed.description += "\nNo players online."
+        else:
+            for alias, players in online_data.items():
+                if players:
+                    # Discord fields have 1024 char limit
+                    p_str = ", ".join(players)
+                    if len(p_str) > 1000: p_str = p_str[:1000] + "..."
+                    embed.add_field(name=f"{alias} ({len(players)})", value=f"`{p_str}`", inline=False)
+                else:
+                    embed.add_field(name=f"{alias} (0)", value="*No players*", inline=False)
+        
+        await interaction.followup.send(embed=embed)
 
     @tasks.loop(seconds=2.0)
     async def sync_loop(self):
@@ -299,6 +367,33 @@ class ChatBridge(commands.Cog):
             
             if valid_new:
                 new_messages_per_server[source_name] = valid_new
+
+        # 3.5 Intercept Commands
+        for source_name, messages in list(new_messages_per_server.items()):
+            # Find the group for this server
+            parent_group = None
+            for group_name, group_data in self.bridge_data["groups"].items():
+                if source_name in group_data.get("servers", []):
+                    parent_group = group_data
+                    break
+            
+            if not parent_group: continue
+
+            filtered_messages = []
+            valid_commands = {"!online", "!help"}
+            
+            for user, msg in messages:
+                first_word = msg.split(" ")[0].lower()
+                if msg.startswith("!") and first_word in valid_commands:
+                    # It's a valid command
+                    asyncio.create_task(self.handle_minecraft_command(source_name, user, msg, parent_group))
+                else:
+                    filtered_messages.append((user, msg))
+            
+            if filtered_messages:
+                new_messages_per_server[source_name] = filtered_messages
+            else:
+                del new_messages_per_server[source_name]
 
         # 4. Second Pass: Dispatch messages to groups AND Discord
         for group_name, group_data in self.bridge_data["groups"].items():
