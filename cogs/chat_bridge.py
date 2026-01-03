@@ -7,8 +7,8 @@ import config
 from cogs.utils import load_json, save_json, CHAT_BRIDGE_FILE, has_admin_or_mod_permissions
 import asyncio
 import re
-from collections import deque
 import traceback
+from datetime import datetime, timezone
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -24,9 +24,10 @@ class ChatBridge(commands.Cog):
         self.amp_bridge = AMPBridge(api_params=self.api_params)
         self.ads = AMPControllerInstance()
         
-        self.instances = {} 
-        self.last_processed = {}
-        self.initialized_instances = set()
+        self.instances = {}
+        # Stores the "High Water Mark" for each server: 
+        # { "server_name": { "ts": datetime_obj, "hashes": set() } }
+        self.high_water_marks = {}
         
         self.sync_loop.start()
 
@@ -95,45 +96,64 @@ class ChatBridge(commands.Cog):
                 updates = updates_map.get(source_name)
                 if not updates or not updates.console_entries: continue
                 
-                # Check initialization state
-                is_initialized = source_name in self.initialized_instances
-                self.initialized_instances.add(source_name)
-
-                new_messages = []
+                # Pre-process and sort entries by timestamp to ensure chronological handling
+                parsed_entries = []
                 for entry in updates.console_entries:
-                    user = str(getattr(entry, 'source', ''))
+                    ts_str = str(getattr(entry, 'timestamp', ''))
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        # Ensure UTC
+                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                        parsed_entries.append((ts, entry))
+                    except ValueError:
+                        continue # Skip entries with invalid timestamps
+                
+                # Sort ascending (oldest -> newest)
+                parsed_entries.sort(key=lambda x: x[0])
+
+                # --- Initialization Check (High-Water Mark) ---
+                if source_name not in self.high_water_marks:
+                    if parsed_entries:
+                        # Set watermark to the latest message in this batch
+                        # This efficiently ignores all "history" on startup/reload
+                        latest_ts = parsed_entries[-1][0]
+                        self.high_water_marks[source_name] = {'ts': latest_ts, 'hashes': set()}
+                    else:
+                        # If no messages, default to NOW
+                        self.high_water_marks[source_name] = {'ts': datetime.now(timezone.utc), 'hashes': set()}
+                    continue # Skip processing this batch as it is considered history
+
+                # --- Message Processing ---
+                watermark = self.high_water_marks[source_name]
+                new_messages = []
+
+                for ts, entry in parsed_entries:
+                    # Logic: Is this message newer than our watermark?
+                    
+                    if ts < watermark['ts']:
+                        # Strictly older: Ignore
+                        continue
+                    
                     msg = str(getattr(entry, 'contents', ''))
+                    user = str(getattr(entry, 'source', ''))
+                    msg_hash = hash(f"{user}:{msg}") # Simple hash for duplicate check at exact same second
+
+                    if ts == watermark['ts']:
+                        # Exact same microsecond timestamp: Check secondary hash cache
+                        if msg_hash in watermark['hashes']:
+                            continue
+                        # New message at same timestamp
+                        watermark['hashes'].add(msg_hash)
+                    
+                    elif ts > watermark['ts']:
+                        # Strictly newer: Update watermark, clear hash cache
+                        watermark['ts'] = ts
+                        watermark['hashes'] = {msg_hash}
+
+                    # --- If we reached here, the message is NEW. Proceed to filters. ---
+                    
                     msg_type = str(getattr(entry, 'type', '')).lower()
-                    timestamp = str(getattr(entry, 'timestamp', ''))
-                    
                     if not user or not msg: continue
-                    
-                    # --- FILTERS ---
-                    
-                    # Dedupe using Source + Msg + Timestamp for uniqueness
-                    line_hash = hash(f"{source_name}:{user}:{msg}:{timestamp}")
-                    
-                    if source_name not in self.last_processed:
-                        self.last_processed[source_name] = {"set": set(), "deque": deque()}
-                    
-                    # Safety check for structure type
-                    if isinstance(self.last_processed[source_name], set):
-                            self.last_processed[source_name] = {"set": self.last_processed[source_name], "deque": deque(self.last_processed[source_name])}
-
-                    proc_data = self.last_processed[source_name]
-                    if line_hash in proc_data["set"]: continue
-                    
-                    proc_data["set"].add(line_hash)
-                    proc_data["deque"].append(line_hash)
-                    
-                    # Increased cache size to 2000 to better handle large history buffers
-                    if len(proc_data["deque"]) > 2000:
-                        removed = proc_data["deque"].popleft()
-                        if removed in proc_data["set"]:
-                            proc_data["set"].remove(removed)
-
-                    # If first run for this server, skip broadcasting
-                    if not is_initialized: continue
 
                     if "chat" not in msg_type: continue
                     
