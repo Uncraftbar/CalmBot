@@ -6,6 +6,9 @@ from ampapi.dataclass import APIParams
 import config
 from cogs.utils import load_json, save_json, CHAT_BRIDGE_FILE, has_admin_or_mod_permissions
 import asyncio
+import re
+from collections import deque
+import traceback
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -23,6 +26,7 @@ class ChatBridge(commands.Cog):
         
         self.instances = {} 
         self.last_processed = {}
+        self.initialized_instances = set()
         
         self.sync_loop.start()
 
@@ -40,7 +44,9 @@ class ChatBridge(commands.Cog):
             for inst in self.ads.instances:
                 name = inst.friendly_name or inst.instance_name
                 self.instances[name] = inst
-        except: pass
+        except Exception:
+            print("Error refreshing instances:")
+            traceback.print_exc()
 
     @tasks.loop(seconds=2.0)
     async def sync_loop(self):
@@ -58,6 +64,11 @@ class ChatBridge(commands.Cog):
 
                 try:
                     updates = await instance.get_updates(format_data=True)
+                    
+                    # Capture initialization state before processing this batch
+                    is_initialized = source_name in self.initialized_instances
+                    self.initialized_instances.add(source_name)
+
                     if not updates.console_entries: continue
 
                     new_messages = []
@@ -73,12 +84,33 @@ class ChatBridge(commands.Cog):
                         
                         # Dedupe using Source + Msg + Timestamp for uniqueness
                         line_hash = hash(f"{source_name}:{user}:{msg}:{timestamp}")
-                        if source_name not in self.last_processed: self.last_processed[source_name] = set()
-                        if len(self.last_processed[source_name]) > 500: self.last_processed[source_name].clear()
-                        if line_hash in self.last_processed[source_name]: continue
-                        self.last_processed[source_name].add(line_hash)
+                        
+                        if source_name not in self.last_processed:
+                            self.last_processed[source_name] = {"set": set(), "deque": deque()}
+                        
+                        # Handle case where old set-only structure might persist if hot-reloaded incorrectly (safety check)
+                        if isinstance(self.last_processed[source_name], set):
+                             self.last_processed[source_name] = {"set": self.last_processed[source_name], "deque": deque(self.last_processed[source_name])}
+
+                        proc_data = self.last_processed[source_name]
+                        if line_hash in proc_data["set"]: continue
+                        
+                        proc_data["set"].add(line_hash)
+                        proc_data["deque"].append(line_hash)
+                        
+                        if len(proc_data["deque"]) > 500:
+                            removed = proc_data["deque"].popleft()
+                            if removed in proc_data["set"]:
+                                proc_data["set"].remove(removed)
+
+                        # If this is the first time we're seeing this instance, just populate cache and skip sending
+                        if not is_initialized: continue
 
                         if "chat" not in msg_type: continue
+                        
+                        # Avoid looping bridge messages: [Source] <User> Msg
+                        if re.match(r"^\[.+?\] <.+?> .+", msg): continue
+
                         if msg.startswith("[") and "]" in msg: continue
                         if len(user) < 3 or len(user) > 16: continue
                         
@@ -97,13 +129,20 @@ class ChatBridge(commands.Cog):
                                 if target_name == source_name: continue
                                 target = self.instances.get(target_name)
                                 if target:
-                                    safe_user = user.replace('"', '\"')
-                                    safe_msg = msg.replace('"', '\"')
-                                    safe_source = source_name.replace('"', '\"')
+                                    # Fix JSON injection: Escape backslashes first, then quotes
+                                    safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
+                                    safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
+                                    safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
+                                    
                                     cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
-                                    try: await target.send_console_message(cmd)
-                                    except: pass
-                except: pass
+                                    try: 
+                                        await target.send_console_message(cmd)
+                                    except Exception:
+                                        print(f"Failed to send message to {target_name}:")
+                                        traceback.print_exc()
+                except Exception:
+                    print(f"Error processing updates for {source_name}:")
+                    traceback.print_exc()
 
     @sync_loop.before_loop
     async def before_sync(self):
