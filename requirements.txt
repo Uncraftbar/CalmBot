@@ -1,0 +1,4 @@
+discord.py>=2.3.0
+cc-ampapi>=1.0.0
+mcstatus>=11.1.0
+dnspython>=2.6.0

@@ -36,7 +36,7 @@ A feature-rich Discord bot designed for Minecraft server communities. It offers 
 
 2. **Install dependencies**
    ```bash
-   pip install discord.py cc-ampapi
+   pip install -r requirements.txt
    ```
 
 3. **Configure the bot**
@@ -83,6 +83,8 @@ A feature-rich Discord bot designed for Minecraft server communities. It offers 
 - Python 3.8+
 - `discord.py`
 - `cc-ampapi`
+- `mcstatus`
+- `dnspython`
 
 ## Security
 

@@ -9,6 +9,8 @@ import asyncio
 import re
 import traceback
 from datetime import datetime, timezone
+from urllib.parse import urlparse
+from mcstatus import JavaServer
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -101,6 +103,103 @@ class ChatBridge(commands.Cog):
             
             # We found the group, no need to check others (assuming 1:1 mapping preference)
             break
+
+    async def _update_channel_topic(self, group_name, group_data):
+        linked_channel_id = group_data.get("channel_id")
+        if not linked_channel_id: return
+        
+        channel = self.bot.get_channel(linked_channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel): return
+
+        instance_names = group_data.get("servers", [])
+        if not instance_names: return
+        
+        # Parse AMP URL for hostname
+        try:
+            parsed_url = urlparse(self.amp_url)
+            hostname = parsed_url.hostname
+            if not hostname: hostname = "localhost"
+        except:
+            hostname = "localhost"
+
+        total_players = 0
+        all_player_names = set()
+
+        for server_name in instance_names:
+            inst = self.instances.get(server_name)
+            if not inst or not inst.running: continue
+
+            # Get port from endpoints if available, otherwise fallback to instance.port (management port - usually wrong for MC)
+            # We rely on application_endpoints being populated.
+            mc_port = None
+            if hasattr(inst, 'application_endpoints'):
+                 for ep in inst.application_endpoints:
+                     # Check for "Minecraft Server Address" or similar if possible, but structure is list of dicts
+                     # [{'display_name': 'Minecraft Server Address', 'endpoint': '0.0.0.0:25569', 'uri': ''}]
+                     if ep.get('display_name') == 'Minecraft Server Address':
+                         endpoint_str = ep.get('endpoint', '')
+                         if ':' in endpoint_str:
+                             try:
+                                 mc_port = int(endpoint_str.split(':')[-1])
+                             except: pass
+                         break
+            
+            # If we couldn't find it in endpoints, we might have to skip or guess. 
+            # Ideally AMP populates this. If not, we can't query via mcstatus easily without port.
+            if not mc_port: continue
+
+            try:
+                # Resolve address
+                address = f"{hostname}:{mc_port}"
+                server = await JavaServer.async_lookup(address)
+                status = await server.async_status()
+                
+                if status.players.online > 0:
+                    total_players += status.players.online
+                    if status.players.sample:
+                        for p in status.players.sample:
+                            all_player_names.add(p.name)
+            except Exception:
+                # Server might be starting up or unreachable
+                pass
+
+        # Construct Topic
+        # Example: "Online Players (3): Player1, Player2, Player3"
+        topic = f"Online Players ({total_players})"
+        if all_player_names:
+             # Sort and join
+             sorted_names = sorted(list(all_player_names))
+             # Truncate if too long for topic (1024 char limit usually, but keep it shorter)
+             names_str = ", ".join(sorted_names)
+             topic += f": {names_str}"
+        
+        if len(topic) > 1000:
+            topic = topic[:1000] + "..."
+
+        # Update Topic if changed
+        # We need to be careful with rate limits (2 per 10 minutes per channel).
+        # So we only update if it changed AND enough time has passed.
+        # Check last update time
+        last_update = group_data.get("last_topic_update", 0)
+        current_time = datetime.now().timestamp()
+        
+        # 5 minutes cooldown (300 seconds) to be safe
+        if current_time - last_update < 300:
+             # Exception: if topic is drastically different? No, stick to rate limit safe.
+             # Unless we cache the current topic locally to compare.
+             if channel.topic == topic: return
+             # If different, we still wait for cooldown.
+             pass
+        else:
+             if channel.topic != topic:
+                 try:
+                     await channel.edit(topic=topic)
+                     group_data["last_topic_update"] = current_time
+                     # We don't save to file every time to avoid disk I/O spam, 
+                     # but we could if we wanted persistence across restarts. 
+                     # For now, memory cache is fine.
+                 except Exception as e:
+                     print(f"[Bridge] Failed to update topic for {channel.name}: {e}")
 
     @tasks.loop(seconds=2.0)
     async def sync_loop(self):
@@ -235,6 +334,9 @@ class ChatBridge(commands.Cog):
                     # Send to Discord
                     if discord_channel:
                         asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name))
+
+            # Update Topic for this group
+            asyncio.create_task(self._update_channel_topic(group_name, group_data))
 
     async def _send_discord_message_webhook(self, channel, user, msg, source_name):
         try:
