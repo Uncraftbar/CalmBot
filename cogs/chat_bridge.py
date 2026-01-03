@@ -30,6 +30,7 @@ class ChatBridge(commands.Cog):
         # Stores the "High Water Mark" for each server: 
         # { "server_name": { "ts": datetime_obj, "hashes": set() } }
         self.high_water_marks = {}
+        self.console_listeners = []
         
         self.sync_loop.start()
 
@@ -232,9 +233,75 @@ class ChatBridge(commands.Cog):
         elif command == "!help":
             target = self.instances.get(source_name)
             if target:
-                help_msg = '["",{"text":"[System] ", "color": "gold"}, {"text": "Available Commands:\\n", "color": "yellow"}, {"text": "!online ", "color": "aqua"}, {"text": "- List online players", "color": "white"}]'
+                help_msg = '["",{"text":"[System] ", "color": "gold"}, {"text": "Available Commands:\\n", "color": "yellow"}, {"text": "!online ", "color": "aqua"}, {"text": "- List online players", "color": "white"}, {"text": "\\n!item ", "color": "aqua"}, {"text": "- Show held item", "color": "white"}]'
                 final_cmd = f"tellraw {user} {help_msg}"
                 await self._send_message_safe(target, final_cmd, source_name)
+
+        elif command == "!item":
+            target_inst = self.instances.get(source_name)
+            if not target_inst: return
+
+            # 1. Send data get command
+            cmd_check = f"data get entity {user} SelectedItem.id"
+            await self._send_message_safe(target_inst, cmd_check, source_name)
+            
+            # 2. Setup Listener
+            # Pattern: PlayerName has the following entity data: "gtceu:tritanium_coil_block"
+            pattern_str = f"{re.escape(user)} has the following entity data: \"(?:[^:]+:)?(.+?)\""
+            regex = re.compile(pattern_str)
+            
+            fut = asyncio.Future()
+            listener = {'source': source_name, 'regex': regex, 'future': fut}
+            self.console_listeners.append(listener)
+            
+            try:
+                # Wait for response (4 seconds to cover 2 sync loops)
+                match = await asyncio.wait_for(fut, timeout=4.0)
+                
+                item_id = match.group(1)
+                # cleanup: remove underscores, capitalize
+                item_name = item_id.replace("_", " ").title()
+                
+                # 3. Broadcast to all servers in the group (including source)
+                # Get Source Display Name & Color
+                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
+                display_name = settings.get("alias", source_name)
+                color = settings.get("color", "aqua")
+
+                # Sanitize
+                safe_user = self._sanitize_for_minecraft(user)
+                safe_source = self._sanitize_for_minecraft(display_name)
+                safe_item = self._sanitize_for_minecraft(item_name)
+
+                # Construct Tellraw
+                # Format: [Source] <User> [Item Name]
+                cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "[{safe_item}]", "color": "light_purple" }}]'
+
+                instance_names = group_data.get("servers", [])
+                for target_name in instance_names:
+                    target = self.instances.get(target_name)
+                    if target:
+                        asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+                
+                # Send to Discord too if linked
+                discord_channel_id = group_data.get("channel_id")
+                if discord_channel_id:
+                    channel = self.bot.get_channel(discord_channel_id)
+                    if channel:
+                         embed = discord.Embed(
+                             title=f"{user} Shared an Item", 
+                             description=item_name, 
+                             color=discord.Color.blue()
+                         )
+                         asyncio.create_task(self._send_discord_message_webhook(channel, user, None, display_name, embed=embed))
+
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                traceback.print_exc()
+            finally:
+                if listener in self.console_listeners:
+                    self.console_listeners.remove(listener)
 
     @app_commands.command(name="online", description="List online players across the bridged servers.")
     async def online_command(self, interaction: discord.Interaction):
@@ -348,6 +415,16 @@ class ChatBridge(commands.Cog):
                     watermark['ts'] = ts
                     watermark['hashes'] = {msg_hash}
 
+                # Check Listeners
+                for listener in self.console_listeners[:]:
+                    if listener['source'] == source_name:
+                        match = listener['regex'].search(msg)
+                        if match:
+                            if not listener['future'].done():
+                                listener['future'].set_result(match)
+                            if listener in self.console_listeners:
+                                self.console_listeners.remove(listener)
+
                 # Filters
                 msg_type = str(getattr(entry, 'type', '')).lower()
                 if not user or not msg: continue
@@ -380,7 +457,7 @@ class ChatBridge(commands.Cog):
             if not parent_group: continue
 
             filtered_messages = []
-            valid_commands = {"!online", "!help"}
+            valid_commands = {"!online", "!help", "!item"}
             
             for user, msg in messages:
                 first_word = msg.split(" ")[0].lower()
@@ -439,10 +516,10 @@ class ChatBridge(commands.Cog):
             # Update Topic for this group
             asyncio.create_task(self._update_channel_topic(group_name, group_data))
 
-    async def _send_discord_message_webhook(self, channel, user, msg, source_name):
+    async def _send_discord_message_webhook(self, channel, user, msg, source_name, embed=None):
         try:
             # Clean content
-            safe_msg = discord.utils.escape_markdown(msg)
+            safe_msg = discord.utils.escape_markdown(msg) if msg else None
             
             # Try to get or create a webhook
             webhook = await self._get_or_create_webhook(channel)
@@ -451,6 +528,7 @@ class ChatBridge(commands.Cog):
                 # Use webhook to impersonate player
                 await webhook.send(
                     content=safe_msg,
+                    embed=embed,
                     username=f"{user} [{source_name}]",
                     avatar_url=f"https://mc-heads.net/avatar/{user}",
                     allowed_mentions=discord.AllowedMentions.none()
@@ -458,7 +536,11 @@ class ChatBridge(commands.Cog):
             else:
                 # Fallback if webhook creation failed
                 safe_user = discord.utils.escape_markdown(user)
-                await channel.send(f"**[{source_name}]** <{safe_user}> {safe_msg}")
+                prefix = f"**[{source_name}]** <{safe_user}>"
+                if embed:
+                    await channel.send(content=prefix, embed=embed)
+                else:
+                    await channel.send(f"{prefix} {safe_msg}")
 
         except Exception:
             # Fallback for any other error (permissions, rate limits)
@@ -466,7 +548,12 @@ class ChatBridge(commands.Cog):
                 print(f"[Bridge] Webhook failed for {channel.id}, falling back to standard message.")
                 # traceback.print_exc() 
                 safe_user = discord.utils.escape_markdown(user)
-                await channel.send(f"**[{source_name}]** <{safe_user}> {safe_msg}")
+                prefix = f"**[{source_name}]** <{safe_user}>"
+                if embed:
+                    await channel.send(content=prefix, embed=embed)
+                else:
+                    safe_msg = discord.utils.escape_markdown(msg) if msg else ""
+                    await channel.send(f"{prefix} {safe_msg}")
             except Exception:
                 print(f"[Bridge] Failed to send message to Discord channel {channel.id}")
 
