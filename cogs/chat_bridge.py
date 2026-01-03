@@ -48,10 +48,42 @@ class ChatBridge(commands.Cog):
             print("Error refreshing instances:")
             traceback.print_exc()
 
+    async def _fetch_update_safe(self, name, instance):
+        try:
+            # Return tuple of (name, updates)
+            # 5 second timeout to prevent hanging
+            updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=5.0)
+            return name, updates
+        except asyncio.TimeoutError:
+            print(f"[Bridge] Timeout fetching updates for {name}")
+            return name, None
+        except Exception:
+            # Log error but don't crash; return None updates
+            return name, None
+
     @tasks.loop(seconds=2.0)
     async def sync_loop(self):
         if not self.bridge_data.get("groups"): return
 
+        # 1. Identify all unique active servers across all groups
+        active_instances = {}
+        for group_data in self.bridge_data["groups"].values():
+            if not group_data.get("active", True): continue
+            for server_name in group_data.get("servers", []):
+                if server_name in self.instances:
+                    active_instances[server_name] = self.instances[server_name]
+
+        if not active_instances:
+            return
+
+        # 2. Fetch updates from all servers concurrently
+        tasks = [self._fetch_update_safe(name, inst) for name, inst in active_instances.items()]
+        results = await asyncio.gather(*tasks)
+        
+        # Map: server_name -> updates_object
+        updates_map = {name: updates for name, updates in results if updates}
+
+        # 3. Process groups using the fetched data
         for group_name, group_data in list(self.bridge_data["groups"].items()):
             if not group_data.get("active", True): continue
             
@@ -59,90 +91,91 @@ class ChatBridge(commands.Cog):
             if len(instance_names) < 2: continue
 
             for source_name in instance_names:
-                instance = self.instances.get(source_name)
-                if not instance: continue
+                # We already fetched this above
+                updates = updates_map.get(source_name)
+                if not updates or not updates.console_entries: continue
+                
+                # Check initialization state
+                is_initialized = source_name in self.initialized_instances
+                self.initialized_instances.add(source_name)
 
-                try:
-                    updates = await instance.get_updates(format_data=True)
+                new_messages = []
+                for entry in updates.console_entries:
+                    user = str(getattr(entry, 'source', ''))
+                    msg = str(getattr(entry, 'contents', ''))
+                    msg_type = str(getattr(entry, 'type', '')).lower()
+                    timestamp = str(getattr(entry, 'timestamp', ''))
                     
-                    # Capture initialization state before processing this batch
-                    is_initialized = source_name in self.initialized_instances
-                    self.initialized_instances.add(source_name)
+                    if not user or not msg: continue
+                    
+                    # --- FILTERS ---
+                    
+                    # Dedupe using Source + Msg + Timestamp for uniqueness
+                    line_hash = hash(f"{source_name}:{user}:{msg}:{timestamp}")
+                    
+                    if source_name not in self.last_processed:
+                        self.last_processed[source_name] = {"set": set(), "deque": deque()}
+                    
+                    # Safety check for structure type
+                    if isinstance(self.last_processed[source_name], set):
+                            self.last_processed[source_name] = {"set": self.last_processed[source_name], "deque": deque(self.last_processed[source_name])}
 
-                    if not updates.console_entries: continue
+                    proc_data = self.last_processed[source_name]
+                    if line_hash in proc_data["set"]: continue
+                    
+                    proc_data["set"].add(line_hash)
+                    proc_data["deque"].append(line_hash)
+                    
+                    # Increased cache size to 2000 to better handle large history buffers
+                    if len(proc_data["deque"]) > 2000:
+                        removed = proc_data["deque"].popleft()
+                        if removed in proc_data["set"]:
+                            proc_data["set"].remove(removed)
 
-                    new_messages = []
-                    for entry in updates.console_entries:
-                        user = str(getattr(entry, 'source', ''))
-                        msg = str(getattr(entry, 'contents', ''))
-                        msg_type = str(getattr(entry, 'type', '')).lower()
-                        timestamp = str(getattr(entry, 'timestamp', ''))
-                        
-                        if not user or not msg: continue
-                        
-                        # --- FILTERS ---
-                        
-                        # Dedupe using Source + Msg + Timestamp for uniqueness
-                        line_hash = hash(f"{source_name}:{user}:{msg}:{timestamp}")
-                        
-                        if source_name not in self.last_processed:
-                            self.last_processed[source_name] = {"set": set(), "deque": deque()}
-                        
-                        # Handle case where old set-only structure might persist if hot-reloaded incorrectly (safety check)
-                        if isinstance(self.last_processed[source_name], set):
-                             self.last_processed[source_name] = {"set": self.last_processed[source_name], "deque": deque(self.last_processed[source_name])}
+                    # If first run for this server, skip broadcasting
+                    if not is_initialized: continue
 
-                        proc_data = self.last_processed[source_name]
-                        if line_hash in proc_data["set"]: continue
-                        
-                        proc_data["set"].add(line_hash)
-                        proc_data["deque"].append(line_hash)
-                        
-                        if len(proc_data["deque"]) > 500:
-                            removed = proc_data["deque"].popleft()
-                            if removed in proc_data["set"]:
-                                proc_data["set"].remove(removed)
+                    if "chat" not in msg_type: continue
+                    
+                    # Avoid looping bridge messages: [Source] <User> Msg
+                    if re.match(r"^\[.+?\] <.+?> .+", msg): continue
 
-                        # If this is the first time we're seeing this instance, just populate cache and skip sending
-                        if not is_initialized: continue
+                    if msg.startswith("[") and "]" in msg: continue
+                    if len(user) < 3 or len(user) > 16: continue
+                    
+                    msg_lower = msg.lower()
+                    if "tps" in msg_lower and "ms/tick" in msg_lower: continue
+                    if msg_lower.startswith("private_for_"): continue
+                    
+                    system_users = {"server", "console", "rcon", "tip", "ftbteambases", "dimdungeons", "compactmachines", "storage", "twilight", "the", "overworld", "nether", "end", "irons_spellbooks", "ftb", "irregular_implements", "spatial"}
+                    if user.lower() in system_users: continue
 
-                        if "chat" not in msg_type: continue
-                        
-                        # Avoid looping bridge messages: [Source] <User> Msg
-                        if re.match(r"^\[.+?\] <.+?> .+", msg): continue
+                    new_messages.append((user, msg))
 
-                        if msg.startswith("[") and "]" in msg: continue
-                        if len(user) < 3 or len(user) > 16: continue
-                        
-                        msg_lower = msg.lower()
-                        if "tps" in msg_lower and "ms/tick" in msg_lower: continue
-                        if msg_lower.startswith("private_for_"): continue
-                        
-                        system_users = {"server", "console", "rcon", "tip", "ftbteambases", "dimdungeons", "compactmachines", "storage", "twilight", "the", "overworld", "nether", "end", "irons_spellbooks", "ftb", "irregular_implements", "spatial"}
-                        if user.lower() in system_users: continue
+                if new_messages:
+                    for user, msg in new_messages:
+                        for target_name in instance_names:
+                            if target_name == source_name: continue
+                            target = self.instances.get(target_name)
+                            if target:
+                                safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
+                                safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
+                                safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
+                                
+                                cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                                
+                                # Send concurrently/non-blocking
+                                asyncio.create_task(self._send_message_safe(target, cmd, target_name))
 
-                        new_messages.append((user, msg))
-
-                    if new_messages:
-                        for user, msg in new_messages:
-                            for target_name in instance_names:
-                                if target_name == source_name: continue
-                                target = self.instances.get(target_name)
-                                if target:
-                                    # Fix JSON injection: Escape backslashes first, then quotes
-                                    safe_user = user.replace('\\', '\\\\').replace('"', '\\"')
-                                    safe_msg = msg.replace('\\', '\\\\').replace('"', '\\"')
-                                    safe_source = source_name.replace('\\', '\\\\').replace('"', '\\"')
-                                    
-                                    cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "aqua"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
-                                    try: 
-                                        await target.send_console_message(cmd)
-                                    except Exception:
-                                        print(f"Failed to send message to {target_name}:")
-                                        traceback.print_exc()
-                except Exception:
-                    print(f"Error processing updates for {source_name}:")
-                    traceback.print_exc()
+    async def _send_message_safe(self, target, cmd, target_name):
+        try:
+            # 5 second timeout for sending too
+            await asyncio.wait_for(target.send_console_message(cmd), timeout=5.0)
+        except asyncio.TimeoutError:
+            print(f"[Bridge] Timeout sending message to {target_name}")
+        except Exception:
+            print(f"Failed to send message to {target_name}:")
+            traceback.print_exc()
 
     @sync_loop.before_loop
     async def before_sync(self):
