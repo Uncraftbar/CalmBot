@@ -210,7 +210,7 @@ class ChatBridge(commands.Cog):
                 discord_channel = self.bot.get_channel(discord_channel_id)
 
             for source_name in instance_names:
-                messages = new_messages_per_per_server.get(source_name)
+                messages = new_messages_per_server.get(source_name)
                 if not messages: continue
                 
                 # Get Instance Settings
