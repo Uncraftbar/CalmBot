@@ -20,7 +20,7 @@ class MainBot(commands.Bot):
         intents.reactions = True
         intents.members = True
         intents.message_content = True  # Enable message content intent for keyword triggers
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="?", intents=intents, help_command=None)
 
     async def setup_hook(self):
         for filename in os.listdir("./cogs"):
