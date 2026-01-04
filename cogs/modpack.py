@@ -1,214 +1,363 @@
+"""
+Modpack management for CalmBot.
+Handles modpack category creation, migration, and connection info.
+"""
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-from cogs.utils import has_admin_or_mod_permissions, find_category_by_name, load_json, save_json, ROLES_BOARD_FILE
+
+from cogs.utils import (
+    get_logger,
+    load_json,
+    save_json,
+    check_permissions,
+    admin_only,
+    find_category_by_name,
+    success_embed,
+    error_embed,
+    warning_embed,
+    info_embed,
+    ROLES_BOARD_FILE
+)
+
+log = get_logger("modpack")
+
+
+class ConfirmDeleteView(discord.ui.View):
+    """Confirmation view for modpack deletion."""
+    
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.confirmed = None
+    
+    @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        self.stop()
+        await interaction.response.defer()
+    
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        self.stop()
+        await interaction.response.defer()
+
 
 class Modpack(commands.Cog):
-    def __init__(self, bot):
+    """Modpack category and channel management."""
+    
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.roles_board = load_json(ROLES_BOARD_FILE, {"channel_id": None, "message_id": None, "roles": []})
-
-    def reload_roles_board(self):
-        # Always reload the latest roles_board.json from disk
+        log.info("Modpack cog initialized")
+    
+    def _reload_roles_board(self):
+        """Reload roles board data from disk."""
         self.roles_board = load_json(ROLES_BOARD_FILE, {"channel_id": None, "message_id": None, "roles": []})
-
-    @app_commands.command(name="setup_modpack", description="Set up modpack category and channels")
+    
+    @app_commands.command(name="setup_modpack", description="Create a modpack category with channels and role")
     @app_commands.describe(
         name="Name of the modpack",
         modloader="The modloader for this modpack",
         modpack_link="Link to the modpack",
         connection_ip="Connection IP or URL",
-        role_emoji="Emoji for users to react with to get the role"
+        role_emoji="Emoji for the notification role (optional)"
     )
     @app_commands.choices(modloader=[
         app_commands.Choice(name="NEOFORGE", value="NEOFORGE"),
         app_commands.Choice(name="FORGE", value="FORGE"),
         app_commands.Choice(name="FABRIC", value="FABRIC")
     ])
-    async def setup_modpack(self, interaction: discord.Interaction, name: str, modloader: str, modpack_link: str, connection_ip: str, role_emoji: str = None):
-        self.reload_roles_board()  # Ensure latest roles board config
-        if not await has_admin_or_mod_permissions(interaction):
-            return
+    @admin_only()
+    async def setup_modpack(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        modloader: str,
+        modpack_link: str,
+        connection_ip: str,
+        role_emoji: str = None
+    ):
+        """Create a new modpack with category, channels, and optional role."""
+        self._reload_roles_board()
         guild = interaction.guild
-        category_name = f"{name} [{modloader}]"
-        await interaction.response.send_message(f"Setting up **{category_name}**...", ephemeral=True)
-        if discord.utils.get(guild.categories, name=category_name):
-            await interaction.edit_original_response(content=f"? Category **{category_name}** already exists.")
+        
+        if not guild:
+            await interaction.response.send_message(
+                embed=error_embed("Error", "This command must be used in a server."),
+                ephemeral=True
+            )
             return
-        category = await guild.create_category(category_name)
-        general = await guild.create_text_channel("general", category=category)
-        await guild.create_text_channel("technical-help", category=category)
+        
+        category_name = f"{name} [{modloader}]"
+        await interaction.response.send_message(
+            f"⏳ Setting up **{category_name}**...",
+            ephemeral=True
+        )
+        
+        # Check if category exists
+        if discord.utils.get(guild.categories, name=category_name):
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Already Exists", f"Category **{category_name}** already exists.")
+            )
+            return
+        
         try:
+            # Create category and channels
+            category = await guild.create_category(category_name)
+            await guild.create_text_channel("general", category=category)
+            await guild.create_text_channel("technical-help", category=category)
+            
+            # Create connection-info with restricted permissions
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(send_messages=False, add_reactions=True),
                 guild.me: discord.PermissionOverwrite(send_messages=True)
             }
-            connection_info = await guild.create_text_channel("connection-info", overwrites=overwrites, category=category)
-            msg = f"**Modpack URL:** {modpack_link}\n**Connection URL:** {connection_ip}"
-            await connection_info.send(msg)
+            connection_info = await guild.create_text_channel(
+                "connection-info",
+                overwrites=overwrites,
+                category=category
+            )
+            
+            # Send connection info message
+            await connection_info.send(
+                f"**Modpack URL:** {modpack_link}\n**Connection URL:** {connection_ip}"
+            )
+            
+            # Handle role creation
             role_message = ""
             if role_emoji:
-                try:
-                    role = await guild.create_role(name=f"{name} Updates", mentionable=True, reason="Modpack Updates Role")
-                    if not self.roles_board["channel_id"] or not self.roles_board["message_id"]:
-                        role_message = f"\n⚠️ Created role '{role.name}' but no roles board is configured. Use /setup_roles_board to create one."
-                    else:
-                        roles_channel = self.bot.get_channel(self.roles_board["channel_id"])
-                        if roles_channel:
-                            message = await roles_channel.fetch_message(self.roles_board["message_id"])
-                            try:
-                                await message.add_reaction(role_emoji)
-                                emoji_key = role_emoji
-                                self.roles_board["roles"].append({
-                                    "name": f"{name} Updates",
-                                    "emoji": emoji_key,
-                                    "role_id": role.id
-                                })
-                                save_json(ROLES_BOARD_FILE, self.roles_board)
-                                roles_cog = self.bot.get_cog("RolesBoard")
-                                if roles_cog and await roles_cog.update_roles_board():
-                                    role_message = f"\n✅ Created role '{role.name}' with reaction {role_emoji} on the roles board"
-                                else:
-                                    role_message = f"\n⚠️ Created role '{role.name}' but could not update the roles board"
-                            except discord.HTTPException:
-                                role_message = f"\n⚠️ Created role '{role.name}' but '{role_emoji}' is not a valid emoji"
-                        else:
-                            role_message = f"\n⚠️ Created role '{role.name}' but could not find the roles board channel"
-                except discord.Forbidden:
-                    role_message = "\n⚠️ I don't have permission to create roles."
-                except Exception as e:
-                    role_message = f"\n⚠️ Error creating role: {str(e)}"
-            await interaction.edit_original_response(content=f"✅ Created **{category_name}** with required channels.{role_message}")
-        except discord.Forbidden as e:
-            await interaction.edit_original_response(content=f"⚠️ Cannot create or use connection-info channel properly. Error: {str(e)}")
-            return
-
-    @app_commands.command(name="delete_modpack", description="Delete a modpack category, all its channels, and associated role")
-    @app_commands.describe(
-        category_name="The name of the modpack (with or without [MODLOADER])"
-    )
+                role_message = await self._create_modpack_role(guild, name, role_emoji)
+            
+            await interaction.edit_original_response(
+                content=None,
+                embed=success_embed(
+                    "Modpack Created",
+                    f"Created **{category_name}** with channels.{role_message}"
+                )
+            )
+            log.info(f"Created modpack: {category_name}")
+            
+        except discord.Forbidden:
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Permission Error", "I don't have permission to create channels.")
+            )
+        except Exception as e:
+            log.error(f"Failed to create modpack: {e}")
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Error", f"Failed to create modpack: {e}")
+            )
+    
+    async def _create_modpack_role(self, guild: discord.Guild, name: str, emoji: str) -> str:
+        """Create a modpack notification role and add to roles board."""
+        try:
+            role = await guild.create_role(
+                name=f"{name} Updates",
+                mentionable=True,
+                reason="Modpack Updates Role"
+            )
+            
+            if not self.roles_board.get("channel_id") or not self.roles_board.get("message_id"):
+                return f"\n⚠️ Created role **{role.name}** but no roles board configured. Use `/setup_roles_board`."
+            
+            # Add to roles board
+            roles_channel = self.bot.get_channel(self.roles_board["channel_id"])
+            if not roles_channel:
+                return f"\n⚠️ Created role **{role.name}** but roles board channel not found."
+            
+            try:
+                message = await roles_channel.fetch_message(self.roles_board["message_id"])
+                await message.add_reaction(emoji)
+                
+                self.roles_board["roles"].append({
+                    "name": f"{name} Updates",
+                    "emoji": emoji,
+                    "role_id": role.id
+                })
+                save_json(ROLES_BOARD_FILE, self.roles_board)
+                
+                # Update roles board message
+                roles_cog = self.bot.get_cog("RolesBoard")
+                if roles_cog:
+                    await roles_cog.update_roles_board()
+                
+                return f"\n✅ Created role **{role.name}** with reaction {emoji}"
+                
+            except discord.HTTPException:
+                return f"\n⚠️ Created role **{role.name}** but `{emoji}` is not a valid emoji."
+                
+        except discord.Forbidden:
+            return "\n⚠️ I don't have permission to create roles."
+        except Exception as e:
+            return f"\n⚠️ Error creating role: {e}"
+    
+    @app_commands.command(name="delete_modpack", description="Delete a modpack category and its role")
+    @app_commands.describe(category_name="Name of the modpack (with or without [MODLOADER])")
+    @admin_only()
     async def delete_modpack(self, interaction: discord.Interaction, category_name: str):
+        """Delete a modpack category, channels, and associated role."""
         guild = interaction.guild
-        if not await has_admin_or_mod_permissions(interaction):
+        if not guild:
+            await interaction.response.send_message(
+                embed=error_embed("Error", "This command must be used in a server."),
+                ephemeral=True
+            )
             return
-        await interaction.response.send_message(f"Searching for modpack **{category_name}**...", ephemeral=True)
+        
+        await interaction.response.send_message(
+            f"⏳ Searching for modpack **{category_name}**...",
+            ephemeral=True
+        )
+        
         category = await find_category_by_name(guild, category_name)
         if not category:
-            await interaction.edit_original_response(content=f"❌ Category containing **{category_name}** not found.")
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Not Found", f"Category **{category_name}** not found.")
+            )
             return
-        actual_category_name = category.name
+        
+        actual_name = category.name
+        
+        # Find associated role
+        role = None
         role_name = None
-        if "[" in actual_category_name and "]" in actual_category_name:
-            modpack_name = actual_category_name.split("[")[0].strip()
+        if "[" in actual_name and "]" in actual_name:
+            modpack_name = actual_name.split("[")[0].strip()
             role_name = f"{modpack_name} Updates"
-        role = discord.utils.get(guild.roles, name=role_name) if role_name else None
-        channels_info = [f"#{channel.name}" for channel in category.channels]
-        confirmation_msg = f"**Warning!** You are about to delete:\n"
-        confirmation_msg += f"• Category: **{actual_category_name}**\n"
-        confirmation_msg += f"• Channels ({len(channels_info)}): {', '.join(channels_info)}\n"
-        emoji_to_remove = None
+            role = discord.utils.get(guild.roles, name=role_name)
+        
+        # Build confirmation message
+        channels = [f"#{c.name}" for c in category.channels]
+        confirm_msg = f"**You are about to delete:**\n"
+        confirm_msg += f"• Category: **{actual_name}**\n"
+        confirm_msg += f"• Channels: {', '.join(channels)}\n"
         if role:
-            confirmation_msg += f"• Role: **{role.name}**\n"
-            for role_data in self.roles_board["roles"]:
-                if role_data["role_id"] == role.id:
-                    emoji_to_remove = role_data["emoji"]
-                    confirmation_msg += f"• Role emoji: {emoji_to_remove} will be removed from roles board\n"
-                    break
-        class ConfirmView(discord.ui.View):
-            def __init__(self):
-                super().__init__(timeout=60)
-                self.confirmed = None
-            @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
-            async def confirm_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-                self.confirmed = True
-                self.stop()
-                await button_interaction.response.defer()
-            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-            async def cancel_button(self, button_interaction: discord.Interaction, button: discord.ui.Button):
-                self.confirmed = False
-                self.stop()
-                await button_interaction.response.defer()
-        view = ConfirmView()
-        await interaction.edit_original_response(content=confirmation_msg, view=view)
+            confirm_msg += f"• Role: **{role.name}**\n"
+        
+        view = ConfirmDeleteView()
+        await interaction.edit_original_response(content=confirm_msg, view=view)
         await view.wait()
+        
         if not view.confirmed:
-            await interaction.edit_original_response(content="Deletion cancelled.", view=None)
+            await interaction.edit_original_response(
+                content=None,
+                embed=info_embed("Cancelled", "Deletion cancelled."),
+                view=None
+            )
             return
-        await interaction.edit_original_response(content=f"Deleting modpack **{actual_category_name}**...", view=None)
-        deletion_log = []
-        success = True
+        
+        await interaction.edit_original_response(
+            content=f"⏳ Deleting **{actual_name}**...",
+            view=None
+        )
+        
+        # Delete channels and category
+        results = []
         for channel in category.channels:
             try:
-                await channel.delete(reason=f"Modpack deletion requested by {interaction.user.display_name}")
-                deletion_log.append(f"✅ Deleted channel #{channel.name}")
+                await channel.delete(reason=f"Modpack deletion by {interaction.user}")
+                results.append(f"✅ Deleted #{channel.name}")
             except Exception as e:
-                deletion_log.append(f"❌ Failed to delete channel #{channel.name}: {str(e)}")
-                success = False
+                results.append(f"❌ Failed #{channel.name}: {e}")
+        
         try:
-            await category.delete(reason=f"Modpack deletion requested by {interaction.user.display_name}")
-            deletion_log.append(f"✅ Deleted category **{actual_category_name}**")
+            await category.delete(reason=f"Modpack deletion by {interaction.user}")
+            results.append(f"✅ Deleted category **{actual_name}**")
         except Exception as e:
-            deletion_log.append(f"❌ Failed to delete category **{actual_category_name}**: {str(e)}")
-            success = False
+            results.append(f"❌ Failed category: {e}")
+        
+        # Delete role and clean up roles board
         if role:
             try:
-                role_index_to_remove = None
-                for i, role_data in enumerate(self.roles_board["roles"]):
-                    if role_data["role_id"] == role.id:
-                        role_index_to_remove = i
+                # Remove from roles board
+                self._reload_roles_board()
+                role_data = None
+                for i, rd in enumerate(self.roles_board["roles"]):
+                    if rd["role_id"] == role.id:
+                        role_data = self.roles_board["roles"].pop(i)
+                        save_json(ROLES_BOARD_FILE, self.roles_board)
                         break
-                if role_index_to_remove is not None:
-                    deleted_role_data = self.roles_board["roles"].pop(role_index_to_remove)
-                    save_json(ROLES_BOARD_FILE, self.roles_board)
-                    if self.roles_board["channel_id"] and self.roles_board["message_id"]:
-                        try:
-                            channel = self.bot.get_channel(self.roles_board["channel_id"])
-                            if channel:
-                                message = await channel.fetch_message(self.roles_board["message_id"])
-                                if message:
-                                    try:
-                                        await message.clear_reaction(deleted_role_data["emoji"])
-                                        deletion_log.append(f"✅ Removed reaction {deleted_role_data['emoji']} from roles board")
-                                    except Exception as e:
-                                        deletion_log.append(f"⚠️ Could not remove reaction: {str(e)}")
-                        except Exception as e:
-                            deletion_log.append(f"⚠️ Could not access roles board: {str(e)}")
-                    roles_cog = self.bot.get_cog("RolesBoard")
-                    update_result = roles_cog and await roles_cog.update_roles_board()
-                    if update_result:
-                        deletion_log.append("✅ Updated roles board message")
-                    else:
-                        deletion_log.append("⚠️ Failed to update roles board message")
-                role_name = role.name
-                await role.delete(reason=f"Modpack deletion requested by {interaction.user.display_name}")
-                deletion_log.append(f"✅ Deleted role '{role_name}'")
+                
+                # Remove reaction if possible
+                if role_data and self.roles_board.get("channel_id") and self.roles_board.get("message_id"):
+                    try:
+                        channel = self.bot.get_channel(self.roles_board["channel_id"])
+                        if channel:
+                            message = await channel.fetch_message(self.roles_board["message_id"])
+                            await message.clear_reaction(role_data["emoji"])
+                    except Exception:
+                        pass
+                
+                # Update roles board
+                roles_cog = self.bot.get_cog("RolesBoard")
+                if roles_cog:
+                    await roles_cog.update_roles_board()
+                
+                await role.delete(reason=f"Modpack deletion by {interaction.user}")
+                results.append(f"✅ Deleted role **{role.name}**")
             except Exception as e:
-                deletion_log.append(f"❌ Failed to delete role: {str(e)}")
-                success = False
-        summary = "\n".join(deletion_log)
-        status_emoji = "✅" if success else "⚠️"
+                results.append(f"❌ Failed role: {e}")
+        
+        success = all("✅" in r for r in results)
+        embed = success_embed if success else warning_embed
+        
         await interaction.edit_original_response(
-            content=f"{status_emoji} Modpack **{actual_category_name}** deletion summary:\n\n{summary}"
+            content=None,
+            embed=embed(
+                "Deletion Complete" if success else "Deletion Partial",
+                "\n".join(results)
+            )
         )
-
-    @app_commands.command(name="migrate_modpack", description="Migrate an existing manually created modpack category to the bot")
+        log.info(f"Deleted modpack: {actual_name}")
+    
+    @app_commands.command(name="migrate_modpack", description="Migrate an existing category to the bot's system")
     @app_commands.describe(
-        category_name="Name of the existing modpack (with or without [MODLOADER])",
-        role_name="Name for the notification role (e.g. 'ATM10 Updates')",
+        category_name="Name of existing category",
+        role_name="Name for the notification role",
         modpack_link="Link to the modpack",
         connection_ip="Connection IP or URL",
-        role_emoji="Emoji for users to react with to get the role"
+        role_emoji="Emoji for the role"
     )
-    async def migrate_modpack(self, interaction: discord.Interaction, category_name: str, role_name: str, modpack_link: str, connection_ip: str, role_emoji: str):
-        if not await has_admin_or_mod_permissions(interaction):
-            return
+    @admin_only()
+    async def migrate_modpack(
+        self,
+        interaction: discord.Interaction,
+        category_name: str,
+        role_name: str,
+        modpack_link: str,
+        connection_ip: str,
+        role_emoji: str
+    ):
+        """Convert an existing manual category to bot-managed."""
         guild = interaction.guild
-        await interaction.response.send_message(f"Searching for category **{category_name}**...", ephemeral=True)
+        if not guild:
+            await interaction.response.send_message(
+                embed=error_embed("Error", "This command must be used in a server."),
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_message(
+            f"⏳ Migrating **{category_name}**...",
+            ephemeral=True
+        )
+        
         category = await find_category_by_name(guild, category_name)
         if not category:
-            await interaction.edit_original_response(content=f"❌ Category containing **{category_name}** not found.")
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Not Found", f"Category **{category_name}** not found.")
+            )
             return
-        actual_category_name = category.name
+        
+        actual_name = category.name
+        
+        # Create or find connection-info channel
         connection_info = discord.utils.get(category.channels, name="connection-info")
         if not connection_info:
             try:
@@ -216,165 +365,202 @@ class Modpack(commands.Cog):
                     guild.default_role: discord.PermissionOverwrite(send_messages=False, add_reactions=True),
                     guild.me: discord.PermissionOverwrite(send_messages=True)
                 }
-                connection_info = await guild.create_text_channel("connection-info", overwrites=overwrites, category=category)
-                await interaction.edit_original_response(content=f"Created missing connection-info channel in **{actual_category_name}**...")
-            except discord.Forbidden as e:
-                await interaction.edit_original_response(content=f"⚠️ Cannot create connection-info channel. Error: {str(e)}")
-                return
+                connection_info = await guild.create_text_channel(
+                    "connection-info",
+                    overwrites=overwrites,
+                    category=category
+                )
             except Exception as e:
-                await interaction.edit_original_response(content=f"⚠️ Error creating connection-info channel: {str(e)}")
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=error_embed("Error", f"Failed to create connection-info channel: {e}")
+                )
                 return
+        
+        # Send connection info
         try:
-            msg = f"**Modpack URL:** {modpack_link}\n**Connection URL:** {connection_ip}"
-            await connection_info.send(msg)
+            await connection_info.send(
+                f"**Modpack URL:** {modpack_link}\n**Connection URL:** {connection_ip}"
+            )
         except Exception as e:
-            await interaction.edit_original_response(content=f"⚠️ Error posting info to connection-info channel: {str(e)}")
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Error", f"Failed to send connection info: {e}")
+            )
             return
+        
+        # Create role
         role_message = ""
         try:
             role = discord.utils.get(guild.roles, name=role_name)
             if role:
-                role_message = f"\n⚠️ Role '{role_name}' already exists - using existing role."
+                role_message = f"\n⚠️ Role **{role_name}** already exists."
             else:
-                role = await guild.create_role(name=role_name, mentionable=True, reason="Modpack Updates Role")
-                role_message = f"\n✅ Created role '{role_name}'."
-            if not self.roles_board["channel_id"] or not self.roles_board["message_id"]:
-                role_message += f"\n⚠️ No roles board is configured. Use /setup_roles_board to create one."
-            else:
-                for role_data in self.roles_board["roles"]:
-                    if role_data["role_id"] == role.id:
-                        await interaction.edit_original_response(
-                            content=f"✅ Successfully migrated **{category_name}**.\n⚠️ Role '{role_name}' already exists on the roles board with emoji {role_data['emoji']}."
-                        )
-                        return
-                roles_channel = self.bot.get_channel(self.roles_board["channel_id"])
-                if roles_channel:
-                    message = await roles_channel.fetch_message(self.roles_board["message_id"])
-                    try:
+                role = await guild.create_role(name=role_name, mentionable=True, reason="Modpack Migration")
+                role_message = f"\n✅ Created role **{role_name}**"
+            
+            # Add to roles board
+            self._reload_roles_board()
+            
+            # Check if already in board
+            if any(rd["role_id"] == role.id for rd in self.roles_board["roles"]):
+                role_message += f"\n⚠️ Role already on roles board."
+            elif self.roles_board.get("channel_id") and self.roles_board.get("message_id"):
+                try:
+                    channel = self.bot.get_channel(self.roles_board["channel_id"])
+                    if channel:
+                        message = await channel.fetch_message(self.roles_board["message_id"])
                         await message.add_reaction(role_emoji)
-                        emoji_key = role_emoji
+                        
                         self.roles_board["roles"].append({
                             "name": role_name,
-                            "emoji": emoji_key,
+                            "emoji": role_emoji,
                             "role_id": role.id
                         })
                         save_json(ROLES_BOARD_FILE, self.roles_board)
+                        
                         roles_cog = self.bot.get_cog("RolesBoard")
-                        if roles_cog and await roles_cog.update_roles_board():
-                            role_message += f"\n✅ Added role to the roles board with reaction {role_emoji}."
-                        else:
-                            role_message += f"\n⚠️ Could not update the roles board after adding role."
-                    except discord.HTTPException:
-                        role_message += f"\n⚠️ '{role_emoji}' is not a valid emoji - role not added to roles board."
-                else:
-                    role_message += f"\n⚠️ Could not find the roles board channel."
+                        if roles_cog:
+                            await roles_cog.update_roles_board()
+                        
+                        role_message += f"\n✅ Added to roles board with {role_emoji}"
+                except discord.HTTPException:
+                    role_message += f"\n⚠️ `{role_emoji}` is not a valid emoji."
+            else:
+                role_message += f"\n⚠️ No roles board configured."
+                
         except discord.Forbidden:
-            await interaction.edit_original_response(content=f"⚠️ I don't have permission to create roles.")
-            return
+            role_message = "\n⚠️ I don't have permission to create roles."
         except Exception as e:
-            await interaction.edit_original_response(content=f"⚠️ Error during migration: {str(e)}")
-            return
+            role_message = f"\n⚠️ Error with role: {e}"
+        
         await interaction.edit_original_response(
-            content=f"✅ Successfully migrated **{actual_category_name}** to the bot system.{role_message}"
+            content=None,
+            embed=success_embed(
+                "Migration Complete",
+                f"Migrated **{actual_name}** to bot management.{role_message}"
+            )
         )
-
-    @app_commands.command(name="edit_connection_info", description="Edit the connection info message in a modpack category")
+        log.info(f"Migrated modpack: {actual_name}")
+    
+    @app_commands.command(name="edit_connection_info", description="Edit the connection info message")
     @app_commands.describe(
-        category_name="Name of the modpack (with or without [MODLOADER])",
-        modpack_link="New link to the modpack (leave empty to keep current)",
-        connection_ip="New connection IP or URL (leave empty to keep current)",
-        additional_info="Optional additional information (use 'REMOVE' to clear existing info)"
+        category_name="Name of the modpack",
+        modpack_link="New modpack link (leave empty to keep current)",
+        connection_ip="New connection IP (leave empty to keep current)",
+        additional_info="Additional info (use 'REMOVE' to clear)"
     )
-    async def edit_connection_info(self, interaction: discord.Interaction, category_name: str, modpack_link: str = None, connection_ip: str = None, additional_info: str = None):
-        if not await has_admin_or_mod_permissions(interaction):
-            return
+    @admin_only()
+    async def edit_connection_info(
+        self,
+        interaction: discord.Interaction,
+        category_name: str,
+        modpack_link: str = None,
+        connection_ip: str = None,
+        additional_info: str = None
+    ):
+        """Update the connection info message in a modpack category."""
         guild = interaction.guild
-        await interaction.response.send_message(f"Looking for connection info in **{category_name}**...", ephemeral=True)
+        if not guild:
+            await interaction.response.send_message(
+                embed=error_embed("Error", "This command must be used in a server."),
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.send_message(
+            f"⏳ Updating connection info for **{category_name}**...",
+            ephemeral=True
+        )
+        
         category = await find_category_by_name(guild, category_name)
         if not category:
-            await interaction.edit_original_response(content=f"❌ Category containing **{category_name}** not found.")
+            await interaction.edit_original_response(
+                content=None,
+                embed=error_embed("Not Found", f"Category **{category_name}** not found.")
+            )
             return
-        actual_category_name = category.name
+        
         connection_info = discord.utils.get(category.channels, name="connection-info")
         if not connection_info:
             await interaction.edit_original_response(
-                content=f"❌ No `connection-info` channel found in **{actual_category_name}** category.\nUse `/migrate_modpack` to set up a proper connection-info channel first."
+                content=None,
+                embed=error_embed(
+                    "Not Found",
+                    f"No connection-info channel in **{category.name}**.\nUse `/migrate_modpack` first."
+                )
             )
             return
-        bot_member = guild.get_member(self.bot.user.id)
-        channel_perms = connection_info.permissions_for(bot_member)
-        if not channel_perms.send_messages:
+        
+        # Find existing bot message
+        last_message = None
+        current_modpack = None
+        current_connection = None
+        current_additional = None
+        
+        async for message in connection_info.history(limit=10):
+            if message.author == self.bot.user and "Modpack URL:" in message.content:
+                last_message = message
+                content = message.content
+                
+                if "**Modpack URL:**" in content:
+                    current_modpack = content.split("**Modpack URL:**")[1].split("\n")[0].strip()
+                if "**Connection URL:**" in content:
+                    current_connection = content.split("**Connection URL:**")[1].split("\n")[0].strip()
+                if "**Additional Information:**" in content:
+                    current_additional = content.split("**Additional Information:**")[1].strip()
+                break
+        
+        # Build new message
+        final_modpack = modpack_link or current_modpack
+        final_connection = connection_ip or current_connection
+        
+        if not final_modpack and not final_connection:
             await interaction.edit_original_response(
-                content=f"❌ Bot doesn't have permission to send messages in {connection_info.mention}."
+                content=None,
+                embed=error_embed("No Data", "No connection info found and no new values provided.")
             )
             return
+        
+        new_content = ""
+        if final_modpack:
+            new_content += f"**Modpack URL:** {final_modpack}\n"
+        if final_connection:
+            new_content += f"**Connection URL:** {final_connection}"
+        
+        if additional_info:
+            if additional_info.upper() != "REMOVE":
+                new_content += f"\n\n**Additional Information:**\n{additional_info}"
+        elif current_additional:
+            new_content += f"\n\n**Additional Information:**\n{current_additional}"
+        
+        # Update or create message
         try:
-            last_bot_message = None
-            current_modpack_link = None
-            current_connection_ip = None
-            current_additional_info = None
-            async for message in connection_info.history(limit=10):
-                if message.author == self.bot.user and "Modpack URL:" in message.content:
-                    last_bot_message = message
-                    content = message.content
-                    if "**Modpack URL:**" in content:
-                        modpack_part = content.split("**Modpack URL:**")[1].split("\n")[0].strip()
-                        current_modpack_link = modpack_part
-                    if "**Connection URL:**" in content:
-                        connection_part = content.split("**Connection URL:**")[1].split("\n")[0].strip()
-                        current_connection_ip = connection_part
-                    if "**Additional Information:**" in content:
-                        additional_part = content.split("**Additional Information:**")[1].strip()
-                        current_additional_info = additional_part
-                    break
-            final_modpack_link = modpack_link if modpack_link is not None else current_modpack_link
-            final_connection_ip = connection_ip if connection_ip is not None else current_connection_ip
-            if final_modpack_link is None and final_connection_ip is None:
-                await interaction.edit_original_response(
-                    content=f"❌ No existing connection info found and no new values provided."
-                )
-                return
-            new_info_msg = ""
-            if final_modpack_link is not None:
-                new_info_msg += f"**Modpack URL:** {final_modpack_link}\n"
-            if final_connection_ip is not None:
-                new_info_msg += f"**Connection URL:** {final_connection_ip}"
-            if additional_info is not None:
-                if additional_info.upper() == "REMOVE":
-                    pass
-                else:
-                    new_info_msg += f"\n\n**Additional Information:**\n{additional_info}"
-            elif current_additional_info is not None:
-                new_info_msg += f"\n\n**Additional Information:**\n{current_additional_info}"
-            changes = []
-            if modpack_link is not None:
-                changes.append("modpack link")
-            if connection_ip is not None:
-                changes.append("connection IP")
-            if additional_info is not None:
-                if additional_info.upper() == "REMOVE":
-                    changes.append("removed additional information")
-                else:
-                    changes.append("additional information")
-            change_summary = "no fields" if not changes else ", ".join(changes)
-            if last_bot_message:
-                await last_bot_message.edit(content=new_info_msg)
-                await interaction.edit_original_response(
-                    content=f"✅ Updated {change_summary} in {connection_info.mention}."
-                )
+            if last_message:
+                await last_message.edit(content=new_content)
+                action = "Updated"
             else:
-                await connection_info.send(new_info_msg)
-                await interaction.edit_original_response(
-                    content=f"✅ Created new connection info message in {connection_info.mention}."
+                await connection_info.send(new_content)
+                action = "Created"
+            
+            await interaction.edit_original_response(
+                content=None,
+                embed=success_embed(
+                    "Connection Info Updated",
+                    f"{action} connection info in {connection_info.mention}"
                 )
+            )
         except discord.Forbidden:
             await interaction.edit_original_response(
-                content=f"❌ Missing permissions to edit messages in {connection_info.mention}."
+                content=None,
+                embed=error_embed("Permission Error", "I can't edit messages in that channel.")
             )
         except Exception as e:
             await interaction.edit_original_response(
-                content=f"❌ Error updating connection info: {str(e)}"
+                content=None,
+                embed=error_embed("Error", str(e))
             )
 
-async def setup(bot):
+
+async def setup(bot: commands.Bot):
     await bot.add_cog(Modpack(bot))

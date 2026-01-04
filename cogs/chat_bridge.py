@@ -1,16 +1,36 @@
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-from ampapi import Bridge as AMPBridge, AMPControllerInstance
-from ampapi.dataclass import APIParams
-import config
-from cogs.utils import load_json, save_json, CHAT_BRIDGE_FILE, has_admin_or_mod_permissions, fetch_valid_instances
+"""
+Chat bridge for CalmBot.
+Bridges chat between multiple Minecraft servers and Discord.
+"""
+
 import asyncio
 import re
 import traceback
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from ampapi import Bridge as AMPBridge, AMPControllerInstance
+from ampapi.dataclass import APIParams
 from mcstatus import JavaServer
+
+import config
+from cogs.utils import (
+    get_logger,
+    load_json,
+    save_json,
+    admin_only,
+    check_permissions,
+    fetch_valid_instances,
+    info_embed,
+    success_embed,
+    error_embed,
+    CHAT_BRIDGE_FILE
+)
+
+log = get_logger("bridge")
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -46,7 +66,7 @@ class ChatBridge(commands.Cog):
             fetched_instances = await fetch_valid_instances()
             
             if not fetched_instances:
-                print("[Bridge] No instances returned from API.")
+                log.debug("No instances returned from API")
                 return
 
             self.instances = {}
@@ -54,9 +74,8 @@ class ChatBridge(commands.Cog):
                 name = inst.friendly_name or inst.instance_name
                 self.instances[name] = inst
             
-        except Exception:
-            print("Error refreshing instances:")
-            traceback.print_exc()
+        except Exception as e:
+            log.error(f"Error refreshing instances: {e}")
 
     async def _fetch_update_safe(self, name, instance):
         try:
@@ -65,7 +84,7 @@ class ChatBridge(commands.Cog):
             updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=5.0)
             return name, updates
         except asyncio.TimeoutError:
-            print(f"[Bridge] Timeout fetching updates for {name}")
+            log.debug(f"Timeout fetching updates for {name}")
             return name, None
         except Exception:
             # Log error but don't crash; return None updates
@@ -212,7 +231,7 @@ class ChatBridge(commands.Cog):
                  await channel.edit(topic=topic)
                  group_data["last_topic_update"] = current_time
              except Exception as e:
-                 print(f"[Bridge] Failed to update topic for {channel.name}: {e}")
+                 log.warning(f"Failed to update topic for {channel.name}: {e}")
 
     async def handle_minecraft_command(self, source_name, user, msg, group_data):
         command = msg.split(" ")[0].lower()
@@ -554,8 +573,7 @@ class ChatBridge(commands.Cog):
         except Exception:
             # Fallback for any other error (permissions, rate limits)
             try:
-                print(f"[Bridge] Webhook failed for {channel.id}, falling back to standard message.")
-                # traceback.print_exc() 
+                log.debug(f"Webhook failed for {channel.id}, falling back to standard message")
                 safe_user = discord.utils.escape_markdown(user)
                 prefix = f"**[{source_name}]** <{safe_user}>"
                 if embed:
@@ -564,7 +582,7 @@ class ChatBridge(commands.Cog):
                     safe_msg = discord.utils.escape_markdown(msg) if msg else ""
                     await channel.send(f"{prefix} {safe_msg}")
             except Exception:
-                print(f"[Bridge] Failed to send message to Discord channel {channel.id}")
+                log.warning(f"Failed to send message to Discord channel {channel.id}")
 
     async def _get_or_create_webhook(self, channel):
         # Check cache or fetch
@@ -585,7 +603,7 @@ class ChatBridge(commands.Cog):
             # Create new one
             return await channel.create_webhook(name="CalmBot Bridge")
         except discord.Forbidden:
-            print(f"[Bridge] Missing Manage Webhooks permission in {channel.name}")
+            log.warning(f"Missing Manage Webhooks permission in {channel.name}")
             return None
         except Exception:
             return None
@@ -595,9 +613,9 @@ class ChatBridge(commands.Cog):
             # 5 second timeout for sending too
             await asyncio.wait_for(target.send_console_message(cmd), timeout=5.0)
         except asyncio.TimeoutError:
-            print(f"[Bridge] Timeout sending message to {target_name}")
-        except Exception:
-            print(f"Failed to send message to {target_name}:")
+            log.debug(f"Timeout sending message to {target_name}")
+        except Exception as e:
+            log.warning(f"Failed to send message to {target_name}: {e}")
             traceback.print_exc()
 
     @sync_loop.before_loop
@@ -606,8 +624,8 @@ class ChatBridge(commands.Cog):
         await self._refresh_instances()
 
     @app_commands.command(name="bridge", description="Open the Chat Bridge Control Center")
+    @admin_only()
     async def bridge_control(self, interaction: discord.Interaction):
-        if not await has_admin_or_mod_permissions(interaction): return
         
         embed = discord.Embed(title="🌉 Chat Bridge Control Center", color=discord.Color.blue())
         embed.description = "Manage your cross-server chat links here."

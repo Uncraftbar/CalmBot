@@ -1,39 +1,282 @@
+"""
+Auto-send functionality for CalmBot.
+Automatically responds to messages based on keywords, mentions, and conditions.
+"""
+
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
-from cogs.utils import load_json, save_json
-import os
 
-AUTOSEND_FILE = "data/autosend.json"
+from cogs.utils import (
+    get_logger,
+    load_json,
+    save_json,
+    check_permissions,
+    admin_only,
+    is_valid_url,
+    safe_embed_color,
+    info_embed,
+    success_embed,
+    error_embed,
+    AUTOSEND_FILE
+)
 
-class AutoSendListView(discord.ui.View):
-    def __init__(self, autosend_data, bot):
-        super().__init__(timeout=180)
-        self.autosend_data = autosend_data
-        self.bot = bot
-        options = []
-        for trigger_type, triggers in autosend_data.items():
-            for trigger_value in triggers:
-                label = f"{trigger_type}: {trigger_value}"
-                options.append(discord.SelectOption(label=label, value=f"{trigger_type}|{trigger_value}"))
-        self.select = discord.ui.Select(placeholder="Select an auto-send to edit or remove", options=options)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
+log = get_logger("autosend")
 
-    async def select_callback(self, interaction: discord.Interaction):
-        trigger_type, trigger_value = self.select.values[0].split("|", 1)
-        if trigger_type in self.autosend_data and trigger_value in self.autosend_data[trigger_type]:
-            entry = self.autosend_data[trigger_type][trigger_value]
-            # Show Edit/Delete options
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def build_auto_embed(embed_data: dict) -> discord.Embed:
+    """Build a discord Embed from stored embed data."""
+    embed = discord.Embed(
+        title=embed_data.get("title"),
+        description=embed_data.get("description"),
+        color=safe_embed_color(embed_data.get("color"))
+    )
+    
+    if is_valid_url(embed_data.get("image_url")):
+        embed.set_image(url=embed_data["image_url"])
+    
+    if embed_data.get("footer"):
+        embed.set_footer(
+            text=embed_data["footer"],
+            icon_url=embed_data.get("footer_icon") if is_valid_url(embed_data.get("footer_icon")) else None
+        )
+    
+    if is_valid_url(embed_data.get("thumbnail")):
+        embed.set_thumbnail(url=embed_data["thumbnail"])
+    
+    if embed_data.get("url"):
+        embed.url = embed_data["url"]
+    
+    if embed_data.get("timestamp"):
+        embed.timestamp = discord.utils.utcnow()
+    
+    if embed_data.get("fields"):
+        for field in embed_data["fields"].split(";"):
+            if ":" in field:
+                name, value = field.split(":", 1)
+                embed.add_field(name=name.strip(), value=value.strip(), inline=False)
+    
+    return embed
+
+
+# =============================================================================
+# MODALS
+# =============================================================================
+
+class TriggerValueModal(discord.ui.Modal, title="Enter Trigger Value"):
+    """Modal for entering the trigger value."""
+    
+    trigger_value = discord.ui.TextInput(
+        label="Trigger Value",
+        placeholder="e.g. 'hello' for keyword, user ID, or role ID",
+        required=True,
+        max_length=100
+    )
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.state["trigger_value"] = self.trigger_value.value.strip()
+        await interaction.response.send_message(
+            f"Trigger value set to: `{self.trigger_value.value.strip()}`",
+            ephemeral=True
+        )
+
+
+class PlainMessageModal(discord.ui.Modal, title="Enter Message"):
+    """Modal for entering plain text message."""
+    
+    message = discord.ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000
+    )
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.state["plain_message"] = self.message.value
+        await interaction.response.send_message(
+            "Message set! Click 'Save AutoSend' to finish.",
+            ephemeral=True
+        )
+
+
+class EmbedFieldModal(discord.ui.Modal):
+    """Modal for editing a single embed field."""
+    
+    def __init__(self, parent_view, field: str, label: str, style=discord.TextStyle.short):
+        super().__init__(title=label)
+        self.parent_view = parent_view
+        self.field = field
+        
+        self.input = discord.ui.TextInput(label=label, style=style, required=False)
+        
+        # Pre-fill with current value
+        if parent_view.state["message_type"] == "plain":
+            val = parent_view.state.get("plain_message")
+        else:
+            val = parent_view.state.get("embed", {}).get(field)
+        
+        if val:
+            self.input.default = str(val)
+        
+        self.add_item(self.input)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.parent_view.state["message_type"] == "plain":
+            self.parent_view.state["plain_message"] = self.input.value
+        else:
+            if "embed" not in self.parent_view.state:
+                self.parent_view.state["embed"] = {}
+            self.parent_view.state["embed"][self.field] = self.input.value or None
+        
+        await self.parent_view.update_preview(interaction)
+
+
+class AdvancedOptionsModal(discord.ui.Modal, title="Advanced Embed Options"):
+    """Modal for advanced embed settings."""
+    
+    thumbnail = discord.ui.TextInput(label="Thumbnail URL", required=False, max_length=500)
+    url = discord.ui.TextInput(label="Title URL", required=False, max_length=500)
+    timestamp = discord.ui.TextInput(label="Include Timestamp? (true/false)", required=False, max_length=5)
+    fields = discord.ui.TextInput(label="Fields (name:value;name:value)", required=False, max_length=1000)
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = self.parent_view.state.setdefault("embed", {})
+        embed["thumbnail"] = self.thumbnail.value or None
+        embed["url"] = self.url.value or None
+        embed["timestamp"] = self.timestamp.value.lower() == "true" if self.timestamp.value else False
+        embed["fields"] = self.fields.value or None
+        
+        await interaction.response.send_message(
+            "Advanced options set! Click 'Save AutoSend' to finish.",
+            ephemeral=True
+        )
+
+
+class RegexModal(discord.ui.Modal, title="Regex Condition"):
+    """Modal for setting regex pattern condition."""
+    
+    pattern = discord.ui.TextInput(label="Regex Pattern", placeholder="e.g. ^Hello.*", required=False)
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        current = parent_view.state.get("conditions", {}).get("regex")
+        if current:
+            self.pattern.default = current
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        conditions = self.parent_view.state.setdefault("conditions", {})
+        if self.pattern.value:
+            conditions["regex"] = self.pattern.value
             await interaction.response.send_message(
-                f"What would you like to do with {trigger_type} '{trigger_value}'?",
-                view=AutoSendEditDeleteView(self.bot, self.autosend_data, trigger_type, trigger_value, entry),
+                f"Regex pattern set: `{self.pattern.value}`",
                 ephemeral=True
             )
         else:
-            await interaction.response.send_message("No such auto-send trigger found.", ephemeral=True)
+            conditions.pop("regex", None)
+            await interaction.response.send_message("Regex condition removed.", ephemeral=True)
 
-class AutoSendEditDeleteView(discord.ui.View):
+
+class LengthModal(discord.ui.Modal, title="Message Length Conditions"):
+    """Modal for setting min/max length conditions."""
+    
+    min_len = discord.ui.TextInput(label="Min Length", placeholder="0", required=False)
+    max_len = discord.ui.TextInput(label="Max Length", placeholder="2000", required=False)
+    
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+        conditions = parent_view.state.get("conditions", {})
+        if "min_length" in conditions:
+            self.min_len.default = str(conditions["min_length"])
+        if "max_length" in conditions:
+            self.max_len.default = str(conditions["max_length"])
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        conditions = self.parent_view.state.setdefault("conditions", {})
+        msgs = []
+        
+        if self.min_len.value and self.min_len.value.isdigit():
+            conditions["min_length"] = int(self.min_len.value)
+            msgs.append(f"Min: {self.min_len.value}")
+        else:
+            conditions.pop("min_length", None)
+        
+        if self.max_len.value and self.max_len.value.isdigit():
+            conditions["max_length"] = int(self.max_len.value)
+            msgs.append(f"Max: {self.max_len.value}")
+        else:
+            conditions.pop("max_length", None)
+        
+        if msgs:
+            await interaction.response.send_message(f"Length conditions set: {', '.join(msgs)}", ephemeral=True)
+        else:
+            await interaction.response.send_message("Length conditions cleared.", ephemeral=True)
+
+
+# =============================================================================
+# VIEWS
+# =============================================================================
+
+class AutoSendListView(discord.ui.View):
+    """View for listing and selecting existing auto-sends."""
+    
+    def __init__(self, autosend_data: dict, bot: commands.Bot):
+        super().__init__(timeout=180)
+        self.autosend_data = autosend_data
+        self.bot = bot
+        
+        options = []
+        for trigger_type, triggers in autosend_data.items():
+            for trigger_value in triggers:
+                label = f"{trigger_type}: {trigger_value}"[:100]
+                options.append(discord.SelectOption(label=label, value=f"{trigger_type}|{trigger_value}"))
+        
+        if options:
+            self.select = discord.ui.Select(
+                placeholder="Select an auto-send to edit or remove",
+                options=options[:25]
+            )
+            self.select.callback = self.select_callback
+            self.add_item(self.select)
+    
+    async def select_callback(self, interaction: discord.Interaction):
+        trigger_type, trigger_value = self.select.values[0].split("|", 1)
+        
+        if trigger_type in self.autosend_data and trigger_value in self.autosend_data[trigger_type]:
+            entry = self.autosend_data[trigger_type][trigger_value]
+            await interaction.response.send_message(
+                f"What would you like to do with **{trigger_type}** `{trigger_value}`?",
+                view=EditDeleteView(self.bot, self.autosend_data, trigger_type, trigger_value, entry),
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                embed=error_embed("Not Found", "Auto-send trigger not found."),
+                ephemeral=True
+            )
+
+
+class EditDeleteView(discord.ui.View):
+    """View with Edit and Delete buttons for an auto-send."""
+    
     def __init__(self, bot, autosend_data, trigger_type, trigger_value, entry):
         super().__init__(timeout=60)
         self.bot = bot
@@ -41,72 +284,56 @@ class AutoSendEditDeleteView(discord.ui.View):
         self.trigger_type = trigger_type
         self.trigger_value = trigger_value
         self.entry = entry
-        self.add_item(self.EditButton(self))
-        self.add_item(self.DeleteButton(self))
-
-    class EditButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit", style=discord.ButtonStyle.primary)
-        async def callback(self, interaction: discord.Interaction):
-            # Launch the editor with pre-filled data
-            state = {
-                "trigger_type": self.view.trigger_type,
-                "trigger_value": self.view.trigger_value,
-                "message_type": "embed" if "embed" in self.view.entry else "plain",
-                "plain_message": self.view.entry.get("message") if "message" in self.view.entry else None,
-                "embed": self.view.entry.get("embed") if "embed" in self.view.entry else {
-                    "title": self.view.entry.get("title"),
-                    "description": self.view.entry.get("description"),
-                    "color": self.view.entry.get("color"),
-                    "footer": self.view.entry.get("footer"),
-                    "footer_icon": self.view.entry.get("footer_icon"),
-                    "thumbnail": self.view.entry.get("thumbnail"),
-                    "image_url": self.view.entry.get("image_url"),
-                    "url": self.view.entry.get("url"),
-                    "timestamp": self.view.entry.get("timestamp"),
-                    "fields": self.view.entry.get("fields"),
-                },
-                "conditions": self.view.entry.get("conditions", {}).copy()
-            }
-            live_edit_view = AutoSendLiveEditView(self.view.bot, self.view.autosend_data, state)
-            if state["message_type"] == "plain":
-                content = state.get("plain_message", "(empty)")
-                await interaction.response.send_message(
-                    content,
-                    view=live_edit_view,
-                    ephemeral=True
-                )
-            else:
-                embed_data = state["embed"]
-                embed = discord.Embed(
-                    title=embed_data.get("title"),
-                    description=embed_data.get("description"),
-                    color=safe_embed_color(embed_data.get("color"))
-                )
-                if is_valid_url(embed_data.get("image_url")):
-                    embed.set_image(url=embed_data["image_url"])
-                if embed_data.get("footer"):
-                    embed.set_footer(text=embed_data["footer"])
-                await interaction.response.send_message(
-                    embed=embed,
-                    view=live_edit_view,
-                    ephemeral=True
-                )
-
-    class DeleteButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Delete", style=discord.ButtonStyle.danger)
-        async def callback(self, interaction: discord.Interaction):
-            del self.view.autosend_data[self.view.trigger_type][self.view.trigger_value]
-            save_json(AUTOSEND_FILE, self.view.autosend_data)
+    
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary)
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Build state from existing entry
+        state = {
+            "trigger_type": self.trigger_type,
+            "trigger_value": self.trigger_value,
+            "message_type": "embed" if "embed" in self.entry else "plain",
+            "plain_message": self.entry.get("message"),
+            "embed": self.entry.get("embed", {}).copy() if "embed" in self.entry else {},
+            "conditions": self.entry.get("conditions", {}).copy()
+        }
+        
+        view = LiveEditView(self.bot, self.autosend_data, state)
+        
+        if state["message_type"] == "plain":
             await interaction.response.send_message(
-                f"Removed auto-send for {self.view.trigger_type} '{self.view.trigger_value}'.",
+                state.get("plain_message", "(empty)"),
+                view=view,
                 ephemeral=True
             )
+        else:
+            embed = build_auto_embed(state.get("embed", {}))
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        del self.autosend_data[self.trigger_type][self.trigger_value]
+        
+        # Clean up empty trigger types
+        if not self.autosend_data[self.trigger_type]:
+            del self.autosend_data[self.trigger_type]
+        
+        save_json(AUTOSEND_FILE, self.autosend_data)
+        log.info(f"Deleted auto-send: {self.trigger_type}/{self.trigger_value}")
+        
+        await interaction.response.send_message(
+            embed=success_embed(
+                "Deleted",
+                f"Removed auto-send for **{self.trigger_type}** `{self.trigger_value}`"
+            ),
+            ephemeral=True
+        )
 
-class AutoSendCreateView(discord.ui.View):
-    def __init__(self, bot, autosend_data, *, timeout=300):
-        super().__init__(timeout=timeout)
+
+class SetupView(discord.ui.View):
+    """Initial setup view for creating a new auto-send."""
+    
+    def __init__(self, bot, autosend_data):
+        super().__init__(timeout=180)
         self.bot = bot
         self.autosend_data = autosend_data
         self.state = {
@@ -114,679 +341,452 @@ class AutoSendCreateView(discord.ui.View):
             "trigger_value": None,
             "message_type": None,
             "plain_message": None,
-            "embed": {
-                "title": None,
-                "description": None,
-                "color": None,
-                "footer": None,
-                "footer_icon": None,
-                "thumbnail": None,
-                "image_url": None,
-                "url": None,
-                "timestamp": False,
-                "fields": None
-            }
+            "embed": {},
+            "conditions": {}
         }
-        self.add_item(self.TriggerTypeSelect(self))
-        self.add_item(self.MessageTypeSelect(self))
-        self.add_item(self.PreviewButton(self))
-        self.add_item(self.AdvancedButton(self))
-        self.add_item(self.NextButton(self))
-
-    class TriggerTypeSelect(discord.ui.Select):
-        def __init__(self, parent_view):
-            options = [
-                discord.SelectOption(label="Keyword", value="keyword"),
-                discord.SelectOption(label="Ping User", value="ping_user"),
-                discord.SelectOption(label="Ping Role", value="ping_role")
-            ]
-            super().__init__(placeholder="Select trigger type...", options=options, row=0)
-        async def callback(self, interaction: discord.Interaction):
-            self.view.state["trigger_type"] = self.values[0]
-            await interaction.response.send_modal(TriggerValueModal(self.view))
-
-    class MessageTypeSelect(discord.ui.Select):
-        def __init__(self, parent_view):
-            options = [
-                discord.SelectOption(label="Plain Message", value="plain"),
-                discord.SelectOption(label="Embed", value="embed")
-            ]
-            super().__init__(placeholder="Select message type...", options=options, row=1)
-        async def callback(self, interaction: discord.Interaction):
-            self.view.state["message_type"] = self.values[0]
-            if self.values[0] == "plain":
-                await interaction.response.send_modal(AutoSendPlainModal(self.view))
-            else:
-                await interaction.response.send_message("Embed type selected! Now click Continue.", ephemeral=True)
-
-    class PreviewButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Preview", style=discord.ButtonStyle.blurple, row=2)
-        async def callback(self, interaction: discord.Interaction):
-            if self.view.state["message_type"] == "plain":
-                msg = self.view.state.get("plain_message", "")
-                if not msg:
-                    await interaction.response.send_message("Please enter a message before previewing.", ephemeral=True)
-                    return
-                await interaction.response.send_message(msg, ephemeral=True)
-            else:
-                embed_data = self.view.state["embed"]
-                if not embed_data.get("description"):
-                    await interaction.response.send_message("Please enter an embed description before previewing.", ephemeral=True)
-                    return
-                embed = discord.Embed(
-                    title=embed_data.get("title"),
-                    description=embed_data.get("description"),
-                    color=safe_embed_color(embed_data.get("color"))
-                )
-                if is_valid_url(embed_data.get("image_url")):
-                    embed.set_image(url=embed_data["image_url"])
-                if embed_data.get("footer"):
-                    embed.set_footer(text=embed_data["footer"])
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    class AdvancedButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Advanced Options", style=discord.ButtonStyle.secondary, row=2)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(AutoSendEmbedAdvancedModal(self.view))
-
-    class NextButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Save AutoSend", style=discord.ButtonStyle.green, row=3)
-        async def callback(self, interaction: discord.Interaction):
-            state = self.view.state
-            if not (state["trigger_type"] and state["trigger_value"] and state["message_type"]):
-                await interaction.response.send_message("Please select all required options and fill out the message.", ephemeral=True)
-                return
-            if state["message_type"] == "plain" and not state["plain_message"]:
-                await interaction.response.send_message("Please enter a plain message.", ephemeral=True)
-                return
-            if state["message_type"] == "embed" and not state["embed"]["description"]:
-                await interaction.response.send_message("Please enter an embed description.", ephemeral=True)
-                return
-            # Save
-            if state["message_type"] == "plain":
-                entry = {"message": state["plain_message"]}
-            else:
-                entry = {"embed": {k: v for k, v in state["embed"].items() if v}}
-            self.view.autosend_data.setdefault(state["trigger_type"], {})[state["trigger_value"]] = entry
-            save_json(AUTOSEND_FILE, self.view.autosend_data)
-            await interaction.response.send_message(f"Auto-send for {state['trigger_type']} '{state['trigger_value']}' saved!", ephemeral=True)
-
-class TriggerValueModal(discord.ui.Modal, title="Enter Trigger Value"):
-    trigger_value = discord.ui.TextInput(label="Trigger Value", placeholder="e.g. 'hello' for keyword, user ID, or role ID", required=True, max_length=100)
-    def __init__(self, parent_view):
-        discord.ui.Modal.__init__(self)
-        self.parent_view = parent_view
-    async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.state["trigger_value"] = self.trigger_value.value.strip()
-        await interaction.response.send_message(f"Trigger value set to: `{self.trigger_value.value.strip()}`", ephemeral=True)
-
-class AutoSendPlainModal(discord.ui.Modal, title="Enter Plain Message"):
-    plain_message = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, required=True, max_length=2000)
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-    async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.state["plain_message"] = self.plain_message.value
-        await interaction.response.send_message("Plain message set! Click 'Save AutoSend' to finish.", ephemeral=True)
-
-class AutoSendEmbedAdvancedModal(discord.ui.Modal, title="Advanced Embed Options"):
-    embed_thumbnail = discord.ui.TextInput(label="Thumbnail URL", required=False, max_length=500)
-    embed_url = discord.ui.TextInput(label="Title URL", required=False, max_length=500)
-    embed_timestamp = discord.ui.TextInput(label="Include Timestamp? (true/false)", required=False, max_length=5)
-    embed_fields = discord.ui.TextInput(label="Fields (name:value;name:value)", required=False, max_length=1000)
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-    async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.state["embed"]["thumbnail"] = self.embed_thumbnail.value or None
-        self.parent_view.state["embed"]["url"] = self.embed_url.value or None
-        self.parent_view.state["embed"]["timestamp"] = (self.embed_timestamp.value.lower() == "true") if self.embed_timestamp.value else False
-        self.parent_view.state["embed"]["fields"] = self.embed_fields.value or None
-        await interaction.response.send_message("Advanced embed options set! Click 'Save AutoSend' to finish.", ephemeral=True)
-
-# In your AutoSend cog:
-class AutoSend(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.autosend_data = load_json(AUTOSEND_FILE, {})
-
-    autosend_group = app_commands.Group(name="autosend", description="Manage auto-send triggers")
-
-    @autosend_group.command(name="add", description="Interactively add an auto-send trigger.")
-    async def add(self, interaction: discord.Interaction):
-        from cogs.utils import has_admin_or_mod_permissions
-        if not await has_admin_or_mod_permissions(interaction):
-            return
-        await interaction.response.send_message(
-            "Let's create a new auto-send! Select the event and message type, then continue:",
-            view=AutoSendSetupView(self.bot, self.autosend_data),
-            ephemeral=True
-        )
-
-    @autosend_group.command(name="list", description="List all current auto-send triggers and remove them via dropdown.")
-    async def list(self, interaction: discord.Interaction):
-        from cogs.utils import has_admin_or_mod_permissions
-        if not await has_admin_or_mod_permissions(interaction):
-            return
-        if not self.autosend_data or not any(self.autosend_data.values()):
-            await interaction.response.send_message("No auto-send triggers set.", ephemeral=True)
-            return
-        embed = discord.Embed(title="Auto-Send Triggers", color=discord.Color.blue())
-        for trigger_type, triggers in self.autosend_data.items():
-            def preview(v):
-                if isinstance(v, dict) and (v.get("type") == "embed" or "embed" in v):
-                    embed_data = v.get("embed", v)
-                    desc = embed_data.get("description", "")
-                    return f"[EMBED] {embed_data.get('title','')}: {desc[:60]}{'...' if len(desc)>60 else ''}"
-                return str(v) if len(str(v)) < 100 else str(v)[:97]+'...'
-            value = "\n".join([f"**{k}**: {preview(v)}" for k, v in triggers.items()])
-            embed.add_field(name=trigger_type, value=value or "None", inline=False)
-        await interaction.response.send_message(embed=embed, view=AutoSendListView(self.autosend_data, self.bot), ephemeral=True)
-
-    @autosend_group.command(name="help", description="Show help and formatting options for auto-send.")
-    async def help(self, interaction: discord.Interaction):
-        from cogs.utils import has_admin_or_mod_permissions
-        if not await has_admin_or_mod_permissions(interaction):
-            return
-        embed = discord.Embed(title="AutoSend Help & Guide", color=discord.Color.green())
-        embed.add_field(
-            name="Basic Usage",
-            value=(
-                "/autosend add — Create a new auto-send with an interactive menu.\n"
-                "/autosend list — View, edit, or delete auto-sends with a dropdown and buttons.\n"
-                "/autosend help — Show this help."
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="Workflow",
-            value=(
-                "• Select trigger/event and message type.\n"
-                "• Use the live editor to update fields, preview changes, and access advanced options.\n"
-                "• Edit or delete existing auto-sends from the list."
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="Trigger Types",
-            value="keyword, ping_user, ping_role, (more coming soon!)",
-            inline=False
-        )
-        embed.add_field(
-            name="Embed & Message Formatting",
-            value=(
-                "• Edit title, description, color, footer, image, thumbnail, URL, timestamp, and fields.\n"
-                "• Use the 'Advanced Options' button for extra embed fields.\n"
-                "• Live preview updates after every change."
-            ),
-            inline=False
-        )
-        embed.add_field(
-            name="Tips",
-            value=(
-                "• Before submitting a field (like description or title), copy its contents to your clipboard.\n"
-                "• If you want to make changes, you can paste and edit instead of retyping everything.\n"
-                "• This is a technical limitation of Discord modals—previous values are not auto-filled."
-            ),
-            inline=False
-        )
-        embed.set_footer(text="Tip: Use the interactive UI for everything!")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
-        for trigger_type, triggers in self.autosend_data.items():
-            for trigger_value, entry in triggers.items():
-                # Support both old and new format
-                if isinstance(entry, dict) and ("embed" in entry or "message" in entry):
-                    msg = entry.get("embed") or entry.get("message")
-                    conditions = entry.get("conditions", {})
-                else:
-                    msg = entry
-                    conditions = {}
-                # --- Condition checks ---
-                if conditions.get("channel_id") and message.channel.id != conditions["channel_id"]:
-                    continue
-                if conditions.get("role_id") and not any(r.id == conditions["role_id"] for r in getattr(message.author, 'roles', [])):
-                    continue
-                if conditions.get("min_length") and len(message.content) < conditions["min_length"]:
-                    continue
-                if conditions.get("max_length") and len(message.content) > conditions["max_length"]:
-                    continue
-                if conditions.get("attachment_type") and not any(a.filename.lower().endswith(conditions["attachment_type"]) for a in message.attachments):
-                    continue
-                if conditions.get("regex"):
-                    import re
-                    if not re.search(conditions["regex"], message.content):
-                        continue
-                if conditions.get("first_time_user"):
-                    if hasattr(message.author, 'joined_at') and message.author.joined_at:
-                        history = [m async for m in message.channel.history(limit=1000) if m.author == message.author]
-                        if len(history) > 1:
-                            continue
-                # --- Trigger checks ---
-                if trigger_type == "keyword" and trigger_value.lower() in message.content.lower():
-                    await self._send_auto(message.channel, msg)
-                    return
-                if trigger_type == "ping_user" and any(str(user.id) == trigger_value for user in message.mentions):
-                    await self._send_auto(message.channel, msg)
-                    return
-                if trigger_type == "ping_role" and any(str(role.id) == trigger_value for role in message.role_mentions):
-                    await self._send_auto(message.channel, msg)
-                    return
-
-    async def _send_auto(self, channel, auto_msg):
-        # Always build and send a discord.Embed if auto_msg is an embed dict or has embed-like keys
-        embed_data = None
-        if isinstance(auto_msg, dict):
-            if "embed" in auto_msg:
-                embed_data = auto_msg["embed"]
-            elif any(k in auto_msg for k in ("title", "description", "color", "footer")):
-                embed_data = auto_msg
-        if embed_data:
-            embed = discord.Embed(
-                title=embed_data.get("title"),
-                description=embed_data.get("description"),
-                color=safe_embed_color(embed_data.get("color"))
-            )
-            if is_valid_url(embed_data.get("image_url")):
-                embed.set_image(url=embed_data["image_url"])
-            if embed_data.get("footer"):
-                embed.set_footer(text=embed_data["footer"], icon_url=embed_data.get("footer_icon"))
-            if embed_data.get("thumbnail") and is_valid_url(embed_data.get("thumbnail")):
-                embed.set_thumbnail(url=embed_data["thumbnail"])
-            if embed_data.get("url"):
-                embed.url = embed_data["url"]
-            if embed_data.get("timestamp"):
-                embed.timestamp = discord.utils.utcnow()
-            if embed_data.get("fields"):
-                for field in embed_data["fields"].split(";"):
-                    if ":" in field:
-                        name, value = field.split(":", 1)
-                        embed.add_field(name=name.strip(), value=value.strip(), inline=False)
-            await channel.send(embed=embed)
+    
+    @discord.ui.select(
+        placeholder="Select trigger type...",
+        options=[
+            discord.SelectOption(label="Keyword", value="keyword"),
+            discord.SelectOption(label="Ping User", value="ping_user"),
+            discord.SelectOption(label="Ping Role", value="ping_role")
+        ],
+        row=0
+    )
+    async def trigger_type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.state["trigger_type"] = select.values[0]
+        await interaction.response.send_modal(TriggerValueModal(self))
+    
+    @discord.ui.select(
+        placeholder="Select message type...",
+        options=[
+            discord.SelectOption(label="Plain Message", value="plain"),
+            discord.SelectOption(label="Embed", value="embed")
+        ],
+        row=1
+    )
+    async def message_type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.state["message_type"] = select.values[0]
+        if select.values[0] == "plain":
+            await interaction.response.send_modal(PlainMessageModal(self))
         else:
-            await channel.send(auto_msg if not isinstance(auto_msg, dict) else str(auto_msg))
+            await interaction.response.send_message(
+                "Embed type selected! Click **Continue** to open the editor.",
+                ephemeral=True
+            )
+    
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.green, row=2)
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.state
+        
+        if not all([state["trigger_type"], state["trigger_value"], state["message_type"]]):
+            await interaction.response.send_message(
+                embed=error_embed(
+                    "Incomplete",
+                    "Please select trigger type, enter trigger value, and select message type."
+                ),
+                ephemeral=True
+            )
+            return
+        
+        # Initialize embed if needed
+        if state["message_type"] == "embed" and not state.get("embed", {}).get("description"):
+            state["embed"]["description"] = "(no description yet)"
+        
+        view = LiveEditView(self.bot, self.autosend_data, state)
+        
+        if state["message_type"] == "plain":
+            await interaction.response.send_message(
+                state.get("plain_message", "(empty)"),
+                view=view,
+                ephemeral=True
+            )
+        else:
+            embed = build_auto_embed(state.get("embed", {}))
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @commands.Cog.listener()
-    async def on_raw_reaction_add(self, payload):
-        # Reaction-based auto-send
-        for trigger_type, triggers in self.autosend_data.items():
-            for trigger_value, entry in triggers.items():
-                if isinstance(entry, dict) and "conditions" in entry and entry["conditions"].get("reaction_emoji"):
-                    emoji = entry["conditions"]["reaction_emoji"]
-                    if str(payload.emoji) == emoji or getattr(payload.emoji, 'name', None) == emoji:
-                        if entry["conditions"].get("channel_id") and payload.channel_id != entry["conditions"]["channel_id"]:
-                            continue
-                        channel = self.bot.get_channel(payload.channel_id)
-                        if channel:
-                            msg = entry.get("embed") or entry.get("message")
-                            await self._send_auto(channel, msg)
-                            return
 
-    async def setup(self):
-        self.bot.tree.add_command(self.autosend_group)
-
-async def setup(bot):
-    await bot.add_cog(AutoSend(bot))
-
-class AutoSendSetupView(discord.ui.View):
-    def __init__(self, bot, autosend_data, *, timeout=180):
-        super().__init__(timeout=timeout)
-        self.bot = bot
-        self.autosend_data = autosend_data
-        self.state = {
-            "trigger_type": None,
-            "trigger_value": None,
-            "message_type": None,
-        }
-        self.add_item(self.TriggerTypeSelect(self))
-        self.add_item(self.MessageTypeSelect(self))
-        self.add_item(self.ContinueButton(self))
-
-    class TriggerTypeSelect(discord.ui.Select):
-        def __init__(self, parent_view):
-            options = [
-                discord.SelectOption(label="Keyword", value="keyword"),
-                discord.SelectOption(label="Ping User", value="ping_user"),
-                discord.SelectOption(label="Ping Role", value="ping_role")
-            ]
-            super().__init__(placeholder="Select trigger type...", options=options, row=0)
-        async def callback(self, interaction: discord.Interaction):
-            self.view.state["trigger_type"] = self.values[0]
-            await interaction.response.send_modal(TriggerValueModal(self.view))
-
-    class MessageTypeSelect(discord.ui.Select):
-        def __init__(self, parent_view):
-            options = [
-                discord.SelectOption(label="Plain Message", value="plain"),
-                discord.SelectOption(label="Embed", value="embed")
-            ]
-            super().__init__(placeholder="Select message type...", options=options, row=1)
-        async def callback(self, interaction: discord.Interaction):
-            self.view.state["message_type"] = self.values[0]
-            if self.values[0] == "plain":
-                await interaction.response.send_modal(AutoSendPlainModal(self.view))
-            else:
-                await interaction.response.send_message("Embed type selected! Now click Continue.", ephemeral=True)
-
-    class ContinueButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Continue", style=discord.ButtonStyle.green, row=2)
-        async def callback(self, interaction: discord.Interaction):
-            state = self.view.state
-            if not (state["trigger_type"] and state["trigger_value"] and state["message_type"]):
-                await interaction.response.send_message("Please select all options and enter a trigger value.", ephemeral=True)
-                return
-            # Ensure embed dict exists for embed type
-            if state["message_type"] == "embed":
-                if "embed" not in state:
-                    state["embed"] = {
-                        "title": None,
-                        "description": None,
-                        "color": None,
-                        "footer": None,
-                        "footer_icon": None,
-                        "thumbnail": None,
-                        "image_url": None,
-                        "url": None,
-                        "timestamp": False,
-                        "fields": None
-                    }
-                # Ensure description is not empty for Discord embed
-                if not state["embed"].get("description"):
-                    state["embed"]["description"] = "(no description yet)"
-            # Build the preview and send the live edit menu
-            live_edit_view = AutoSendLiveEditView(self.view.bot, self.view.autosend_data, self.view.state)
-            if state["message_type"] == "plain":
-                content = state.get("plain_message", "(empty)")
-                await interaction.response.send_message(
-                    content,
-                    view=live_edit_view,
-                    ephemeral=True
-                )
-            else:
-                embed_data = state["embed"]
-                embed = discord.Embed(
-                    title=embed_data.get("title"),
-                    description=embed_data.get("description"),
-                    color=safe_embed_color(embed_data.get("color"))
-                )
-                if is_valid_url(embed_data.get("image_url")):
-                    embed.set_image(url=embed_data["image_url"])
-                if embed_data.get("footer"):
-                    embed.set_footer(text=embed_data["footer"])
-                await interaction.response.send_message(
-                    embed=embed,
-                    view=live_edit_view,
-                    ephemeral=True
-                )
-
-class AutoSendLiveEditView(discord.ui.View):
-    def __init__(self, bot, autosend_data, state, *, timeout=300):
-        super().__init__(timeout=timeout)
+class LiveEditView(discord.ui.View):
+    """Live editor view with preview updates."""
+    
+    def __init__(self, bot, autosend_data, state):
+        super().__init__(timeout=300)
         self.bot = bot
         self.autosend_data = autosend_data
         self.state = state
-        # Default values for editing
+        
+        # Ensure embed dict exists
         if self.state["message_type"] == "embed":
-            self.state.setdefault("embed", {
-                "title": None,
-                "description": None,
-                "color": None,
-                "footer": None,
-                "footer_icon": None,
-                "thumbnail": None,
-                "image_url": None,
-                "url": None,
-                "timestamp": False,
-                "fields": None
-            })
-        self.add_item(self.EditTitleButton(self))
-        self.add_item(self.EditDescriptionButton(self))
-        self.add_item(self.EditColorButton(self))
-        self.add_item(self.EditFooterButton(self))
-        self.add_item(self.EditImageButton(self))
-        self.add_item(self.ConditionsButton(self))  # Add conditions button
-        self.add_item(self.AdvancedButton(self))  # Add advanced options button to live editor
-        self.add_item(self.SaveButton(self))
-        # Add more edit buttons for advanced fields as needed
-
-    async def update_message(self, interaction: discord.Interaction):
+            self.state.setdefault("embed", {})
+    
+    async def update_preview(self, interaction: discord.Interaction):
+        """Update the message to show current preview."""
         if self.state["message_type"] == "plain":
-            content = self.state.get("plain_message", "(empty)")
-            await interaction.response.edit_message(content=content, embed=None, view=self)
-        else:
-            embed_data = self.state["embed"]
-            embed = discord.Embed(
-                title=embed_data.get("title"),
-                description=embed_data.get("description"),
-                color=safe_embed_color(embed_data.get("color"))
+            await interaction.response.edit_message(
+                content=self.state.get("plain_message", "(empty)"),
+                embed=None,
+                view=self
             )
-            if is_valid_url(embed_data.get("image_url")):
-                embed.set_image(url=embed_data["image_url"])
-            if embed_data.get("footer"):
-                embed.set_footer(text=embed_data["footer"])
+        else:
+            embed = build_auto_embed(self.state.get("embed", {}))
             await interaction.response.edit_message(content=None, embed=embed, view=self)
+    
+    @discord.ui.button(label="Edit Title", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_title(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedFieldModal(self, "title", "Edit Title"))
+    
+    @discord.ui.button(label="Edit Description", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_desc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            EmbedFieldModal(self, "description", "Edit Description", discord.TextStyle.paragraph)
+        )
+    
+    @discord.ui.button(label="Edit Color", style=discord.ButtonStyle.secondary, row=1)
+    async def edit_color(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedFieldModal(self, "color", "Hex Color (e.g. #FF0000)"))
+    
+    @discord.ui.button(label="Edit Footer", style=discord.ButtonStyle.secondary, row=1)
+    async def edit_footer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedFieldModal(self, "footer", "Footer Text"))
+    
+    @discord.ui.button(label="Edit Image", style=discord.ButtonStyle.secondary, row=2)
+    async def edit_image(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EmbedFieldModal(self, "image_url", "Image URL"))
+    
+    @discord.ui.button(label="Conditions", style=discord.ButtonStyle.primary, row=3)
+    async def conditions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Select a condition to edit:",
+            view=ConditionsView(self.bot, self.state),
+            ephemeral=True
+        )
+    
+    @discord.ui.button(label="Advanced", style=discord.ButtonStyle.secondary, row=3)
+    async def advanced(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AdvancedOptionsModal(self))
+    
+    @discord.ui.button(label="Save AutoSend", style=discord.ButtonStyle.green, row=4)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.state
+        
+        # Build entry
+        if state["message_type"] == "plain":
+            entry = {"message": state.get("plain_message", "")}
+        else:
+            entry = {"embed": {k: v for k, v in state.get("embed", {}).items() if v}}
+        
+        # Add conditions if any
+        if state.get("conditions"):
+            entry["conditions"] = state["conditions"]
+        
+        # Save
+        self.autosend_data.setdefault(state["trigger_type"], {})[state["trigger_value"]] = entry
+        save_json(AUTOSEND_FILE, self.autosend_data)
+        
+        log.info(f"Saved auto-send: {state['trigger_type']}/{state['trigger_value']}")
+        
+        await interaction.response.send_message(
+            embed=success_embed(
+                "Saved",
+                f"Auto-send for **{state['trigger_type']}** `{state['trigger_value']}` saved!"
+            ),
+            ephemeral=True
+        )
 
-    class EditTitleButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Title", style=discord.ButtonStyle.secondary, row=0)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(EditFieldModal(self.view, "title", "Edit Title"))
 
-    class EditDescriptionButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Description", style=discord.ButtonStyle.secondary, row=0)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(EditFieldModal(self.view, "description", "Edit Description", style=discord.TextStyle.paragraph))
-
-    class EditColorButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Color", style=discord.ButtonStyle.secondary, row=1)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(EditFieldModal(self.view, "color", "Edit Color (hex, e.g. #00ff00)"))
-
-    class EditFooterButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Footer", style=discord.ButtonStyle.secondary, row=1)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(EditFieldModal(self.view, "footer", "Edit Footer"))
-
-    class EditImageButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Image", style=discord.ButtonStyle.secondary, row=2)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(EditFieldModal(self.view, "image_url", "Edit Image URL"))
-
-    class ConditionsButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Edit Conditions", style=discord.ButtonStyle.primary, row=3)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_message("Select a condition to edit:", view=ConditionEditView(self.view.bot, self.view.state), ephemeral=True)
-
-    class AdvancedButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Advanced Options", style=discord.ButtonStyle.secondary, row=3)
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(AutoSendEmbedAdvancedModal(self.view))
-
-    class SaveButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Save AutoSend", style=discord.ButtonStyle.green, row=4)
-        async def callback(self, interaction: discord.Interaction):
-            state = self.view.state
-            if state["message_type"] == "plain":
-                entry = {"message": state.get("plain_message", "")}
-            else:
-                entry = {"embed": {k: v for k, v in state["embed"].items() if v}}
-            
-            # Save conditions if any exist
-            if "conditions" in state and state["conditions"]:
-                entry["conditions"] = state["conditions"]
-
-            self.view.autosend_data.setdefault(state["trigger_type"], {})[state["trigger_value"]] = entry
-            save_json(AUTOSEND_FILE, self.view.autosend_data)
-            await interaction.response.send_message(f"Auto-send for {state['trigger_type']} '{state['trigger_value']}' saved!", ephemeral=True)
-
-class ConditionEditView(discord.ui.View):
+class ConditionsView(discord.ui.View):
+    """View for editing auto-send conditions."""
+    
     def __init__(self, bot, state):
         super().__init__(timeout=180)
         self.bot = bot
         self.state = state
         self.state.setdefault("conditions", {})
-        
-        self.add_item(self.ChannelSelect(self))
-        self.add_item(self.RoleSelect(self))
-        self.add_item(self.SetRegexButton(self))
-        self.add_item(self.SetLengthButton(self))
-        self.add_item(self.ClearConditionsButton(self))
-
-    class ChannelSelect(discord.ui.ChannelSelect):
-        def __init__(self, parent_view):
-            super().__init__(placeholder="Restrict to specific channel...", channel_types=[discord.ChannelType.text], min_values=0, max_values=1, row=0)
-            self.parent_view = parent_view
-        async def callback(self, interaction: discord.Interaction):
-            if self.values:
-                self.parent_view.state["conditions"]["channel_id"] = self.values[0].id
-                await interaction.response.send_message(f"Restricted to channel: {self.values[0].mention}", ephemeral=True)
-            else:
-                self.parent_view.state["conditions"].pop("channel_id", None)
-                await interaction.response.send_message("Channel restriction removed.", ephemeral=True)
-
-    class RoleSelect(discord.ui.RoleSelect):
-        def __init__(self, parent_view):
-            super().__init__(placeholder="Restrict to specific role...", min_values=0, max_values=1, row=1)
-            self.parent_view = parent_view
-        async def callback(self, interaction: discord.Interaction):
-            if self.values:
-                self.parent_view.state["conditions"]["role_id"] = self.values[0].id
-                await interaction.response.send_message(f"Restricted to users with role: {self.values[0].mention}", ephemeral=True)
-            else:
-                self.parent_view.state["conditions"].pop("role_id", None)
-                await interaction.response.send_message("Role restriction removed.", ephemeral=True)
-
-    class SetRegexButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Set Regex Trigger", style=discord.ButtonStyle.secondary, row=2)
-            self.parent_view = parent_view
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(RegexConditionModal(self.parent_view))
-
-    class SetLengthButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Set Min/Max Length", style=discord.ButtonStyle.secondary, row=2)
-            self.parent_view = parent_view
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.send_modal(LengthConditionModal(self.parent_view))
-
-    class ClearConditionsButton(discord.ui.Button):
-        def __init__(self, parent_view):
-            super().__init__(label="Clear All Conditions", style=discord.ButtonStyle.danger, row=3)
-            self.parent_view = parent_view
-        async def callback(self, interaction: discord.Interaction):
-            self.parent_view.state["conditions"] = {}
-            await interaction.response.send_message("All conditions cleared.", ephemeral=True)
-
-class RegexConditionModal(discord.ui.Modal, title="Regex Trigger Condition"):
-    regex_pattern = discord.ui.TextInput(label="Regex Pattern", placeholder="e.g. ^Hello.*", required=False)
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-        if "regex" in self.parent_view.state["conditions"]:
-            self.regex_pattern.default = self.parent_view.state["conditions"]["regex"]
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.regex_pattern.value:
-            self.parent_view.state["conditions"]["regex"] = self.regex_pattern.value
-            await interaction.response.send_message(f"Regex pattern set: `{self.regex_pattern.value}`", ephemeral=True)
-        else:
-            self.parent_view.state["conditions"].pop("regex", None)
-            await interaction.response.send_message("Regex condition removed.", ephemeral=True)
-
-class LengthConditionModal(discord.ui.Modal, title="Message Length Conditions"):
-    min_len = discord.ui.TextInput(label="Min Length", placeholder="0", required=False, style=discord.TextStyle.short)
-    max_len = discord.ui.TextInput(label="Max Length", placeholder="2000", required=False, style=discord.TextStyle.short)
-    def __init__(self, parent_view):
-        super().__init__()
-        self.parent_view = parent_view
-        if "min_length" in self.parent_view.state["conditions"]:
-            self.min_len.default = str(self.parent_view.state["conditions"]["min_length"])
-        if "max_length" in self.parent_view.state["conditions"]:
-            self.max_len.default = str(self.parent_view.state["conditions"]["max_length"])
-    async def on_submit(self, interaction: discord.Interaction):
-        msg = []
-        if self.min_len.value and self.min_len.value.isdigit():
-            self.parent_view.state["conditions"]["min_length"] = int(self.min_len.value)
-            msg.append(f"Min Length: {self.min_len.value}")
-        else:
-            self.parent_view.state["conditions"].pop("min_length", None)
-        
-        if self.max_len.value and self.max_len.value.isdigit():
-            self.parent_view.state["conditions"]["max_length"] = int(self.max_len.value)
-            msg.append(f"Max Length: {self.max_len.value}")
-        else:
-            self.parent_view.state["conditions"].pop("max_length", None)
-
-        if msg:
-            await interaction.response.send_message(f"Length conditions set: {', '.join(msg)}", ephemeral=True)
-        else:
-            await interaction.response.send_message("Length conditions cleared.", ephemeral=True)
-
-    async def send_initial(self, interaction):
-        if self.state["message_type"] == "plain":
-            await interaction.response.send_message(self.state.get("plain_message", "(empty)"), view=self, ephemeral=True)
-        else:
-            embed_data = self.state["embed"]
-            embed = discord.Embed(
-                title=embed_data.get("title"),
-                description=embed_data.get("description"),
-                color=safe_embed_color(embed_data.get("color"))
+    
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        placeholder="Restrict to channel...",
+        channel_types=[discord.ChannelType.text],
+        min_values=0,
+        max_values=1,
+        row=0
+    )
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if select.values:
+            self.state["conditions"]["channel_id"] = select.values[0].id
+            await interaction.response.send_message(
+                f"Restricted to channel: {select.values[0].mention}",
+                ephemeral=True
             )
-            if is_valid_url(embed_data.get("image_url")):
-                embed.set_image(url=embed_data["image_url"])
-            if embed_data.get("footer"):
-                embed.set_footer(text=embed_data["footer"])
-            await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
-
-class EditFieldModal(discord.ui.Modal):
-    def __init__(self, parent_view, field, label, style=discord.TextStyle.short):
-        super().__init__(title=label)
-        self.parent_view = parent_view
-        self.field = field
-        self.input = discord.ui.TextInput(label=label, style=style, required=False)
-        
-        # Pre-fill value
-        val = None
-        if self.parent_view.state["message_type"] == "plain":
-            val = self.parent_view.state.get("plain_message")
         else:
-            if "embed" in self.parent_view.state:
-                val = self.parent_view.state["embed"].get(field)
+            self.state["conditions"].pop("channel_id", None)
+            await interaction.response.send_message("Channel restriction removed.", ephemeral=True)
+    
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Restrict to role...",
+        min_values=0,
+        max_values=1,
+        row=1
+    )
+    async def role_select(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if select.values:
+            self.state["conditions"]["role_id"] = select.values[0].id
+            await interaction.response.send_message(
+                f"Restricted to role: {select.values[0].mention}",
+                ephemeral=True
+            )
+        else:
+            self.state["conditions"].pop("role_id", None)
+            await interaction.response.send_message("Role restriction removed.", ephemeral=True)
+    
+    @discord.ui.button(label="Set Regex", style=discord.ButtonStyle.secondary, row=2)
+    async def set_regex(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RegexModal(self))
+    
+    @discord.ui.button(label="Set Length", style=discord.ButtonStyle.secondary, row=2)
+    async def set_length(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LengthModal(self))
+    
+    @discord.ui.button(label="Clear All", style=discord.ButtonStyle.danger, row=3)
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.state["conditions"] = {}
+        await interaction.response.send_message("All conditions cleared.", ephemeral=True)
+
+
+# =============================================================================
+# COG
+# =============================================================================
+
+class AutoSend(commands.Cog):
+    """Automatic message responses based on triggers and conditions."""
+    
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.autosend_data = load_json(AUTOSEND_FILE, {})
+        log.info(f"AutoSend cog loaded with {sum(len(v) for v in self.autosend_data.values())} triggers")
+    
+    autosend_group = app_commands.Group(name="autosend", description="Manage auto-send triggers")
+    
+    @autosend_group.command(name="add", description="Create a new auto-send trigger")
+    @admin_only()
+    async def add(self, interaction: discord.Interaction):
+        """Interactively create a new auto-send."""
+        await interaction.response.send_message(
+            "**Create New Auto-Send**\n"
+            "Select the trigger type and message type, then click Continue:",
+            view=SetupView(self.bot, self.autosend_data),
+            ephemeral=True
+        )
+    
+    @autosend_group.command(name="list", description="View and manage existing auto-sends")
+    @admin_only()
+    async def list(self, interaction: discord.Interaction):
+        """List all auto-sends with edit/delete options."""
+        # Reload from disk
+        self.autosend_data = load_json(AUTOSEND_FILE, {})
         
-        if val:
-            self.input.default = str(val)
+        if not self.autosend_data or not any(self.autosend_data.values()):
+            await interaction.response.send_message(
+                embed=info_embed("No Auto-Sends", "No auto-send triggers configured yet."),
+                ephemeral=True
+            )
+            return
+        
+        # Build summary embed
+        embed = info_embed("Auto-Send Triggers", "Select one to edit or delete:")
+        
+        for trigger_type, triggers in self.autosend_data.items():
+            if not triggers:
+                continue
             
-        self.add_item(self.input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.parent_view.state["message_type"] == "plain":
-            self.parent_view.state["plain_message"] = self.input.value
+            entries = []
+            for key, value in triggers.items():
+                if isinstance(value, dict) and "embed" in value:
+                    desc = value["embed"].get("description", "")[:40]
+                    entries.append(f"• `{key}` → [Embed] {desc}...")
+                else:
+                    msg = value.get("message", str(value))[:40] if isinstance(value, dict) else str(value)[:40]
+                    entries.append(f"• `{key}` → {msg}...")
+            
+            if entries:
+                embed.add_field(
+                    name=trigger_type.replace("_", " ").title(),
+                    value="\n".join(entries[:5]),
+                    inline=False
+                )
+        
+        await interaction.response.send_message(
+            embed=embed,
+            view=AutoSendListView(self.autosend_data, self.bot),
+            ephemeral=True
+        )
+    
+    @autosend_group.command(name="help", description="Show help for the auto-send system")
+    @admin_only()
+    async def help(self, interaction: discord.Interaction):
+        """Display help information."""
+        embed = info_embed(
+            "AutoSend Help",
+            "Configure automatic responses to messages."
+        )
+        
+        embed.add_field(
+            name="Commands",
+            value=(
+                "`/autosend add` — Create a new auto-send\n"
+                "`/autosend list` — View, edit, or delete existing\n"
+                "`/autosend help` — Show this help"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Trigger Types",
+            value=(
+                "• **Keyword** — Responds when message contains word\n"
+                "• **Ping User** — Responds when user is mentioned\n"
+                "• **Ping Role** — Responds when role is mentioned"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Conditions",
+            value=(
+                "• **Channel** — Only trigger in specific channel\n"
+                "• **Role** — Only trigger for users with role\n"
+                "• **Regex** — Match pattern in message\n"
+                "• **Length** — Min/max message length"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text="Tip: Use the interactive editor for live preview!")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Process messages for auto-send triggers."""
+        if message.author.bot:
+            return
+        
+        for trigger_type, triggers in self.autosend_data.items():
+            for trigger_value, entry in triggers.items():
+                # Parse entry
+                if isinstance(entry, dict) and ("embed" in entry or "message" in entry):
+                    msg_data = entry.get("embed") or entry.get("message")
+                    conditions = entry.get("conditions", {})
+                else:
+                    msg_data = entry
+                    conditions = {}
+                
+                # Check conditions
+                if not self._check_conditions(message, conditions):
+                    continue
+                
+                # Check trigger
+                triggered = False
+                
+                if trigger_type == "keyword":
+                    if trigger_value.lower() in message.content.lower():
+                        triggered = True
+                
+                elif trigger_type == "ping_user":
+                    if any(str(u.id) == trigger_value for u in message.mentions):
+                        triggered = True
+                
+                elif trigger_type == "ping_role":
+                    if any(str(r.id) == trigger_value for r in message.role_mentions):
+                        triggered = True
+                
+                if triggered:
+                    await self._send_response(message.channel, msg_data)
+                    log.debug(f"Auto-send triggered: {trigger_type}/{trigger_value}")
+                    return
+    
+    def _check_conditions(self, message: discord.Message, conditions: dict) -> bool:
+        """Check if all conditions are met."""
+        if not conditions:
+            return True
+        
+        # Channel restriction
+        if conditions.get("channel_id"):
+            if message.channel.id != conditions["channel_id"]:
+                return False
+        
+        # Role restriction
+        if conditions.get("role_id"):
+            member_roles = getattr(message.author, 'roles', [])
+            if not any(r.id == conditions["role_id"] for r in member_roles):
+                return False
+        
+        # Length restrictions
+        if conditions.get("min_length"):
+            if len(message.content) < conditions["min_length"]:
+                return False
+        
+        if conditions.get("max_length"):
+            if len(message.content) > conditions["max_length"]:
+                return False
+        
+        # Regex
+        if conditions.get("regex"):
+            try:
+                if not re.search(conditions["regex"], message.content):
+                    return False
+            except re.error:
+                return False
+        
+        return True
+    
+    async def _send_response(self, channel, msg_data):
+        """Send the auto-response."""
+        # Check if it's embed data
+        if isinstance(msg_data, dict):
+            if "embed" in msg_data:
+                embed = build_auto_embed(msg_data["embed"])
+            elif any(k in msg_data for k in ("title", "description", "color")):
+                embed = build_auto_embed(msg_data)
+            else:
+                # Plain message in dict
+                await channel.send(msg_data.get("message", str(msg_data)))
+                return
+            
+            await channel.send(embed=embed)
         else:
-            self.parent_view.state["embed"][self.field] = self.input.value
-        await self.parent_view.update_message(interaction)
+            await channel.send(str(msg_data))
+    
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Handle reaction-based auto-sends."""
+        for trigger_type, triggers in self.autosend_data.items():
+            for trigger_value, entry in triggers.items():
+                if not isinstance(entry, dict):
+                    continue
+                
+                conditions = entry.get("conditions", {})
+                reaction_emoji = conditions.get("reaction_emoji")
+                
+                if not reaction_emoji:
+                    continue
+                
+                # Check emoji match
+                emoji_str = str(payload.emoji) if payload.emoji.id else payload.emoji.name
+                if emoji_str != reaction_emoji and payload.emoji.name != reaction_emoji:
+                    continue
+                
+                # Check channel restriction
+                if conditions.get("channel_id") and payload.channel_id != conditions["channel_id"]:
+                    continue
+                
+                channel = self.bot.get_channel(payload.channel_id)
+                if channel:
+                    msg_data = entry.get("embed") or entry.get("message")
+                    await self._send_response(channel, msg_data)
+                    return
 
-def safe_embed_color(color_str):
-    if not color_str:
-        return discord.Color.green()
-    try:
-        return int(color_str.replace("#", ""), 16)
-    except Exception:
-        return discord.Color.green()
 
-def is_valid_url(url):
-    return isinstance(url, str) and (url.startswith("http://") or url.startswith("https://"))
+async def setup(bot: commands.Bot):
+    await bot.add_cog(AutoSend(bot))
