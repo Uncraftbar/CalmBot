@@ -125,9 +125,9 @@ class ChatBridge(commands.Cog):
 
         online_data = {} # { "Server Alias": [player1, player2] }
 
-        for server_name in instance_names:
+        async def fetch_server_status(server_name):
             inst = self.instances.get(server_name)
-            if not inst or not inst.running: continue
+            if not inst or not inst.running: return None
             
             # Get Display Name
             settings = self.bridge_data.get("instance_settings", {}).get(server_name, {})
@@ -144,7 +144,7 @@ class ChatBridge(commands.Cog):
                              except: pass
                          break
             
-            if not mc_port: continue
+            if not mc_port: return None
 
             try:
                 address = f"{hostname}:{mc_port}"
@@ -157,10 +157,19 @@ class ChatBridge(commands.Cog):
                 
                 # Sort players
                 players.sort()
-                online_data[display_name] = players
+                return display_name, players
                 
             except Exception:
-                pass
+                return None
+
+        # Fetch all statuses in parallel
+        tasks = [fetch_server_status(name) for name in instance_names]
+        results = await asyncio.gather(*tasks)
+
+        for result in results:
+            if result:
+                display_name, players = result
+                online_data[display_name] = players
         
         return online_data
 
@@ -170,6 +179,13 @@ class ChatBridge(commands.Cog):
         
         channel = self.bot.get_channel(linked_channel_id)
         if not channel or not isinstance(channel, discord.TextChannel): return
+
+        # OPTIMIZATION: Check time before fetching data to prevent spamming the servers
+        last_update = group_data.get("last_topic_update", 0)
+        current_time = datetime.now().timestamp()
+        
+        if current_time - last_update < 300:
+             return
 
         online_data = await self._get_online_players(group_data)
         
@@ -191,19 +207,12 @@ class ChatBridge(commands.Cog):
         if len(topic) > 1000:
             topic = topic[:1000] + "..."
 
-        last_update = group_data.get("last_topic_update", 0)
-        current_time = datetime.now().timestamp()
-        
-        if current_time - last_update < 300:
-             if channel.topic == topic: return
-             pass
-        else:
-             if channel.topic != topic:
-                 try:
-                     await channel.edit(topic=topic)
-                     group_data["last_topic_update"] = current_time
-                 except Exception as e:
-                     print(f"[Bridge] Failed to update topic for {channel.name}: {e}")
+        if channel.topic != topic:
+             try:
+                 await channel.edit(topic=topic)
+                 group_data["last_topic_update"] = current_time
+             except Exception as e:
+                 print(f"[Bridge] Failed to update topic for {channel.name}: {e}")
 
     async def handle_minecraft_command(self, source_name, user, msg, group_data):
         command = msg.split(" ")[0].lower()
