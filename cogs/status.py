@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 import os
-import itertools
+import random
 
 INTERVAL = 60
 
@@ -10,7 +10,6 @@ class StatusRotator(commands.Cog):
         self.bot = bot
         self.status_file = "data/statuses.txt"
         self.statuses = []
-        self.status_iterator = None
         self.load_statuses()
         self.status_loop.start()
 
@@ -21,15 +20,13 @@ class StatusRotator(commands.Cog):
         
         if not self.statuses:
             self.statuses = ["Default Status"]
-        
-        self.status_iterator = itertools.cycle(self.statuses)
 
     def cog_unload(self):
         self.status_loop.cancel()
 
     @tasks.loop(seconds=INTERVAL)
     async def status_loop(self):
-        current_status = next(self.status_iterator)
+        current_status = random.choice(self.statuses)
         await self.bot.change_presence(activity=discord.CustomActivity(name=current_status))
 
     @status_loop.before_loop
