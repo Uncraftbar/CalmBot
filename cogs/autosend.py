@@ -4,7 +4,7 @@ from discord import app_commands
 from cogs.utils import load_json, save_json
 import os
 
-AUTOSEND_FILE = "autosend.json"
+AUTOSEND_FILE = "data/autosend.json"
 
 class AutoSendListView(discord.ui.View):
     def __init__(self, autosend_data, bot):

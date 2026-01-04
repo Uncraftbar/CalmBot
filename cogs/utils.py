@@ -2,8 +2,8 @@ import json
 import os
 from ampapi import AMPControllerInstance
 
-ROLES_BOARD_FILE = "roles_board.json"
-CHAT_BRIDGE_FILE = "chat_bridge.json"
+ROLES_BOARD_FILE = "data/roles_board.json"
+CHAT_BRIDGE_FILE = "data/chat_bridge.json"
 
 
 async def fetch_valid_instances():

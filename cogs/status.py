@@ -8,7 +8,7 @@ INTERVAL = 60
 class StatusRotator(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.status_file = "statuses.txt"
+        self.status_file = "data/statuses.txt"
         self.statuses = []
         self.status_iterator = None
         self.load_statuses()

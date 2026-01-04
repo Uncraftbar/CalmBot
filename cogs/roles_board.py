@@ -3,7 +3,7 @@ from discord.ext import commands
 from cogs.utils import load_json, save_json, ROLES_BOARD_FILE
 from discord import app_commands
 
-REACTION_ROLES_FILE = "reaction_roles.json"
+REACTION_ROLES_FILE = "data/reaction_roles.json"
 
 class SyncRolesView(discord.ui.View):
     def __init__(self, bot, roles_board_data, invalid_roles):
