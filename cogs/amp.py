@@ -44,14 +44,17 @@ class InstanceActionView(discord.ui.View):
         except Exception:
             pass
         # Show action buttons based on state
-        view = InstanceControlView(instance, state)
-        await interaction.response.send_message(f"**{selected_label}** is currently **{state}**.", view=view, ephemeral=True)
+        view = InstanceControlView(instance, state, self.instances, self.bot)
+        await interaction.response.edit_message(content=f"**{selected_label}** is currently **{state}**.", embed=None, view=view)
 
 class InstanceControlView(discord.ui.View):
-    def __init__(self, instance, state):
+    def __init__(self, instance, state, all_instances, bot):
         super().__init__(timeout=60)
         self.instance = instance
         self.state = state
+        self.all_instances = all_instances
+        self.bot = bot
+        
         if state.lower() == 'running':
             self.add_item(RestartButton(instance))
             self.add_item(StopButton(instance))
@@ -59,6 +62,28 @@ class InstanceControlView(discord.ui.View):
             self.add_item(ProfilerButton(instance))
         else:
             self.add_item(StartButton(instance))
+        
+        self.add_item(BackButton(all_instances, bot))
+
+class BackButton(discord.ui.Button):
+    def __init__(self, all_instances, bot):
+        super().__init__(label="Back", style=discord.ButtonStyle.secondary, row=4)
+        self.all_instances = all_instances
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        # Restore the original embed view (InstanceActionView)
+        # We need to rebuild the main embed or just go back to the list
+        # Since the original command had an embed, we should ideally try to restore it,
+        # but for now let's just restore the View and a title.
+        
+        # Re-fetch instance states for the main embed if possible, or just use a generic message
+        embed = discord.Embed(title="AMP Instances", color=discord.Color.blue())
+        for i in self.all_instances:
+            # We skip fetching fresh state to avoid lag, just list them
+            embed.add_field(name=i.friendly_name or i.instance_name, value="Select to manage", inline=False)
+        
+        await interaction.response.edit_message(content=None, embed=embed, view=InstanceActionView(self.all_instances, self.bot))
 
 class RestartButton(discord.ui.Button):
     def __init__(self, instance):

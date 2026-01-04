@@ -809,7 +809,8 @@ class CreateGroupModal(discord.ui.Modal, title="Create Bridge Group"):
             return
         self.cog.bridge_data["groups"][name] = {"servers": [], "active": True}
         save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
-        await interaction.response.send_message(f"✅ Created group **{name}**. Select it in the menu to add servers.", ephemeral=True)
+        # Refresh the main view to show the new group in the dropdown
+        await interaction.response.edit_message(embed=interaction.message.embeds[0], view=BridgeControlView(self.cog))
 
 class LinkInstanceView(discord.ui.View):
     def __init__(self, cog, group_name, options):
@@ -882,8 +883,9 @@ class IE_SetAliasButton(discord.ui.Button):
         super().__init__(label=f"Alias: {current_alias}", style=discord.ButtonStyle.primary, row=0)
         self.cog = cog
         self.server_name = server_name
+        self.current_alias = current_alias
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(AliasModal(self.cog, self.server_name))
+        await interaction.response.send_modal(AliasModal(self.cog, self.server_name, self.current_alias))
 
 class IE_ColorSelect(discord.ui.Select):
     def __init__(self, cog, server_name, current_color):
@@ -907,15 +909,19 @@ class IE_ColorSelect(discord.ui.Select):
         self.cog.bridge_data["instance_settings"][self.server_name]["color"] = color
         save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
         
-        await interaction.response.send_message(f"🎨 Color for **{self.server_name}** set to `{color}`.", ephemeral=True)
+        await interaction.response.edit_message(
+            content=f"Configuring **{self.server_name}** (Color set to `{color}`):",
+            view=InstanceEditView(self.cog, self.server_name)
+        )
 
 class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
     alias = discord.ui.TextInput(label="Display Name", required=True, max_length=20)
     
-    def __init__(self, cog, server_name):
+    def __init__(self, cog, server_name, current_alias):
         super().__init__()
         self.cog = cog
         self.server_name = server_name
+        self.alias.default = current_alias
         
     async def on_submit(self, interaction: discord.Interaction):
         alias = self.alias.value.strip()
@@ -926,7 +932,10 @@ class AliasModal(discord.ui.Modal, title="Set Instance Alias"):
             
         self.cog.bridge_data["instance_settings"][self.server_name]["alias"] = alias
         save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
-        await interaction.response.send_message(f"🏷️ Alias for **{self.server_name}** set to **{alias}**.", ephemeral=True)
+        await interaction.response.edit_message(
+            content=f"Configuring **{self.server_name}** (Alias set to **{alias}**):",
+            view=InstanceEditView(self.cog, self.server_name)
+        )
 
 async def setup(bot):
     await bot.add_cog(ChatBridge(bot))
