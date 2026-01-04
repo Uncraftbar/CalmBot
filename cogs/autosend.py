@@ -533,9 +533,6 @@ class AutoSendLiveEditView(discord.ui.View):
         self.bot = bot
         self.autosend_data = autosend_data
         self.state = state
-        # Store preview message info for editing
-        self.preview_message_id = None
-        self.preview_channel_id = None
         # Default values for editing
         if self.state["message_type"] == "embed":
             self.state.setdefault("embed", {
@@ -559,6 +556,23 @@ class AutoSendLiveEditView(discord.ui.View):
         self.add_item(self.AdvancedButton(self))  # Add advanced options button to live editor
         self.add_item(self.SaveButton(self))
         # Add more edit buttons for advanced fields as needed
+
+    async def update_message(self, interaction: discord.Interaction):
+        if self.state["message_type"] == "plain":
+            content = self.state.get("plain_message", "(empty)")
+            await interaction.response.edit_message(content=content, embed=None, view=self)
+        else:
+            embed_data = self.state["embed"]
+            embed = discord.Embed(
+                title=embed_data.get("title"),
+                description=embed_data.get("description"),
+                color=safe_embed_color(embed_data.get("color"))
+            )
+            if is_valid_url(embed_data.get("image_url")):
+                embed.set_image(url=embed_data["image_url"])
+            if embed_data.get("footer"):
+                embed.set_footer(text=embed_data["footer"])
+            await interaction.response.edit_message(content=None, embed=embed, view=self)
 
     class EditTitleButton(discord.ui.Button):
         def __init__(self, parent_view):
@@ -739,77 +753,32 @@ class LengthConditionModal(discord.ui.Modal, title="Message Length Conditions"):
                 embed.set_footer(text=embed_data["footer"])
             await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
 
-# Utility function to build the current preview embed
-async def update_live_preview(interaction, state, view):
-    try:
-        # Try to use the interaction's message if available
-        msg = getattr(interaction, 'message', None)
-        # If not, try to fetch the original preview message using the view's stored ids
-        if msg is None and hasattr(view, 'preview_message_id') and hasattr(view, 'preview_channel_id'):
-            channel = interaction.client.get_channel(view.preview_channel_id)
-            if channel:
-                try:
-                    msg = await channel.fetch_message(view.preview_message_id)
-                except Exception:
-                    msg = None
-        if msg:
-            if state["message_type"] == "plain":
-                content = state.get("plain_message", "(empty)")
-                await msg.edit(content=content, embed=None, view=view)
-            else:
-                embed_data = state["embed"]
-                embed = discord.Embed(
-                    title=embed_data.get("title"),
-                    description=embed_data.get("description"),
-                    color=safe_embed_color(embed_data.get("color"))
-                )
-                if is_valid_url(embed_data.get("image_url")):
-                    embed.set_image(url=embed_data["image_url"])
-                if embed_data.get("footer"):
-                    embed.set_footer(text=embed_data["footer"])
-                await msg.edit(content=None, embed=embed, view=view)
-            return
-    except (discord.NotFound, AttributeError):
-        pass
-    # If the message is gone or not found, send a new ephemeral preview and update the view's ids
-    if state["message_type"] == "plain":
-        content = state.get("plain_message", "(empty)")
-        sent = await interaction.response.send_message(content, view=view, ephemeral=True)
-    else:
-        embed_data = state["embed"]
-        embed = discord.Embed(
-            title=embed_data.get("title"),
-            description=embed_data.get("description"),
-            color=safe_embed_color(embed_data.get("color"))
-        )
-        if is_valid_url(embed_data.get("image_url")):
-            embed.set_image(url=embed_data["image_url"])
-        if embed_data.get("footer"):
-            embed.set_footer(text=embed_data["footer"])
-        sent = await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    # Try to store the new preview message id/channel id
-    if hasattr(view, 'preview_message_id') and hasattr(view, 'preview_channel_id'):
-        try:
-            if hasattr(sent, 'id') and hasattr(sent, 'channel'):
-                view.preview_message_id = sent.id
-                view.preview_channel_id = sent.channel.id
-        except Exception:
-            pass
-
 class EditFieldModal(discord.ui.Modal):
     def __init__(self, parent_view, field, label, style=discord.TextStyle.short):
         super().__init__(title=label)
         self.parent_view = parent_view
         self.field = field
         self.input = discord.ui.TextInput(label=label, style=style, required=False)
+        
+        # Pre-fill value
+        val = None
+        if self.parent_view.state["message_type"] == "plain":
+            val = self.parent_view.state.get("plain_message")
+        else:
+            if "embed" in self.parent_view.state:
+                val = self.parent_view.state["embed"].get(field)
+        
+        if val:
+            self.input.default = str(val)
+            
         self.add_item(self.input)
+
     async def on_submit(self, interaction: discord.Interaction):
         if self.parent_view.state["message_type"] == "plain":
             self.parent_view.state["plain_message"] = self.input.value
         else:
             self.parent_view.state["embed"][self.field] = self.input.value
-        await update_live_preview(interaction, self.parent_view.state, self.parent_view)
-        # Removed extra send_message to avoid InteractionResponded error and ghost messages
+        await self.parent_view.update_message(interaction)
 
 def safe_embed_color(color_str):
     if not color_str:
