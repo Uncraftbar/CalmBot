@@ -58,25 +58,20 @@ class Modpack(commands.Cog):
     
     @app_commands.command(name="setup_modpack", description="Create a modpack category with channels and role")
     @app_commands.describe(
-        name="Name of the modpack",
-        modloader="The modloader for this modpack",
+        name="Name of the modpack or game",
+        modloader="The modloader/platform (optional, e.g., 'Fabric', 'Steam')",
         modpack_link="Link to the modpack",
         connection_ip="Connection IP or URL",
         role_emoji="Emoji for the notification role (optional)"
     )
-    @app_commands.choices(modloader=[
-        app_commands.Choice(name="NEOFORGE", value="NEOFORGE"),
-        app_commands.Choice(name="FORGE", value="FORGE"),
-        app_commands.Choice(name="FABRIC", value="FABRIC")
-    ])
     @admin_only()
     async def setup_modpack(
         self,
         interaction: discord.Interaction,
         name: str,
-        modloader: str,
         modpack_link: str,
         connection_ip: str,
+        modloader: str = None,
         role_emoji: str = None
     ):
         """Create a new modpack with category, channels, and optional role."""
@@ -90,7 +85,10 @@ class Modpack(commands.Cog):
             )
             return
         
-        category_name = f"{name} [{modloader}]"
+        if modloader:
+            category_name = f"{name} [{modloader}]"
+        else:
+            category_name = name
         await interaction.response.send_message(
             f"⏳ Setting up **{category_name}**...",
             ephemeral=True
@@ -228,8 +226,11 @@ class Modpack(commands.Cog):
         role_name = None
         if "[" in actual_name and "]" in actual_name:
             modpack_name = actual_name.split("[")[0].strip()
-            role_name = f"{modpack_name} Updates"
-            role = discord.utils.get(guild.roles, name=role_name)
+        else:
+            modpack_name = actual_name
+            
+        role_name = f"{modpack_name} Updates"
+        role = discord.utils.get(guild.roles, name=role_name)
         
         # Build confirmation message
         channels = [f"#{c.name}" for c in category.channels]
