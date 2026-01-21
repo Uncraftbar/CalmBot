@@ -143,6 +143,58 @@ class ChatBridge(commands.Cog):
             # We found the group, no need to check others (assuming 1:1 mapping preference)
             break
 
+    async def broadcast_system_message(self, message: str, group_name: str = None) -> int:
+        """Broadcasts a system message to bridged servers. Returns count of targets."""
+        if not self.bridge_data.get("groups"): return 0
+
+        unique_targets = set()
+        for name, group_data in self.bridge_data["groups"].items():
+            if not group_data.get("active", True): continue
+            
+            # Filter by group if specified
+            if group_name and name.lower() != group_name.lower():
+                continue
+                
+            for server_name in group_data.get("servers", []):
+                unique_targets.add(server_name)
+        
+        if not unique_targets:
+            return 0
+        
+        # Parse for links
+        # Regex for URL
+        url_regex = r'(https?://[^\s]+)'
+        parts = re.split(url_regex, message)
+        
+        json_components = ['["",{"text":"[System] ", "color": "gold"}']
+        
+        for part in parts:
+            if not part: continue
+            if re.match(url_regex, part):
+                # It's a link
+                safe_url = self._sanitize_for_minecraft(part)
+                json_components.append(f', {{ "text": "{safe_url}", "color": "blue", "underlined": true, "clickEvent": {{ "action": "open_url", "value": "{safe_url}" }} }}')
+            else:
+                # Normal text
+                safe_text = self._sanitize_for_minecraft(part)
+                json_components.append(f', {{ "text": "{safe_text}", "color": "yellow" }}')
+        
+        json_components.append(']')
+        json_cmd = "".join(json_components)
+        
+        plain_cmd = f'tellraw @a "[System] {message}"' # Fallback for non-MC
+        
+        count = 0
+        for target_name in unique_targets:
+            target = self.instances.get(target_name)
+            if target:
+                count += 1
+                if self._is_minecraft(target):
+                    asyncio.create_task(self._send_message_safe(target, f"tellraw @a {json_cmd}", target_name))
+                else:
+                    asyncio.create_task(self._send_message_safe(target, plain_cmd, target_name))
+        return count
+
     async def _get_online_players(self, group_data):
         instance_names = group_data.get("servers", [])
         if not instance_names: return {}
@@ -717,6 +769,40 @@ class ChatBridge(commands.Cog):
     async def before_sync(self):
         await self.bot.wait_until_ready()
         await self._refresh_instances()
+
+    async def group_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        groups = list(self.bridge_data.get("groups", {}).keys())
+        return [
+            app_commands.Choice(name=g, value=g)
+            for g in groups if current.lower() in g.lower()
+        ][:25]
+
+    @app_commands.command(name="broadcast", description="Broadcast a system message to bridged servers.")
+    @app_commands.describe(message="The message to broadcast", group="Target bridge group")
+    @app_commands.autocomplete(group=group_autocomplete)
+    @admin_only()
+    async def broadcast_command(self, interaction: discord.Interaction, message: str, group: str):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Validate group
+        if group not in self.bridge_data.get("groups", {}):
+             # Try case-insensitive lookup
+             found = False
+             for g in self.bridge_data.get("groups", {}):
+                 if g.lower() == group.lower():
+                     group = g
+                     found = True
+                     break
+             if not found:
+                 await interaction.followup.send(f"❌ Group '{group}' not found.", ephemeral=True)
+                 return
+
+        count = await self.broadcast_system_message(message, group)
+        
+        if count > 0:
+            await interaction.followup.send(f"✅ Broadcast sent to **{count}** servers in group '{group}': {message}")
+        else:
+            await interaction.followup.send(f"⚠️ No active servers found for group '{group}'.")
 
     @app_commands.command(name="bridge", description="Open the Chat Bridge Control Center")
     @admin_only()

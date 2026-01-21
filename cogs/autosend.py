@@ -5,7 +5,7 @@ Automatically responds to messages based on keywords, mentions, and conditions.
 
 import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 from cogs.utils import (
@@ -68,12 +68,32 @@ def build_auto_embed(embed_data: dict) -> discord.Embed:
 # MODALS
 # =============================================================================
 
+class GroupSelectView(discord.ui.View):
+    """View for selecting a bridge group."""
+    def __init__(self, parent_view, groups):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        
+        options = [discord.SelectOption(label="All Groups", value="all")]
+        for g in groups:
+            options.append(discord.SelectOption(label=g, value=g))
+            
+        self.select = discord.ui.Select(placeholder="Select Target Group...", options=options[:25])
+        self.select.callback = self.callback
+        self.add_item(self.select)
+    
+    async def callback(self, interaction: discord.Interaction):
+        group = self.select.values[0]
+        self.parent_view.state["target_group"] = None if group == "all" else group
+        # Continue to message input
+        await interaction.response.send_modal(PlainMessageModal(self.parent_view))
+
 class TriggerValueModal(discord.ui.Modal, title="Enter Trigger Value"):
     """Modal for entering the trigger value."""
     
     trigger_value = discord.ui.TextInput(
         label="Trigger Value",
-        placeholder="e.g. 'hello' for keyword, user ID, or role ID",
+        placeholder="e.g. 'hello', user ID, or 'hourly' for time",
         required=True,
         max_length=100
     )
@@ -106,10 +126,12 @@ class PlainMessageModal(discord.ui.Modal, title="Enter Message"):
     
     async def on_submit(self, interaction: discord.Interaction):
         self.parent_view.state["plain_message"] = self.message.value
-        await interaction.response.send_message(
-            "Message set! Click 'Save AutoSend' to finish.",
-            ephemeral=True
-        )
+        
+        msg = "Message set! Click 'Save AutoSend' to finish."
+        if self.parent_view.state.get("target_group"):
+            msg += f"\nTarget Group: **{self.parent_view.state['target_group']}**"
+            
+        await interaction.response.send_message(msg, ephemeral=True)
 
 
 class EmbedFieldModal(discord.ui.Modal):
@@ -123,7 +145,7 @@ class EmbedFieldModal(discord.ui.Modal):
         self.input = discord.ui.TextInput(label=label, style=style, required=False)
         
         # Pre-fill with current value
-        if parent_view.state["message_type"] == "plain":
+        if parent_view.state["message_type"] in ("plain", "game_chat"):
             val = parent_view.state.get("plain_message")
         else:
             val = parent_view.state.get("embed", {}).get(field)
@@ -134,7 +156,7 @@ class EmbedFieldModal(discord.ui.Modal):
         self.add_item(self.input)
     
     async def on_submit(self, interaction: discord.Interaction):
-        if self.parent_view.state["message_type"] == "plain":
+        if self.parent_view.state["message_type"] in ("plain", "game_chat"):
             self.parent_view.state["plain_message"] = self.input.value
         else:
             if "embed" not in self.parent_view.state:
@@ -288,10 +310,14 @@ class EditDeleteView(discord.ui.View):
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary)
     async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Build state from existing entry
+        msg_type = "embed" if "embed" in self.entry else "plain"
+        if self.entry.get("type") == "game_chat":
+            msg_type = "game_chat"
+
         state = {
             "trigger_type": self.trigger_type,
             "trigger_value": self.trigger_value,
-            "message_type": "embed" if "embed" in self.entry else "plain",
+            "message_type": msg_type,
             "plain_message": self.entry.get("message"),
             "embed": self.entry.get("embed", {}).copy() if "embed" in self.entry else {},
             "conditions": self.entry.get("conditions", {}).copy()
@@ -299,7 +325,7 @@ class EditDeleteView(discord.ui.View):
         
         view = LiveEditView(self.bot, self.autosend_data, state)
         
-        if state["message_type"] == "plain":
+        if state["message_type"] in ("plain", "game_chat"):
             await interaction.response.send_message(
                 state.get("plain_message", "(empty)"),
                 view=view,
@@ -350,25 +376,54 @@ class SetupView(discord.ui.View):
         options=[
             discord.SelectOption(label="Keyword", value="keyword"),
             discord.SelectOption(label="Ping User", value="ping_user"),
-            discord.SelectOption(label="Ping Role", value="ping_role")
+            discord.SelectOption(label="Ping Role", value="ping_role"),
+            discord.SelectOption(label="Time (Interval)", value="time")
         ],
         row=0
     )
     async def trigger_type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.state["trigger_type"] = select.values[0]
-        await interaction.response.send_modal(TriggerValueModal(self))
+        val = select.values[0]
+        self.state["trigger_type"] = val
+        
+        if val == "time":
+            self.state["trigger_value"] = "hourly"
+            await interaction.response.send_message(
+                "✅ Trigger set to **Hourly**. Now select a message type.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_modal(TriggerValueModal(self))
     
     @discord.ui.select(
         placeholder="Select message type...",
         options=[
             discord.SelectOption(label="Plain Message", value="plain"),
-            discord.SelectOption(label="Embed", value="embed")
+            discord.SelectOption(label="Embed", value="embed"),
+            discord.SelectOption(label="Game Chat (Bridge)", value="game_chat")
         ],
         row=1
     )
     async def message_type_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         self.state["message_type"] = select.values[0]
-        if select.values[0] == "plain":
+        
+        if select.values[0] == "game_chat":
+            # Fetch groups from ChatBridge
+            bridge_cog = self.bot.get_cog("ChatBridge")
+            groups = []
+            if bridge_cog and hasattr(bridge_cog, "bridge_data"):
+                groups = list(bridge_cog.bridge_data.get("groups", {}).keys())
+            
+            if groups:
+                await interaction.response.send_message(
+                    "Select a target group for the broadcast:",
+                    view=GroupSelectView(self, groups),
+                    ephemeral=True
+                )
+            else:
+                self.state["target_group"] = None
+                await interaction.response.send_modal(PlainMessageModal(self))
+                
+        elif select.values[0] == "plain":
             await interaction.response.send_modal(PlainMessageModal(self))
         else:
             await interaction.response.send_message(
@@ -396,9 +451,10 @@ class SetupView(discord.ui.View):
         
         view = LiveEditView(self.bot, self.autosend_data, state)
         
-        if state["message_type"] == "plain":
+        if state["message_type"] in ("plain", "game_chat"):
+            prefix = "[Game Chat Preview] " if state["message_type"] == "game_chat" else ""
             await interaction.response.send_message(
-                state.get("plain_message", "(empty)"),
+                f"{prefix}{state.get('plain_message', '(empty)')}",
                 view=view,
                 ephemeral=True
             )
@@ -422,9 +478,10 @@ class LiveEditView(discord.ui.View):
     
     async def update_preview(self, interaction: discord.Interaction):
         """Update the message to show current preview."""
-        if self.state["message_type"] == "plain":
+        if self.state["message_type"] in ("plain", "game_chat"):
+            prefix = "[Game Chat Preview] " if self.state["message_type"] == "game_chat" else ""
             await interaction.response.edit_message(
-                content=self.state.get("plain_message", "(empty)"),
+                content=f"{prefix}{self.state.get('plain_message', '(empty)')}",
                 embed=None,
                 view=self
             )
@@ -432,26 +489,40 @@ class LiveEditView(discord.ui.View):
             embed = build_auto_embed(self.state.get("embed", {}))
             await interaction.response.edit_message(content=None, embed=embed, view=self)
     
+    @discord.ui.button(label="Edit Message", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_msg(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Determine if we are editing title/description or the plain message
+        if self.state["message_type"] in ("plain", "game_chat"):
+             await interaction.response.send_modal(EmbedFieldModal(self, "message", "Edit Message", discord.TextStyle.paragraph))
+        else:
+             await interaction.response.send_modal(EmbedFieldModal(self, "description", "Edit Description", discord.TextStyle.paragraph))
+
     @discord.ui.button(label="Edit Title", style=discord.ButtonStyle.secondary, row=0)
     async def edit_title(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state["message_type"] in ("plain", "game_chat"):
+            await interaction.response.send_message("Titles are only for Embed type.", ephemeral=True)
+            return
         await interaction.response.send_modal(EmbedFieldModal(self, "title", "Edit Title"))
-    
-    @discord.ui.button(label="Edit Description", style=discord.ButtonStyle.secondary, row=0)
-    async def edit_desc(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            EmbedFieldModal(self, "description", "Edit Description", discord.TextStyle.paragraph)
-        )
     
     @discord.ui.button(label="Edit Color", style=discord.ButtonStyle.secondary, row=1)
     async def edit_color(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state["message_type"] in ("plain", "game_chat"):
+            await interaction.response.send_message("Colors are only for Embed type.", ephemeral=True)
+            return
         await interaction.response.send_modal(EmbedFieldModal(self, "color", "Hex Color (e.g. #FF0000)"))
     
     @discord.ui.button(label="Edit Footer", style=discord.ButtonStyle.secondary, row=1)
     async def edit_footer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state["message_type"] in ("plain", "game_chat"):
+            await interaction.response.send_message("Footers are only for Embed type.", ephemeral=True)
+            return
         await interaction.response.send_modal(EmbedFieldModal(self, "footer", "Footer Text"))
     
     @discord.ui.button(label="Edit Image", style=discord.ButtonStyle.secondary, row=2)
     async def edit_image(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state["message_type"] in ("plain", "game_chat"):
+            await interaction.response.send_message("Images are only for Embed type.", ephemeral=True)
+            return
         await interaction.response.send_modal(EmbedFieldModal(self, "image_url", "Image URL"))
     
     @discord.ui.button(label="Conditions", style=discord.ButtonStyle.primary, row=3)
@@ -464,6 +535,9 @@ class LiveEditView(discord.ui.View):
     
     @discord.ui.button(label="Advanced", style=discord.ButtonStyle.secondary, row=3)
     async def advanced(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.state["message_type"] in ("plain", "game_chat"):
+            await interaction.response.send_message("Advanced options are only for Embed type.", ephemeral=True)
+            return
         await interaction.response.send_modal(AdvancedOptionsModal(self))
     
     @discord.ui.button(label="Save AutoSend", style=discord.ButtonStyle.green, row=4)
@@ -471,8 +545,12 @@ class LiveEditView(discord.ui.View):
         state = self.state
         
         # Build entry
-        if state["message_type"] == "plain":
+        if state["message_type"] in ("plain", "game_chat"):
             entry = {"message": state.get("plain_message", "")}
+            if state["message_type"] == "game_chat":
+                entry["type"] = "game_chat"
+                if state.get("target_group"):
+                    entry["group"] = state["target_group"]
         else:
             entry = {"embed": {k: v for k, v in state.get("embed", {}).items() if v}}
         
@@ -566,6 +644,46 @@ class AutoSend(commands.Cog):
         self.bot = bot
         self.autosend_data = load_json(AUTOSEND_FILE, {})
         log.info(f"AutoSend cog loaded with {sum(len(v) for v in self.autosend_data.values())} triggers")
+    
+    async def cog_load(self):
+        self.time_loop.start()
+
+    async def cog_unload(self):
+        self.time_loop.cancel()
+
+    @tasks.loop(minutes=1)
+    async def time_loop(self):
+        """Check for time-based triggers every minute."""
+        now = discord.utils.utcnow()
+        
+        # Check 'hourly' triggers at minute 0
+        if now.minute == 0:
+            await self._process_time_triggers("hourly")
+
+    async def _process_time_triggers(self, trigger_key):
+        if "time" not in self.autosend_data: return
+        
+        triggers = self.autosend_data["time"]
+        if trigger_key in triggers:
+            entry = triggers[trigger_key]
+            
+            # For game_chat
+            if isinstance(entry, dict) and entry.get("type") == "game_chat":
+                msg = entry.get("message", "")
+                group = entry.get("group")
+                bridge = self.bot.get_cog("ChatBridge")
+                if bridge:
+                    await bridge.broadcast_system_message(msg, group)
+                return
+
+            # For Discord messages, we need a channel_id from conditions
+            conditions = entry.get("conditions", {})
+            channel_id = conditions.get("channel_id")
+            if channel_id:
+                channel = self.bot.get_channel(channel_id)
+                if channel:
+                    msg_data = entry.get("embed") or entry.get("message")
+                    await self._send_response(channel, msg_data)
     
     autosend_group = app_commands.Group(name="autosend", description="Manage auto-send triggers")
     
@@ -743,6 +861,13 @@ class AutoSend(commands.Cog):
     
     async def _send_response(self, channel, msg_data):
         """Send the auto-response."""
+        # Check for game_chat type first
+        if isinstance(msg_data, dict) and msg_data.get("type") == "game_chat":
+             bridge = self.bot.get_cog("ChatBridge")
+             if bridge:
+                 await bridge.broadcast_system_message(msg_data.get("message", ""), msg_data.get("group"))
+             return
+
         # Check if it's embed data
         if isinstance(msg_data, dict):
             if "embed" in msg_data:
