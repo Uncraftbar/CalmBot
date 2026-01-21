@@ -50,6 +50,7 @@ class ChatBridge(commands.Cog):
         # Stores the "High Water Mark" for each server: 
         # { "server_name": { "ts": datetime_obj, "hashes": set() } }
         self.high_water_marks = {}
+        self.failure_counts = {}
         self.console_listeners = []
         
         self.sync_loop.start()
@@ -86,8 +87,9 @@ class ChatBridge(commands.Cog):
         except asyncio.TimeoutError:
             log.debug(f"Timeout fetching updates for {name}")
             return name, None
-        except Exception:
-            # Log error but don't crash; return None updates
+        except Exception as e:
+            log.error(f"Error fetching updates for {name}: {e}")
+            # traceback.print_exc() 
             return name, None
 
     def _sanitize_for_minecraft(self, text):
@@ -96,6 +98,13 @@ class ChatBridge(commands.Cog):
         text = text.replace('\n', ' ').replace('\r', '')
         # 2. Escape backslashes first, then quotes for valid JSON
         return text.replace('\\', '\\\\').replace('"', '\"')
+
+    def _is_minecraft(self, instance):
+        if not instance: return False
+        # Check multiple attributes for robustness
+        mod_disp = str(getattr(instance, 'module_display_name', '')).lower()
+        mod_internal = str(getattr(instance, 'module', '')).lower()
+        return "minecraft" in mod_disp or "minecraft" in mod_internal
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -120,11 +129,15 @@ class ChatBridge(commands.Cog):
             safe_user = self._sanitize_for_minecraft(user)
             safe_msg = self._sanitize_for_minecraft(msg)
             
-            cmd = f'tellraw @a ["",{{"text":"[Discord] ", "color": "blue"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
-
             for target_name in instance_names:
                 target = self.instances.get(target_name)
                 if target:
+                    if self._is_minecraft(target):
+                        cmd = f'tellraw @a ["",{{"text":"[Discord] ", "color": "blue"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                    else:
+                        # Hytale/Generic support
+                        cmd = f'tellraw @a "[Discord] <{safe_user}> {safe_msg}"'
+                    
                     asyncio.create_task(self._send_message_safe(target, cmd, target_name))
             
             # We found the group, no need to check others (assuming 1:1 mapping preference)
@@ -151,7 +164,29 @@ class ChatBridge(commands.Cog):
             # Get Display Name
             settings = self.bridge_data.get("instance_settings", {}).get(server_name, {})
             display_name = settings.get("alias", server_name)
-
+            
+            # Only check Minecraft servers via mcstatus
+            if not self._is_minecraft(inst):
+                # Try to get from AMP status for non-Minecraft servers
+                try:
+                    status = await inst.get_instance_status()
+                    # AMP's active_users can be list of structs or names
+                    if status and hasattr(status, 'active_users'):
+                         raw_users = status.active_users
+                         users = []
+                         if isinstance(raw_users, list):
+                             # Ensure we get strings
+                             users = [str(u.user_name if hasattr(u, 'user_name') else u) for u in raw_users]
+                         elif isinstance(raw_users, dict):
+                             users = list(raw_users.keys())
+                         
+                         if users:
+                             users.sort()
+                             return display_name, users
+                except Exception:
+                    pass
+                return None
+            
             mc_port = None
             if hasattr(inst, 'application_endpoints'):
                  for ep in inst.application_endpoints:
@@ -236,36 +271,57 @@ class ChatBridge(commands.Cog):
     async def handle_minecraft_command(self, source_name, user, msg, group_data):
         command = msg.split(" ")[0].lower()
         
+        target = self.instances.get(source_name)
+        if not target: return
+        
+        is_minecraft = self._is_minecraft(target)
+        
         if command == "!online":
             online_data = await self._get_online_players(group_data)
             
-            # Construct Tellraw Message
-            # Header
-            json_msg = ['["",{"text":"[System] ", "color": "gold"}, {"text": "Online Players:", "color": "yellow"}']
-            
-            if not online_data:
-                json_msg.append(',{"text":"\\nNo players online.", "color": "gray"}]')
-            else:
-                for server_alias, players in online_data.items():
-                    p_list = ", ".join(players) if players else "None"
-                    json_msg.append(f', {{"text": "\\n{server_alias}: ", "color": "aqua"}}, {{"text": "{p_list}", "color": "white"}}')
-                json_msg.append(']')
-            
-            full_cmd = "".join(json_msg)
-            target = self.instances.get(source_name)
-            if target:
+            if is_minecraft:
+                # Construct Tellraw Message
+                # Header
+                json_msg = ['["",{"text":"[System] ", "color": "gold"}, {"text": "Online Players:", "color": "yellow"}']
+                
+                if not online_data:
+                    json_msg.append(',{"text":"\\nNo players online.", "color": "gray"}]')
+                else:
+                    for server_alias, players in online_data.items():
+                        p_list = ", ".join(players) if players else "None"
+                        json_msg.append(f', {{"text": "\\n{server_alias}: ", "color": "aqua"}}, {{"text": "{p_list}", "color": "white"}}')
+                    json_msg.append(']')
+                
+                full_cmd = "".join(json_msg)
                 # Target the specific user
                 final_cmd = f"tellraw {user} {full_cmd}"
-                await self._send_message_safe(target, final_cmd, source_name)
+            else:
+                # Plain text for Hytale
+                lines = ["[System] Online Players:"]
+                if not online_data:
+                    lines.append("No players online.")
+                else:
+                    for server_alias, players in online_data.items():
+                        p_list = ", ".join(players) if players else "None"
+                        lines.append(f"{server_alias}: {p_list}")
+                
+                full_msg = " | ".join(lines)
+                final_cmd = f'tellraw @a "{full_msg}"'
+
+            await self._send_message_safe(target, final_cmd, source_name)
 
         elif command == "!help":
-            target = self.instances.get(source_name)
-            if target:
+            if is_minecraft:
                 help_msg = '["",{"text":"[System] ", "color": "gold"}, {"text": "Available Commands:\\n", "color": "yellow"}, {"text": "!online ", "color": "aqua"}, {"text": "- List online players", "color": "white"}, {"text": "\\n!item ", "color": "aqua"}, {"text": "- Show held item", "color": "white"}]'
                 final_cmd = f"tellraw {user} {help_msg}"
-                await self._send_message_safe(target, final_cmd, source_name)
+            else:
+                final_cmd = 'tellraw @a "[System] Available Commands: !online - List online players"'
+            
+            await self._send_message_safe(target, final_cmd, source_name)
 
         elif command == "!item":
+            if not is_minecraft: return # Not supported on non-minecraft
+
             target_inst = self.instances.get(source_name)
             if not target_inst: return
 
@@ -321,7 +377,7 @@ class ChatBridge(commands.Cog):
                              description=item_name, 
                              color=discord.Color.blue()
                          )
-                         asyncio.create_task(self._send_discord_message_webhook(channel, user, None, display_name, embed=embed))
+                         asyncio.create_task(self._send_discord_message_webhook(channel, user, None, display_name, avatar_url=f"https://mc-heads.net/avatar/{user}", embed=embed))
 
             except asyncio.TimeoutError:
                 pass
@@ -390,7 +446,34 @@ class ChatBridge(commands.Cog):
         results = await asyncio.gather(*tasks)
         
         # Map: server_name -> updates_object
-        updates_map = {name: updates for name, updates in results if updates}
+        updates_map = {}
+        
+        for name, updates in results:
+            if updates:
+                updates_map[name] = updates
+                self.failure_counts[name] = 0
+            else:
+                # Handle Failure
+                count = self.failure_counts.get(name, 0) + 1
+                self.failure_counts[name] = count
+                
+                if count >= 5:
+                    if count == 5: # Log once at threshold
+                        log.warning(f"Bridge connection to '{name}' is unstable (5 failures). Attempting session reset.")
+                    
+                    # Try to heal the connection by clearing the session
+                    try:
+                        inst = self.instances.get(name)
+                        if inst and hasattr(inst, 'instance_id'):
+                            # Access the shared bridge sessions
+                            if inst.instance_id in self.amp_bridge._sessions:
+                                del self.amp_bridge._sessions[inst.instance_id]
+                                log.info(f"Cleared session for '{name}' to force re-login.")
+                            
+                            # Also reset count to give it time to recover
+                            self.failure_counts[name] = 0
+                    except Exception as e:
+                        log.error(f"Failed to reset session for '{name}': {e}")
 
         # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
         new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
@@ -459,7 +542,7 @@ class ChatBridge(commands.Cog):
                 if "chat" not in msg_type: continue
                 if re.match(r"^\\[.+?\\] <.+?> .+", msg): continue
                 if msg.startswith("[") and "]" in msg: continue
-                if len(user) < 3 or len(user) > 16: continue
+                if len(user) < 1 or len(user) > 32: continue
                 
                 msg_lower = msg.lower()
                 if "tps" in msg_lower and "ms/tick" in msg_lower: continue
@@ -523,6 +606,10 @@ class ChatBridge(commands.Cog):
                 display_name = settings.get("alias", source_name)
                 color = settings.get("color", "aqua")
 
+                # Determine Source Type for Avatar
+                source_inst = self.instances.get(source_name)
+                is_minecraft_source = self._is_minecraft(source_inst)
+
                 for user, msg in messages:
                     # Send to other Minecraft Servers
                     for target_name in instance_names:
@@ -534,17 +621,22 @@ class ChatBridge(commands.Cog):
                             safe_msg = self._sanitize_for_minecraft(msg)
                             safe_source = self._sanitize_for_minecraft(display_name)
                             
-                            cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                            if self._is_minecraft(target):
+                                cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                            else:
+                                cmd = f'tellraw @a "[{safe_source}] <{safe_user}> {safe_msg}"'
+                            
                             asyncio.create_task(self._send_message_safe(target, cmd, target_name))
                     
                     # Send to Discord
                     if discord_channel:
-                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name))
+                        avatar_url = f"https://mc-heads.net/avatar/{user}" if is_minecraft_source else None
+                        asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name, avatar_url=avatar_url))
 
             # Update Topic for this group
             asyncio.create_task(self._update_channel_topic(group_name, group_data))
 
-    async def _send_discord_message_webhook(self, channel, user, msg, source_name, embed=None):
+    async def _send_discord_message_webhook(self, channel, user, msg, source_name, avatar_url=None, embed=None):
         try:
             # Clean content
             safe_msg = discord.utils.escape_markdown(msg) if msg else None
@@ -554,13 +646,16 @@ class ChatBridge(commands.Cog):
             
             if webhook:
                 # Use webhook to impersonate player
-                await webhook.send(
-                    content=safe_msg,
-                    embed=embed,
-                    username=f"{user} [{source_name}]",
-                    avatar_url=f"https://mc-heads.net/avatar/{user}",
-                    allowed_mentions=discord.AllowedMentions.none()
-                )
+                kwargs = {
+                    "content": safe_msg,
+                    "embed": embed,
+                    "username": f"{user} [{source_name}]",
+                    "allowed_mentions": discord.AllowedMentions.none()
+                }
+                if avatar_url:
+                    kwargs["avatar_url"] = avatar_url
+
+                await webhook.send(**kwargs)
             else:
                 # Fallback if webhook creation failed
                 safe_user = discord.utils.escape_markdown(user)
