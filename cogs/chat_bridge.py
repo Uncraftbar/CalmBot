@@ -503,29 +503,6 @@ class ChatBridge(commands.Cog):
         for name, updates in results:
             if updates:
                 updates_map[name] = updates
-                self.failure_counts[name] = 0
-            else:
-                # Handle Failure
-                count = self.failure_counts.get(name, 0) + 1
-                self.failure_counts[name] = count
-                
-                if count >= 5:
-                    if count == 5: # Log once at threshold
-                        log.warning(f"Bridge connection to '{name}' is unstable (5 failures). Attempting session reset.")
-                    
-                    # Try to heal the connection by clearing the session
-                    try:
-                        inst = self.instances.get(name)
-                        if inst and hasattr(inst, 'instance_id'):
-                            # Access the shared bridge sessions
-                            if inst.instance_id in self.amp_bridge._sessions:
-                                del self.amp_bridge._sessions[inst.instance_id]
-                                log.info(f"Cleared session for '{name}' to force re-login.")
-                            
-                            # Also reset count to give it time to recover
-                            self.failure_counts[name] = 0
-                    except Exception as e:
-                        log.error(f"Failed to reset session for '{name}': {e}")
 
         # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
         new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
