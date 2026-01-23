@@ -567,8 +567,31 @@ class ChatBridge(commands.Cog):
 
                 # Filters
                 msg_type = str(getattr(entry, 'type', '')).lower()
-                if not user or not msg: continue
-                if "chat" not in msg_type: continue
+                entry_source = str(getattr(entry, 'source', ''))
+                if not entry_source or not msg: continue
+
+                # Check Comp Mode
+                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
+                comp_mode = settings.get("comp_mode", False)
+                
+                is_chat = "chat" in msg_type
+                is_info = "info" in msg_type or "info" in entry_source.lower()
+
+                if not is_chat:
+                    if comp_mode and is_info:
+                        # Regex check for specific format: <[title]: username> message
+                        # Example: <[Member]: Player1> Hello World
+                        match = re.match(r"^<\[.+?\]: (.+?)> (.+)$", msg)
+                        if match:
+                            user = match.group(1)
+                            msg = match.group(2)
+                        else:
+                            continue # Info message didn't match pattern
+                    else:
+                        continue # Not chat, and not (comp_mode + info)
+                else:
+                    user = entry_source
+
                 if re.match(r"^\\[.+?\\] <.+?> .+", msg): continue
                 if msg.startswith("[") and "]" in msg: continue
                 if len(user) < 1 or len(user) > 32: continue
@@ -1059,8 +1082,10 @@ class InstanceEditView(discord.ui.View):
         settings = self.cog.bridge_data.get("instance_settings", {}).get(server_name, {})
         alias = settings.get("alias", server_name)
         color = settings.get("color", "aqua")
+        comp_mode = settings.get("comp_mode", False)
         
         self.add_item(IE_SetAliasButton(cog, server_name, alias))
+        self.add_item(IE_CompModeButton(cog, server_name, comp_mode))
         self.add_item(IE_ColorSelect(cog, server_name, color))
 
 class IE_SetAliasButton(discord.ui.Button):
@@ -1071,6 +1096,30 @@ class IE_SetAliasButton(discord.ui.Button):
         self.current_alias = current_alias
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(AliasModal(self.cog, self.server_name, self.current_alias))
+
+class IE_CompModeButton(discord.ui.Button):
+    def __init__(self, cog, server_name, current_state):
+        style = discord.ButtonStyle.success if current_state else discord.ButtonStyle.secondary
+        label = f"Comp Mode: {'ON' if current_state else 'OFF'}"
+        super().__init__(label=label, style=style, row=0)
+        self.cog = cog
+        self.server_name = server_name
+        self.current_state = current_state
+
+    async def callback(self, interaction: discord.Interaction):
+        if "instance_settings" not in self.cog.bridge_data:
+            self.cog.bridge_data["instance_settings"] = {}
+        if self.server_name not in self.cog.bridge_data["instance_settings"]:
+            self.cog.bridge_data["instance_settings"][self.server_name] = {}
+        
+        new_state = not self.current_state
+        self.cog.bridge_data["instance_settings"][self.server_name]["comp_mode"] = new_state
+        save_json(CHAT_BRIDGE_FILE, self.cog.bridge_data)
+        
+        await interaction.response.edit_message(
+            content=f"Configuring **{self.server_name}**:",
+            view=InstanceEditView(self.cog, self.server_name)
+        )
 
 class IE_ColorSelect(discord.ui.Select):
     def __init__(self, cog, server_name, current_color):
