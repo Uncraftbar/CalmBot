@@ -105,7 +105,7 @@ class PersonalityModal(discord.ui.Modal, title="Configure CalmBot's personality"
 class ModelConfigModal(discord.ui.Modal, title="LLM model and endpoint"):
     model = discord.ui.TextInput(label="Model", min_length=1, max_length=100)
     endpoint = discord.ui.TextInput(
-        label="OpenAI-compatible endpoint (ignored for Codex)", required=False,
+        label="OpenAI-compatible endpoint", required=False,
         max_length=500, placeholder="https://example.com/v1/chat/completions")
     fallback_model = discord.ui.TextInput(label="Fallback model (optional)", required=False, max_length=100)
     followup_seconds = discord.ui.TextInput(label="Conversation lifetime seconds (0-1800)", required=False, max_length=4)
