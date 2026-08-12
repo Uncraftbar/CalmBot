@@ -207,3 +207,8 @@ async def collect_attachments(session: Any, attachments: Any) -> CollectedAttach
 
     result.text = "\n\n".join(text_sections)
     return result
+
+# main.py discovers every Python file in cogs/. This is an import-only support
+# module, so expose an intentional no-op extension hook.
+async def setup(bot):
+    return None
