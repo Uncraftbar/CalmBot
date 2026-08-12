@@ -4,11 +4,14 @@ Bridges chat between multiple Minecraft servers and Discord.
 """
 
 import asyncio
+import json
 import re
 import traceback
+from types import SimpleNamespace
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -52,7 +55,20 @@ class ChatBridge(commands.Cog):
         self.high_water_marks = {}
         self.failure_counts = {}
         self.console_listeners = []
-        
+        self.webhook_cache = {}
+        self.send_locks = {}
+        self.send_queues = {}
+        self.send_workers = {}
+        self.last_instance_refresh = datetime.min.replace(tzinfo=timezone.utc)
+
+        # AMP pushes console events in real time. Each active instance gets one
+        # socket; the existing GetUpdates path remains as an automatic fallback.
+        self.ws_tasks = {}
+        self.ws_connected = set()
+        self.ws_entry_queues = {}
+        self.last_fallback_poll = {}
+        self.ws_base_url = self._make_ws_base_url(self.amp_url)
+
         self.sync_loop.start()
 
     async def cog_load(self):
@@ -61,6 +77,142 @@ class ChatBridge(commands.Cog):
 
     async def cog_unload(self):
         self.sync_loop.cancel()
+        for task in self.ws_tasks.values():
+            task.cancel()
+        if self.ws_tasks:
+            await asyncio.gather(*self.ws_tasks.values(), return_exceptions=True)
+        self.ws_tasks.clear()
+        self.ws_connected.clear()
+        for task in self.send_workers.values():
+            task.cancel()
+        if self.send_workers:
+            await asyncio.gather(*self.send_workers.values(), return_exceptions=True)
+        self.send_workers.clear()
+        self.send_queues.clear()
+
+    @staticmethod
+    def _make_ws_base_url(http_url):
+        parsed = urlparse(http_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return f"{scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+
+    def _active_instances(self):
+        active = {}
+        for group_data in self.bridge_data.get("groups", {}).values():
+            if not group_data.get("active", True):
+                continue
+            for name in group_data.get("servers", []):
+                if name in self.instances:
+                    active[name] = self.instances[name]
+        return active
+
+    def _reconcile_ws_tasks(self, active_instances):
+        for name in list(self.ws_tasks):
+            task = self.ws_tasks[name]
+            if name not in active_instances or task.done():
+                if not task.done():
+                    task.cancel()
+                self.ws_tasks.pop(name, None)
+                self.ws_connected.discard(name)
+        for name, instance in active_instances.items():
+            if name not in self.ws_tasks:
+                self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
+                self.ws_tasks[name] = asyncio.create_task(
+                    self._amp_ws_worker(name, instance), name=f"amp-ws-{name}"
+                )
+
+    async def _amp_ws_worker(self, name, instance):
+        """Maintain AMP's pushed-event stream, reconnecting with bounded backoff."""
+        delay = 1
+        while True:
+            try:
+                await instance._connect()
+                session = instance._bridge._sessions.get(instance.instance_id)
+                if not session or not getattr(session, "id", None) or session.id == "0":
+                    raise RuntimeError("AMP did not issue a session for the event stream")
+
+                # ADS-managed instances are streamed through the controller URL.
+                ws_url = f"{self.ws_base_url}/stream/{instance.instance_id}/{session.id}"
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=None)
+                async with aiohttp.ClientSession(timeout=timeout) as client:
+                    async with client.ws_connect(ws_url, heartbeat=30, autoping=True) as ws:
+                        self.ws_connected.add(name)
+                        self.failure_counts.pop(name, None)
+                        delay = 1
+                        log.info(f"AMP event stream connected for {name}")
+                        async for message in ws:
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    event = json.loads(message.data)
+                                except (TypeError, json.JSONDecodeError):
+                                    continue
+                                if event.get("Message") == "ConsoleEntry":
+                                    self._queue_ws_console_entry(name, event.get("Parameters"))
+                            elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                raise ConnectionError("AMP event stream closed")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.ws_connected.discard(name)
+                log.warning(f"AMP event stream unavailable for {name}; polling fallback active: {exc}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+            finally:
+                self.ws_connected.discard(name)
+
+    def _queue_ws_console_entry(self, name, data):
+        if not isinstance(data, dict):
+            return
+        # AMP's websocket uses PascalCase; ampapi's dataclasses use snake_case.
+        entry = SimpleNamespace(
+            timestamp=data.get("Timestamp") or data.get("timestamp"),
+            source=data.get("Source") or data.get("source") or "",
+            contents=data.get("Contents") or data.get("contents") or "",
+            type=data.get("Type") or data.get("type") or "",
+        )
+        queue = self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            log.warning(f"Dropped oldest queued AMP event for {name}")
+        queue.put_nowait(entry)
+
+    async def run_console_command(self, instance, command, pattern, timeout=10.0, quiet_period=0.5):
+        """Register a pushed-event listener before sending a console command."""
+        source_name = instance.friendly_name or instance.instance_name
+        collector = asyncio.create_task(
+            self.collect_console(source_name, pattern, timeout=timeout, quiet_period=quiet_period)
+        )
+        await asyncio.sleep(0)  # allow collect_console to register before the command
+        sent = await self._send_message_safe(instance, command, source_name)
+        if not sent:
+            collector.cancel()
+            await asyncio.gather(collector, return_exceptions=True)
+            raise ConnectionError(f"Failed to send console command to {source_name}")
+        return await collector
+
+    async def collect_console(self, source_name, pattern, timeout=10.0, quiet_period=0.5):
+        """Collect pushed console lines until a match, then wait briefly for trailing lines."""
+        regex = re.compile(pattern) if isinstance(pattern, str) else pattern
+        queue = asyncio.Queue()
+        future = asyncio.get_running_loop().create_future()
+        listener = {"source": source_name, "regex": regex, "future": future, "queue": queue}
+        self.console_listeners.append(listener)
+        lines = []
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            while True:
+                try:
+                    lines.append(await asyncio.wait_for(queue.get(), timeout=quiet_period))
+                except asyncio.TimeoutError:
+                    break
+            return lines
+        finally:
+            if listener in self.console_listeners:
+                self.console_listeners.remove(listener)
 
     async def _refresh_instances(self):
         try:
@@ -74,22 +226,27 @@ class ChatBridge(commands.Cog):
             for inst in fetched_instances:
                 name = inst.friendly_name or inst.instance_name
                 self.instances[name] = inst
+            self.last_instance_refresh = datetime.now(timezone.utc)
+            self.failure_counts.clear()
+            log.info(f"Refreshed {len(self.instances)} AMP instance(s)")
             
         except Exception as e:
             log.error(f"Error refreshing instances: {e}")
 
     async def _fetch_update_safe(self, name, instance):
         try:
-            # Return tuple of (name, updates)
-            # 5 second timeout to prevent hanging
-            updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=5.0)
+            updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=10.0)
+            self.failure_counts.pop(name, None)
             return name, updates
         except asyncio.TimeoutError:
-            log.debug(f"Timeout fetching updates for {name}")
+            self.failure_counts[name] = self.failure_counts.get(name, 0) + 1
+            log.warning(f"Timeout fetching updates for {name} ({self.failure_counts[name]} consecutive)")
             return name, None
         except Exception as e:
-            log.error(f"Error fetching updates for {name}: {e}")
-            # traceback.print_exc() 
+            count = self.failure_counts.get(name, 0) + 1
+            self.failure_counts[name] = count
+            if count == 1 or count % 30 == 0:
+                log.warning(f"Error fetching updates for {name} ({count} consecutive): {e}")
             return name, None
 
     def _sanitize_for_minecraft(self, text):
@@ -97,7 +254,410 @@ class ChatBridge(commands.Cog):
         # 1. Remove newlines/returns to prevent console command injection
         text = text.replace('\n', ' ').replace('\r', '')
         # 2. Escape backslashes first, then quotes for valid JSON
-        return text.replace('\\', '\\\\').replace('"', '\"')
+        return text.replace('\\', '\\\\').replace('\"', '\\\"')
+
+
+    def _extract_balanced_value(self, text, key):
+        """Extract an SNBT value after `key:` while respecting nested braces/lists/strings."""
+        m = re.search(r'(?<![\w:])' + re.escape(key) + r'\s*:', text)
+        if not m:
+            return None
+
+        i = m.end()
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            return None
+
+        quote = None
+        escape = False
+        stack = []
+        start = i
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == quote:
+                    quote = None
+            else:
+                if ch in ('"', "'"):
+                    quote = ch
+                elif ch in '{[':
+                    stack.append('}' if ch == '{' else ']')
+                elif ch in '}]':
+                    if stack and ch == stack[-1]:
+                        stack.pop()
+                    elif not stack:
+                        break
+                elif ch == ',' and not stack:
+                    break
+            i += 1
+
+        return text[start:i].strip()
+
+    def _split_top_level_snbt(self, text):
+        """Split a comma-delimited SNBT list/compound body without breaking nested values."""
+        if not text:
+            return []
+        parts = []
+        quote = None
+        escape = False
+        stack = []
+        start = 0
+        for i, ch in enumerate(text):
+            if quote:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == quote:
+                    quote = None
+            else:
+                if ch in ('"', "'"):
+                    quote = ch
+                elif ch in '{[':
+                    stack.append('}' if ch == '{' else ']')
+                elif ch in '}]':
+                    if stack and ch == stack[-1]:
+                        stack.pop()
+                elif ch == ',' and not stack:
+                    part = text[start:i].strip()
+                    if part:
+                        parts.append(part)
+                    start = i + 1
+        tail = text[start:].strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _strip_numeric_suffixes_for_jsonish_snbt(self, text):
+        """Make Mojang SNBT closer to JSON where needed: 1b/2s/3L/4.0f -> numbers."""
+        if text is None:
+            return None
+        out = []
+        quote = None
+        escape = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            m = re.match(r'[-+]?(?:\d+\.\d+|\d+)(?:[bBsSlLfFdD])(?=\s*[,}\]])', text[i:])
+            if m:
+                out.append(re.sub(r'[bBsSlLfFdD]$', '', m.group(0)))
+                i += len(m.group(0))
+                continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _quote_unquoted_snbt_keys_for_jsonish(self, text):
+        """Quote bare SNBT keys so data-component compounds survive old JSON chat parsing."""
+        if text is None:
+            return None
+        out = []
+        quote = None
+        escape = False
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if quote:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            if ch in '{,':
+                out.append(ch)
+                i += 1
+                while i < len(text) and text[i].isspace():
+                    out.append(text[i])
+                    i += 1
+                m = re.match(r'([A-Za-z0-9_+\-.]+(?::[A-Za-z0-9_+\-./]+)?)(\s*:)', text[i:])
+                if m:
+                    out.append(json.dumps(m.group(1), ensure_ascii=False))
+                    out.append(m.group(2))
+                    i += len(m.group(0))
+                continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
+
+    def _component_value_for_json_chat(self, value):
+        if value is None:
+            return None
+        v = self._strip_numeric_suffixes_for_jsonish_snbt(value.strip())
+        v = self._quote_unquoted_snbt_keys_for_jsonish(v)
+        return v
+
+    def _extract_component_pairs(self, components):
+        """Return [(component_id, value_snbt)] from a SelectedItem components compound."""
+        if not components or not components.startswith('{') or not components.endswith('}'):
+            return []
+        inner = components[1:-1].strip()
+        pairs = []
+        key_pattern = re.compile(
+            r'^"((?:[^"\\]|\\.)*)"\s*:|^([A-Za-z0-9_.+/-]+(?::[A-Za-z0-9_.+/-]+)?)\s*:'
+        )
+        for part in self._split_top_level_snbt(inner):
+            stripped = part.strip()
+            match = key_pattern.match(stripped)
+            if not match:
+                continue
+            key = match.group(1) if match.group(1) is not None else match.group(2)
+            if match.group(1) is not None:
+                try:
+                    key = json.loads('"' + key + '"')
+                except Exception:
+                    pass
+            value = stripped[match.end():].strip()
+            if key and value:
+                pairs.append((key, value))
+        return pairs
+
+    def _components_for_json_chat(self, components):
+        if not components:
+            return None
+        pairs = self._extract_component_pairs(components)
+        if not pairs:
+            return self._component_value_for_json_chat(components)
+        body = []
+        for key, value in pairs:
+            body.append(json.dumps(key, ensure_ascii=False) + ':' + self._component_value_for_json_chat(value))
+        return '{' + ','.join(body) + '}'
+
+    def _components_for_modern_snbt_chat(self, components):
+        if not components:
+            return None
+        pairs = self._extract_component_pairs(components)
+        if not pairs:
+            return components
+        body = []
+        for key, value in pairs:
+            body.append(json.dumps(key, ensure_ascii=False) + ':' + value.strip())
+        return '{' + ','.join(body) + '}'
+
+    def _convert_selected_item_to_legacy_stack(self, raw):
+        """Best-effort conversion from 1.20.5+ SelectedItem components to legacy item-stack SNBT."""
+        item_id = self._extract_balanced_value(raw, 'id') or '"minecraft:air"'
+        count = self._extract_balanced_value(raw, 'count') or self._extract_balanced_value(raw, 'Count') or '1'
+        if count.endswith(('b', 's', 'l', 'f', 'd')):
+            count_num = count[:-1]
+        else:
+            count_num = count
+
+        components = self._extract_balanced_value(raw, 'components')
+        tag_parts = []
+        if components:
+            custom_name = self._extract_balanced_value(components, 'minecraft:custom_name') or self._extract_balanced_value(components, 'custom_name')
+            if custom_name:
+                tag_parts.append('display:{Name:' + json.dumps(custom_name, ensure_ascii=False) + '}')
+
+            lore = self._extract_balanced_value(components, 'minecraft:lore') or self._extract_balanced_value(components, 'lore')
+            if lore:
+                # Lore in old hover SNBT wants a list of JSON-text strings.
+                # Modern component lore is already a component list, so stringify each rough element.
+                lore_inner = lore[1:-1].strip() if lore.startswith('[') and lore.endswith(']') else lore
+                entries = []
+                depth = 0
+                quote = None
+                escape = False
+                part_start = 0
+                for i, ch in enumerate(lore_inner):
+                    if quote:
+                        if escape:
+                            escape = False
+                        elif ch == '\\':
+                            escape = True
+                        elif ch == quote:
+                            quote = None
+                    else:
+                        if ch in ('"', "'"):
+                            quote = ch
+                        elif ch in '{[':
+                            depth += 1
+                        elif ch in '}]':
+                            depth -= 1
+                        elif ch == ',' and depth == 0:
+                            part = lore_inner[part_start:i].strip()
+                            if part:
+                                entries.append(json.dumps(part, ensure_ascii=False))
+                            part_start = i + 1
+                part = lore_inner[part_start:].strip()
+                if part:
+                    entries.append(json.dumps(part, ensure_ascii=False))
+                if entries:
+                    tag_parts.append('display:{Lore:[' + ','.join(entries) + ']}')
+
+            custom_data = self._extract_balanced_value(components, 'minecraft:custom_data') or self._extract_balanced_value(components, 'custom_data')
+            if custom_data and custom_data.startswith('{'):
+                tag_parts.append(custom_data[1:-1])
+
+        tag = ''
+        if tag_parts:
+            tag = ',tag:{' + ','.join(tag_parts) + '}'
+        return '{id:' + item_id + ',Count:' + count_num + 'b' + tag + '}'
+
+    def _extract_selected_item(self, data_text):
+        """Parse vanilla `data get entity <player> SelectedItem` console output."""
+        if not data_text:
+            return None
+
+        raw = data_text.strip()
+        # AMP usually gives: Player has the following entity data: {id:"minecraft:stone",Count:1b,...}
+        marker = " has the following entity data: "
+        if marker in raw:
+            raw = raw.split(marker, 1)[1].strip()
+
+        if raw in ('{}', 'null') or 'No entity was found' in raw or 'Found no elements' in raw:
+            return None
+
+        item_id_snbt = self._extract_balanced_value(raw, 'id') or '"minecraft:air"'
+        item_id = item_id_snbt.strip().strip('"\'') or "minecraft:air"
+        short_id = item_id.split(":", 1)[-1]
+        item_name = short_id.replace("_", " ").title()
+
+        # Prefer custom display name when it is stored as plain JSON text in classic NBT.
+        name_match = re.search(r'Name\s*:\s*\'({.*?})\'|Name\s*:\s*"(\\?\{.*?\\?\})"', raw)
+        if name_match:
+            try:
+                name_json = (name_match.group(1) or name_match.group(2) or "").replace('\\"', '"')
+                parsed = json.loads(name_json)
+                if isinstance(parsed, dict) and parsed.get("text"):
+                    item_name = str(parsed["text"])
+            except Exception:
+                pass
+
+        custom_name = None
+        components = self._extract_balanced_value(raw, 'components')
+        if components:
+            custom_name = self._extract_balanced_value(components, 'minecraft:custom_name') or self._extract_balanced_value(components, 'custom_name')
+        if custom_name:
+            fallback_name = custom_name.strip().strip('"\'')
+            try:
+                encoded_name = custom_name.strip()
+                # Component values are commonly single-quoted JSON/SNBT strings.
+                if len(encoded_name) >= 2 and encoded_name[0] == encoded_name[-1] == "'":
+                    encoded_name = encoded_name[1:-1]
+                parsed_name = json.loads(encoded_name)
+                if isinstance(parsed_name, dict):
+                    item_name = str(parsed_name.get("text") or parsed_name.get("translate") or fallback_name)
+                elif isinstance(parsed_name, str):
+                    item_name = parsed_name
+                else:
+                    item_name = fallback_name
+            except Exception:
+                item_name = fallback_name
+            item_name = item_name[:80]
+
+        count_raw = self._extract_balanced_value(raw, 'Count') or self._extract_balanced_value(raw, 'count') or "1"
+        count_match = re.search(r'\d+', count_raw)
+        count = count_match.group(0) if count_match else "1"
+
+        legacy_stack = raw if 'Count' in raw and 'tag' in raw else self._convert_selected_item_to_legacy_stack(raw)
+
+        if len(raw) > 1800:
+            hover_text = raw[:1800] + "…"
+        else:
+            hover_text = raw
+
+        return {"raw": raw, "hover_text": hover_text, "id": item_id, "name": item_name, "count": count, "components": components, "legacy_stack": legacy_stack}
+
+    def _text_component_literal(self, text, **style):
+        comp = {"text": text}
+        comp.update({k: v for k, v in style.items() if v is not None})
+        return json.dumps(comp, ensure_ascii=False)
+
+    def _build_item_share_tellraw(self, source, color, user, item, hover_mode="show_item"): 
+        """Build a tellraw command for sharing the held item.
+
+        The bridge may talk to mixed Minecraft versions/modpacks. Build the same
+        visible text with both hover syntaxes available:
+        - modern 1.20.5-1.21.4 JSON: hoverEvent.contents{id,count,components}
+        - legacy JSON: hoverEvent.value = full item stack SNBT string
+        - 1.21.5+ SNBT: hover_event with id/count/components inlined
+        """
+        count = int(item.get("count") or 1)
+        prefix = [
+            json.dumps("", ensure_ascii=False),
+            self._text_component_literal(f"[{source}] ", color=color),
+            self._text_component_literal(f"<{user}> ", color="white"),
+        ]
+        visible = f"[{item['name']} x{count}]"
+        legacy_stack = item.get("legacy_stack") or item.get("raw") or f'{{id:"{item["id"]}",Count:{count}b}}'
+
+        legacy_hover = {
+            "text": visible,
+            "color": "light_purple",
+            "hoverEvent": {"action": "show_item", "value": legacy_stack},
+        }
+
+        modern_hover = {
+            "text": visible,
+            "color": "light_purple",
+            "hoverEvent": {"action": "show_item", "contents": {"id": item["id"], "count": count}},
+        }
+        json_components = self._components_for_json_chat(item.get("components"))
+        if json_components:
+            modern_json = json.dumps({"text": visible, "color": "light_purple"}, ensure_ascii=False)
+            modern_json = modern_json[:-1] + (
+                ',"hoverEvent":{"action":"show_item","contents":'
+                f'{{"id":{json.dumps(item["id"], ensure_ascii=False)},'
+                f'"count":{count},'
+                f'"components":{json_components}}}'
+                '}'
+                '}'
+            )
+        else:
+            modern_json = json.dumps(modern_hover, ensure_ascii=False)
+
+        snbt_components = self._components_for_modern_snbt_chat(item.get("components"))
+
+        legacy_cmd = "tellraw @a " + "[" + ",".join(prefix + [json.dumps(legacy_hover, ensure_ascii=False)]) + "]"
+        modern_cmd = "tellraw @a " + "[" + ",".join(prefix + [modern_json]) + "]"
+
+        modern_snbt_item = '{text:' + json.dumps(visible, ensure_ascii=False) + ',color:"light_purple",hover_event:{action:"show_item",id:' + json.dumps(item["id"], ensure_ascii=False) + ',count:' + str(count)
+        if snbt_components:
+            modern_snbt_item += ',components:' + snbt_components
+        modern_snbt_item += '}}'
+        snbt_cmd = 'tellraw @a ["",' + ",".join([
+            '{text:' + json.dumps(f"[{source}] ", ensure_ascii=False) + ',color:' + json.dumps(color, ensure_ascii=False) + '}',
+            '{text:' + json.dumps(f"<{user}> ", ensure_ascii=False) + ',color:"white"}',
+            modern_snbt_item,
+        ]) + "]"
+
+        if hover_mode == "legacy":
+            return [legacy_cmd]
+        if hover_mode == "modern":
+            return [modern_cmd]
+        if hover_mode == "snbt":
+            return [snbt_cmd]
+        return [modern_cmd, legacy_cmd, snbt_cmd]
 
     def _is_minecraft(self, instance):
         if not instance: return False
@@ -138,7 +698,7 @@ class ChatBridge(commands.Cog):
                         # Hytale/Generic support
                         cmd = f'tellraw @a "[Discord] <{safe_user}> {safe_msg}"'
                     
-                    asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+                    self._enqueue_send(target, cmd, target_name)
             
             # We found the group, no need to check others (assuming 1:1 mapping preference)
             break
@@ -163,7 +723,7 @@ class ChatBridge(commands.Cog):
         
         # Parse for links
         # Regex for URL
-        url_regex = r'(https?://[^\s]+)'
+        url_regex = r'(https?://[^\s<>]+?)(?=[.,!?;:)]*(?:\s|$))'
         parts = re.split(url_regex, message)
         
         json_components = ['["",{"text":"[System] ", "color": "gold"}']
@@ -182,7 +742,8 @@ class ChatBridge(commands.Cog):
         json_components.append(']')
         json_cmd = "".join(json_components)
         
-        plain_cmd = f'tellraw @a "[System] {message}"' # Fallback for non-MC
+        safe_plain_message = self._sanitize_for_minecraft(message)
+        plain_cmd = f'tellraw @a "[System] {safe_plain_message}"'  # Fallback for non-MC
         
         count = 0
         for target_name in unique_targets:
@@ -190,9 +751,9 @@ class ChatBridge(commands.Cog):
             if target:
                 count += 1
                 if self._is_minecraft(target):
-                    asyncio.create_task(self._send_message_safe(target, f"tellraw @a {json_cmd}", target_name))
+                    self._enqueue_send(target, f"tellraw @a {json_cmd}", target_name)
                 else:
-                    asyncio.create_task(self._send_message_safe(target, plain_cmd, target_name))
+                    self._enqueue_send(target, plain_cmd, target_name)
         return count
 
     async def _get_online_players(self, group_data):
@@ -286,12 +847,12 @@ class ChatBridge(commands.Cog):
         channel = self.bot.get_channel(linked_channel_id)
         if not channel or not isinstance(channel, discord.TextChannel): return
 
-        # OPTIMIZATION: Check time before fetching data to prevent spamming the servers
+        # Claim the interval before the first await so concurrent loops cannot all edit.
         last_update = group_data.get("last_topic_update", 0)
         current_time = datetime.now().timestamp()
-        
         if current_time - last_update < 300:
-             return
+            return
+        group_data["last_topic_update"] = current_time
 
         online_data = await self._get_online_players(group_data)
         
@@ -316,7 +877,6 @@ class ChatBridge(commands.Cog):
         if channel.topic != topic:
              try:
                  await channel.edit(topic=topic)
-                 group_data["last_topic_update"] = current_time
              except Exception as e:
                  log.warning(f"Failed to update topic for {channel.name}: {e}")
 
@@ -357,7 +917,7 @@ class ChatBridge(commands.Cog):
                         p_list = ", ".join(players) if players else "None"
                         lines.append(f"{server_alias}: {p_list}")
                 
-                full_msg = " | ".join(lines)
+                full_msg = self._sanitize_for_minecraft(" | ".join(lines))
                 final_cmd = f'tellraw @a "{full_msg}"'
 
             await self._send_message_safe(target, final_cmd, source_name)
@@ -377,59 +937,59 @@ class ChatBridge(commands.Cog):
             target_inst = self.instances.get(source_name)
             if not target_inst: return
 
-            # 1. Send data get command
-            cmd_check = f"data get entity {user} SelectedItem.id"
-            await self._send_message_safe(target_inst, cmd_check, source_name)
+            # 1. Ask Minecraft for the full held-item SNBT, not just SelectedItem.id.
+            cmd_check = f"data get entity {user} SelectedItem"
             
-            # 2. Setup Listener
-            # Pattern: PlayerName has the following entity data: "gtceu:tritanium_coil_block"
-            pattern_str = f"{re.escape(user)} has the following entity data: \"(?:[^:]+:)?(.+?)\""
+            # 2. Setup listener before sending so we cannot miss fast console output.
+            # Pattern: PlayerName has the following entity data: {id:"minecraft:stone",Count:1b,...}
+            pattern_str = f"{re.escape(user)} has the following entity data: (.+)$"
             regex = re.compile(pattern_str)
             
             fut = asyncio.Future()
             listener = {'source': source_name, 'regex': regex, 'future': fut}
             self.console_listeners.append(listener)
+            await self._send_message_safe(target_inst, cmd_check, source_name)
             
             try:
                 # Wait for response (4 seconds to cover 2 sync loops)
                 match = await asyncio.wait_for(fut, timeout=4.0)
-                
-                item_id = match.group(1)
-                # cleanup: remove underscores, capitalize
-                item_name = item_id.replace("_", " ").title()
+                item = self._extract_selected_item(match.group(0))
+                if not item:
+                    return
                 
                 # 3. Broadcast to all servers in the group (including source)
-                # Get Source Display Name & Color
                 settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
                 display_name = settings.get("alias", source_name)
                 color = settings.get("color", "aqua")
-
-                # Sanitize
-                safe_user = self._sanitize_for_minecraft(user)
-                safe_source = self._sanitize_for_minecraft(display_name)
-                safe_item = self._sanitize_for_minecraft(item_name)
-
-                # Construct Tellraw
-                # Format: [Source] <User> [Item Name]
-                cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "[{safe_item}]", "color": "light_purple" }}]'
 
                 instance_names = group_data.get("servers", [])
                 for target_name in instance_names:
                     target = self.instances.get(target_name)
                     if target:
-                        asyncio.create_task(self._send_message_safe(target, cmd, target_name))
+                        # Send exactly one hover syntax per target server. The old diagnostic
+                        # behavior sent every compatible variant, which made servers that accept
+                        # multiple JSON formats display duplicate !item lines. Default to the
+                        # modern JSON hover because it preserves 1.20.5+ components such as
+                        # damage/durability; per-instance overrides can still use legacy/snbt/all.
+                        target_settings = self.bridge_data.get("instance_settings", {}).get(target_name, {})
+                        hover_mode = target_settings.get("item_hover_mode") or "modern"
+                        cmds = self._build_item_share_tellraw(display_name, color, user, item, hover_mode=hover_mode)
+                        for cmd in cmds:
+                            self._enqueue_send(target, cmd, target_name)
                 
-                # Send to Discord too if linked
+                # Send to Discord too if linked. Discord cannot do Minecraft-style hover,
+                # so include the NBT/components in an embed field instead.
                 discord_channel_id = group_data.get("channel_id")
                 if discord_channel_id:
                     channel = self.bot.get_channel(discord_channel_id)
                     if channel:
                          embed = discord.Embed(
                              title=f"{user} Shared an Item", 
-                             description=item_name, 
+                             description=f"**{item['name']}** x{item['count']}\n`{item['id']}`", 
                              color=discord.Color.blue()
                          )
-                         asyncio.create_task(self._send_discord_message_webhook(channel, user, None, display_name, avatar_url=f"https://mc-heads.net/avatar/{user}", embed=embed))
+                         embed.add_field(name="NBT / Components", value=f"```snbt\n{item['hover_text'][:1000]}\n```", inline=False)
+                         asyncio.create_task(self._send_discord_message_webhook(channel, user, None, display_name, avatar_url=f"https://mc-heads.net/avatar/{quote(user, safe='')}", embed=embed))
 
             except asyncio.TimeoutError:
                 pass
@@ -478,31 +1038,55 @@ class ChatBridge(commands.Cog):
         
         await interaction.followup.send(embed=embed)
 
-    @tasks.loop(seconds=2.0)
+    @tasks.loop(seconds=0.25)
     async def sync_loop(self):
         if not self.bridge_data.get("groups"): return
 
-        # 1. Identify all unique active servers across all groups
-        active_instances = {}
-        for group_data in self.bridge_data["groups"].values():
-            if not group_data.get("active", True): continue
-            for server_name in group_data.get("servers", []):
-                if server_name in self.instances:
-                    active_instances[server_name] = self.instances[server_name]
-
+        # 1. Keep one pushed-event stream per unique active server.
+        active_instances = self._active_instances()
         if not active_instances:
             return
+        self._reconcile_ws_tasks(active_instances)
 
-        # 2. Fetch updates from all servers concurrently
-        tasks = [self._fetch_update_safe(name, inst) for name, inst in active_instances.items()]
-        results = await asyncio.gather(*tasks)
-        
-        # Map: server_name -> updates_object
+        # 2. Drain pushed entries immediately. Poll only disconnected streams,
+        # at the old cadence, so socket outages remain transparent.
         updates_map = {}
-        
-        for name, updates in results:
-            if updates:
-                updates_map[name] = updates
+        for name in active_instances:
+            queue = self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
+            entries = []
+            while len(entries) < 500:
+                try:
+                    entries.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if entries:
+                updates_map[name] = SimpleNamespace(console_entries=entries)
+
+        now = datetime.now(timezone.utc)
+        fallback = []
+        for name, instance in active_instances.items():
+            if name in self.ws_connected:
+                continue
+            last = self.last_fallback_poll.get(name, 0.0)
+            if now.timestamp() - last >= 2.0:
+                self.last_fallback_poll[name] = now.timestamp()
+                fallback.append(self._fetch_update_safe(name, instance))
+        if fallback:
+            for name, updates in await asyncio.gather(*fallback):
+                if updates and getattr(updates, "console_entries", None):
+                    existing = updates_map.get(name)
+                    if existing:
+                        existing.console_entries.extend(updates.console_entries)
+                    else:
+                        updates_map[name] = updates
+
+        # AMP handles go stale after instance restarts; periodically reacquire them.
+        if any(count >= 3 for count in self.failure_counts.values()) and (now - self.last_instance_refresh).total_seconds() >= 60:
+            for task in self.ws_tasks.values():
+                task.cancel()
+            self.ws_tasks.clear()
+            self.ws_connected.clear()
+            await self._refresh_instances()
 
         # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
         new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
@@ -518,9 +1102,12 @@ class ChatBridge(commands.Cog):
                 
                 # If timestamp is already a datetime (converted by ampapi), use it.
                 if not isinstance(ts, datetime):
+                    raw_ts = str(ts)
+                    amp_epoch = re.fullmatch(r"/Date\((\d+)(?:[+-]\d+)?\)/", raw_ts)
                     try:
-                        ts = datetime.fromisoformat(str(ts))
-                    except ValueError:
+                        ts = (datetime.fromtimestamp(int(amp_epoch.group(1)) / 1000, tz=timezone.utc)
+                              if amp_epoch else datetime.fromisoformat(raw_ts.replace("Z", "+00:00")))
+                    except (ValueError, OSError, OverflowError):
                         continue
                 
                 if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
@@ -558,11 +1145,13 @@ class ChatBridge(commands.Cog):
                 # Check Listeners
                 for listener in self.console_listeners[:]:
                     if listener['source'] == source_name:
+                        listener_queue = listener.get('queue')
+                        if listener_queue is not None:
+                            listener_queue.put_nowait(msg)
                         match = listener['regex'].search(msg)
-                        if match:
-                            if not listener['future'].done():
-                                listener['future'].set_result(match)
-                            if listener in self.console_listeners:
+                        if match and not listener['future'].done():
+                            listener['future'].set_result(match)
+                            if listener_queue is None and listener in self.console_listeners:
                                 self.console_listeners.remove(listener)
 
                 # Filters
@@ -581,7 +1170,9 @@ class ChatBridge(commands.Cog):
                     if comp_mode and is_info:
                         # Regex check for specific format: <[title]: username> message
                         # Example: <[Member]: Player1> Hello World
-                        match = re.match(r"^<\[.+?\]: (.+?)> (.+)$", msg)
+                        # Also supports optional "[Not Secure]: " prefix
+                        # Support both "<[Rank]: Name>" and "<[Rank] Name>"
+                        match = re.match(r"^(?:\[Not Secure\]: )?<\[.+?\](?: |: )(.+?)> (.+)$", msg)
                         if match:
                             user = match.group(1)
                             msg = match.group(2)
@@ -663,36 +1254,59 @@ class ChatBridge(commands.Cog):
                 is_minecraft_source = self._is_minecraft(source_inst)
 
                 for user, msg in messages:
-                    # Send to other Minecraft Servers
+                    # Queue endpoint deliveries independently so an unavailable AMP target
+                    # cannot stall the polling loop or delay Minecraft -> Discord delivery.
                     for target_name in instance_names:
-                        if target_name == source_name: continue
+                        if target_name == source_name:
+                            continue
                         target = self.instances.get(target_name)
                         if target:
-                            # SECURITY: Sanitize to prevent command injection
                             safe_user = self._sanitize_for_minecraft(user)
                             safe_msg = self._sanitize_for_minecraft(msg)
                             safe_source = self._sanitize_for_minecraft(display_name)
-                            
                             if self._is_minecraft(target):
                                 cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
                             else:
                                 cmd = f'tellraw @a "[{safe_source}] <{safe_user}> {safe_msg}"'
-                            
-                            asyncio.create_task(self._send_message_safe(target, cmd, target_name))
-                    
-                    # Send to Discord
+                            self._enqueue_send(target, cmd, target_name)
+
                     if discord_channel:
-                        avatar_url = f"https://mc-heads.net/avatar/{user}" if is_minecraft_source else None
+                        avatar_url = f"https://mc-heads.net/avatar/{quote(user, safe='')}" if is_minecraft_source else None
                         asyncio.create_task(self._send_discord_message_webhook(discord_channel, user, msg, display_name, avatar_url=avatar_url))
 
-            # Update Topic for this group
+            # Throttling is claimed before the first await inside this method, preventing
+            # topic-update storms without blocking the chat polling loop.
             asyncio.create_task(self._update_channel_topic(group_name, group_data))
 
     async def _send_discord_message_webhook(self, channel, user, msg, source_name, avatar_url=None, embed=None):
         try:
-            # Clean content
+            # 1. Clean content (Escape Markdown first to prevent formatting exploits)
             safe_msg = discord.utils.escape_markdown(msg) if msg else None
             
+            # --- NEW: Mention Resolver ---
+            # Parses @Username -> <@UserID>
+            # Only runs if we have text and are in a guild channel
+            if safe_msg and "@" in safe_msg and hasattr(channel, "guild"):
+                def replace_match(match):
+                    # We strip backslashes because escape_markdown turns "User_Name" into "User\_Name"
+                    # We need the clean name to find the user.
+                    name_query = match.group(1).replace("\\", "")
+                    
+                    # 1. Try exact username (new discord system)
+                    member = discord.utils.get(channel.guild.members, name=name_query)
+                    
+                    # 2. If not found, try Display Name / Nickname
+                    if not member:
+                        member = discord.utils.get(channel.guild.members, display_name=name_query)
+                        
+                    # Return the ping syntax if found, otherwise return original text
+                    return member.mention if member else match.group(0)
+
+                # Regex: Matches @ followed by letters, numbers, dots, or backslashes (for escaped chars)
+                # We limit the character set to prevent it from eating up the rest of the sentence.
+                safe_msg = re.sub(r"@([a-zA-Z0-9_\\.]+)", replace_match, safe_msg)
+            # -----------------------------
+
             # Try to get or create a webhook
             webhook = await self._get_or_create_webhook(channel)
             
@@ -702,7 +1316,8 @@ class ChatBridge(commands.Cog):
                     "content": safe_msg,
                     "embed": embed,
                     "username": f"{user} [{source_name}]",
-                    "allowed_mentions": discord.AllowedMentions.none()
+                    # ENABLE MENTIONS: Allow "users" to be pinged, but block "everyone" and "roles"
+                    "allowed_mentions": discord.AllowedMentions(users=True, roles=False, everyone=False)
                 }
                 if avatar_url:
                     kwargs["avatar_url"] = avatar_url
@@ -732,38 +1347,71 @@ class ChatBridge(commands.Cog):
                 log.warning(f"Failed to send message to Discord channel {channel.id}")
 
     async def _get_or_create_webhook(self, channel):
-        # Check cache or fetch
-        # Note: We don't cache webhooks persistently in this simplistic approach to handle deletions, 
-        # but for a high-traffic bot you might want to cache 'webhook_id' in bridge_data.
-        # For now, fetching listing is reasonably cheap (1 API call per message batch if not cached).
-        
         if not isinstance(channel, discord.TextChannel):
             return None
-
+        cached = self.webhook_cache.get(channel.id)
+        if cached:
+            return cached
         try:
             webhooks = await channel.webhooks()
             for wh in webhooks:
-                # Use existing webhook if it belongs to the bot or has a generic name we recognize
                 if wh.user == self.bot.user or wh.name == "CalmBot Bridge":
+                    self.webhook_cache[channel.id] = wh
                     return wh
-            
-            # Create new one
-            return await channel.create_webhook(name="CalmBot Bridge")
+            webhook = await channel.create_webhook(name="CalmBot Bridge")
+            self.webhook_cache[channel.id] = webhook
+            return webhook
         except discord.Forbidden:
             log.warning(f"Missing Manage Webhooks permission in {channel.name}")
             return None
-        except Exception:
+        except Exception as e:
+            log.warning(f"Unable to obtain webhook for {channel.name}: {e}")
             return None
 
-    async def _send_message_safe(self, target, cmd, target_name):
+    def _enqueue_send(self, target, cmd, target_name):
+        """Queue an AMP send without allowing an unavailable target to grow tasks forever."""
+        queue = self.send_queues.get(target_name)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=100)
+            self.send_queues[target_name] = queue
+        worker = self.send_workers.get(target_name)
+        if worker is None or worker.done():
+            self.send_workers[target_name] = asyncio.create_task(
+                self._send_worker(target_name), name=f"bridge-send-{target_name}"
+            )
         try:
-            # 5 second timeout for sending too
-            await asyncio.wait_for(target.send_console_message(cmd), timeout=5.0)
-        except asyncio.TimeoutError:
-            log.debug(f"Timeout sending message to {target_name}")
-        except Exception as e:
-            log.warning(f"Failed to send message to {target_name}: {e}")
-            traceback.print_exc()
+            queue.put_nowait((target, cmd))
+            return True
+        except asyncio.QueueFull:
+            log.warning(f"Outgoing bridge queue full for {target_name}; dropping newest message")
+            return False
+
+    async def _send_worker(self, target_name):
+        queue = self.send_queues[target_name]
+        try:
+            while True:
+                target, cmd = await queue.get()
+                try:
+                    await self._send_message_safe(target, cmd, target_name)
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            raise
+
+    async def _send_message_safe(self, target, cmd, target_name):
+        # Serialize each target and retry one transient AMP failure.
+        lock = self.send_locks.setdefault(("amp", target_name), asyncio.Lock())
+        async with lock:
+            for attempt in range(1, 3):
+                try:
+                    await asyncio.wait_for(target.send_console_message(cmd), timeout=15.0)
+                    return True
+                except Exception as e:
+                    if attempt == 2:
+                        log.warning(f"Failed to send message to {target_name} after {attempt} attempts: {e}")
+                        return False
+                    await asyncio.sleep(0.75)
+        return False
 
     @sync_loop.before_loop
     async def before_sync(self):

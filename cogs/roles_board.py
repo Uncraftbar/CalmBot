@@ -300,16 +300,10 @@ class RolesBoard(commands.Cog):
             )
             return
         
-        # Delete old message if exists
-        if self.roles_board.get("channel_id") and self.roles_board.get("message_id"):
-            try:
-                old_channel = self.bot.get_channel(self.roles_board["channel_id"])
-                if old_channel:
-                    old_msg = await old_channel.fetch_message(self.roles_board["message_id"])
-                    await old_msg.delete()
-            except Exception:
-                pass
-        
+        # Keep the old board live until its replacement has been sent and saved.
+        old_channel_id = self.roles_board.get("channel_id")
+        old_message_id = self.roles_board.get("message_id")
+
         # Create new embed
         embed = discord.Embed(
             title=f"📋 {title}",
@@ -332,10 +326,12 @@ class RolesBoard(commands.Cog):
         try:
             message = await channel.send(embed=embed)
             
-            self.roles_board["channel_id"] = channel.id
-            self.roles_board["message_id"] = message.id
-            save_json(ROLES_BOARD_FILE, self.roles_board)
-            
+            updated_board = dict(self.roles_board)
+            updated_board["channel_id"] = channel.id
+            updated_board["message_id"] = message.id
+            save_json(ROLES_BOARD_FILE, updated_board)
+            self.roles_board = updated_board
+
             # Add reactions
             failed = []
             for role_data in self.roles_board.get("roles", []):
@@ -344,6 +340,16 @@ class RolesBoard(commands.Cog):
                 except Exception as e:
                     failed.append(f"{role_data['emoji']}: {e}")
             
+            # The replacement is durable now; deleting the old board is best-effort.
+            if old_channel_id and old_message_id and old_message_id != message.id:
+                try:
+                    old_channel = self.bot.get_channel(old_channel_id)
+                    if old_channel:
+                        old_msg = await old_channel.fetch_message(old_message_id)
+                        await old_msg.delete()
+                except Exception as e:
+                    log.warning(f"Could not delete old roles board message: {e}")
+
             result = f"Roles board created in {channel.mention}!"
             if failed:
                 result += f"\n⚠️ Failed reactions: {', '.join(failed)}"
@@ -433,7 +439,7 @@ class RolesBoard(commands.Cog):
         role_id = None
         
         for role_data in self.roles_board["roles"]:
-            if role_data["emoji"] == emoji:
+            if emoji == role_data["emoji"] or emoji == role_data["emoji"].strip():
                 role_id = role_data["role_id"]
                 break
         

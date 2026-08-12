@@ -1,6 +1,13 @@
-﻿info.txt
+info.txt
 __pycache__/
 cogs/__pycache__/
 source/
 config.py
 data/*.json
+.env
+.env.*
+*.py[cod]
+*.bak
+*.bak.*
+*.bak-*
+*~

@@ -234,8 +234,12 @@ def has_mod_permissions(member: discord.Member) -> bool:
     Returns:
         True if member has admin/mod permissions
     """
+    guild = getattr(member, "guild", None)
+    if guild is None:
+        return False
+
     # Guild owner always has permission
-    if member.guild.owner_id == member.id:
+    if guild.owner_id == member.id:
         return True
     
     # Direct admin permission

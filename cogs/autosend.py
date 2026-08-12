@@ -660,6 +660,10 @@ class AutoSend(commands.Cog):
         if now.minute == 0:
             await self._process_time_triggers("hourly")
 
+    @time_loop.before_loop
+    async def before_time_loop(self):
+        await self.bot.wait_until_ready()
+
     async def _process_time_triggers(self, trigger_key):
         if "time" not in self.autosend_data: return
         
@@ -820,7 +824,12 @@ class AutoSend(commands.Cog):
                         triggered = True
                 
                 if triggered:
-                    await self._send_response(message.channel, msg_data)
+                    if isinstance(entry, dict) and entry.get("type") == "game_chat":
+                        bridge = self.bot.get_cog("ChatBridge")
+                        if bridge:
+                            await bridge.broadcast_system_message(entry.get("message", ""), entry.get("group"))
+                    else:
+                        await self._send_response(message.channel, msg_data)
                     log.debug(f"Auto-send triggered: {trigger_type}/{trigger_value}")
                     return
     
@@ -861,6 +870,9 @@ class AutoSend(commands.Cog):
     
     async def _send_response(self, channel, msg_data):
         """Send the auto-response."""
+        if not msg_data:
+            return
+
         # Check for game_chat type first
         if isinstance(msg_data, dict) and msg_data.get("type") == "game_chat":
              bridge = self.bot.get_cog("ChatBridge")
@@ -908,8 +920,13 @@ class AutoSend(commands.Cog):
                 
                 channel = self.bot.get_channel(payload.channel_id)
                 if channel:
-                    msg_data = entry.get("embed") or entry.get("message")
-                    await self._send_response(channel, msg_data)
+                    if entry.get("type") == "game_chat":
+                        bridge = self.bot.get_cog("ChatBridge")
+                        if bridge:
+                            await bridge.broadcast_system_message(entry.get("message", ""), entry.get("group"))
+                    else:
+                        msg_data = entry.get("embed") or entry.get("message")
+                        await self._send_response(channel, msg_data)
                     return
 
 

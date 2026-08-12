@@ -190,7 +190,7 @@ class CalmBot(commands.Bot):
     async def on_ready(self):
         """Called when the bot is fully ready."""
         log.info("=" * 50)
-        log.info(f"  Logged in as: {self.user.name}#{self.user.discriminator}")
+        log.info(f"  Logged in as: {self.user}")
         log.info(f"  User ID: {self.user.id}")
         log.info(f"  Guilds: {len(self.guilds)}")
         log.info(f"  discord.py: {discord.__version__}")

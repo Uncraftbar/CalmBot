@@ -102,11 +102,14 @@ class Modpack(commands.Cog):
             )
             return
         
+        category = None
+        created_channels = []
+        setup_complete = False
         try:
-            # Create category and channels
+            # Track newly created resources so a partial setup can be rolled back safely.
             category = await guild.create_category(category_name)
-            await guild.create_text_channel("general", category=category)
-            await guild.create_text_channel("technical-help", category=category)
+            created_channels.append(await guild.create_text_channel("general", category=category))
+            created_channels.append(await guild.create_text_channel("technical-help", category=category))
             
             # Create connection-info with restricted permissions
             overwrites = {
@@ -118,6 +121,7 @@ class Modpack(commands.Cog):
                 overwrites=overwrites,
                 category=category
             )
+            created_channels.append(connection_info)
             
             # Send connection info message
             await connection_info.send(
@@ -129,6 +133,7 @@ class Modpack(commands.Cog):
             if role_emoji:
                 role_message = await self._create_modpack_role(guild, name, role_emoji)
             
+            setup_complete = True
             await interaction.edit_original_response(
                 content=None,
                 embed=success_embed(
@@ -139,17 +144,33 @@ class Modpack(commands.Cog):
             log.info(f"Created modpack: {category_name}")
             
         except discord.Forbidden:
+            if not setup_complete:
+                await self._cleanup_failed_modpack(category, created_channels)
             await interaction.edit_original_response(
                 content=None,
                 embed=error_embed("Permission Error", "I don't have permission to create channels.")
             )
         except Exception as e:
+            if not setup_complete:
+                await self._cleanup_failed_modpack(category, created_channels)
             log.error(f"Failed to create modpack: {e}")
             await interaction.edit_original_response(
                 content=None,
                 embed=error_embed("Error", f"Failed to create modpack: {e}")
             )
     
+    async def _cleanup_failed_modpack(self, category, channels):
+        for channel in reversed(channels):
+            try:
+                await channel.delete(reason="Rolling back failed modpack setup")
+            except Exception as e:
+                log.warning(f"Could not clean up channel after failed modpack setup: {e}")
+        if category is not None:
+            try:
+                await category.delete(reason="Rolling back failed modpack setup")
+            except Exception as e:
+                log.warning(f"Could not clean up category after failed modpack setup: {e}")
+
     async def _create_modpack_role(self, guild: discord.Guild, name: str, emoji: str) -> str:
         """Create a modpack notification role and add to roles board."""
         try:

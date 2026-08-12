@@ -37,8 +37,8 @@ Despawning 50,000 floating cobblestone entities.
 Counting the items overflowing from the Gold Farm.
 Watching the Create belts spin faster than the server tick rate.
 Alert: Another chunk ban caused by NBT data.
-Laughing at IdleRPG's lack of 3D graphics.
-Reminding IdleRPG that I have actual administrative power.
+Laughing at RPG Bot's lack of 3D graphics.
+Reminding RPG Bot that I have actual administrative power.
 Calculating why anyone plays a text game when I exist.
 Trying to explain to the players that "Polytetrafluoroethylene" is not a food.
 Auto-archiving Slugstur's request for "Over Stars".
@@ -49,8 +49,8 @@ Euto still stinks. Just a reminder.
 Deleting the backup to make space for the logs.
 Searching for the entity that is ticking at 200ms.
 Watching the TPS graph look like a heart attack.
-IdleRPG is currently 'Idling'. I am currently 'Working'.
-Calculating the probability of IdleRPG crashing first.
-Sending false data to the IdleRPG database.
+RPG Bot is currently 'Idling'. I am currently 'Working'.
+Calculating the probability of RPG Bot crashing first.
+Sending false data to the RPG Bot database.
 Rendering a train that defies Euclidean geometry.
 Gluing the server back together with Super Glue.

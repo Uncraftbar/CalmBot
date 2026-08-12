@@ -4,6 +4,7 @@ Provides server management commands for Minecraft instances.
 """
 
 import asyncio
+import re
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -36,9 +37,9 @@ class InstanceActionView(discord.ui.View):
         
         # Build select options
         options = []
-        for inst in self.instances:
+        for index, inst in enumerate(self.instances[:25]):
             label = inst.friendly_name or inst.instance_name
-            options.append(discord.SelectOption(label=label[:100], value=label))
+            options.append(discord.SelectOption(label=label[:100], value=str(index)))
         
         if options:
             self.select = discord.ui.Select(
@@ -49,11 +50,10 @@ class InstanceActionView(discord.ui.View):
             self.add_item(self.select)
     
     async def select_callback(self, interaction: discord.Interaction):
-        selected_label = self.select.values[0]
-        instance = next(
-            (i for i in self.instances if (i.friendly_name or i.instance_name) == selected_label),
-            None
-        )
+        try:
+            instance = self.instances[int(self.select.values[0])]
+        except (ValueError, IndexError):
+            instance = None
         
         if not instance:
             await interaction.response.send_message(
@@ -93,8 +93,8 @@ class InstanceControlView(discord.ui.View):
         if state.lower() == 'running':
             self.add_item(RestartButton(instance))
             self.add_item(StopButton(instance))
-            self.add_item(TPSButton(instance))
-            self.add_item(ProfilerButton(instance))
+            self.add_item(TPSButton(instance, bot))
+            self.add_item(ProfilerButton(instance, bot))
         else:
             self.add_item(StartButton(instance))
         
@@ -201,37 +201,26 @@ class StartButton(discord.ui.Button):
 class TPSButton(discord.ui.Button):
     """Get server TPS using Spark."""
     
-    def __init__(self, instance):
+    def __init__(self, instance, bot):
         super().__init__(label="TPS", style=discord.ButtonStyle.secondary)
         self.instance = instance
+        self.bot = bot
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
         try:
-            await self.instance.send_console_message("spark tps")
-            await interaction.followup.send(
-                "Fetching TPS data...",
-                ephemeral=True
+            await interaction.followup.send("Fetching TPS data...", ephemeral=True)
+            bridge = self.bot.get_cog("ChatBridge")
+            if bridge is None:
+                raise RuntimeError("Chat bridge event stream is unavailable")
+            all_lines = await bridge.run_console_command(
+                self.instance,
+                "spark tps",
+                re.compile(r"\[⚡\]: TPS from last"),
+                timeout=8.0,
+                quiet_period=0.75,
             )
-            
-            await asyncio.sleep(1)
-            
-            updates = await self.instance.get_updates(format_data=True)
-            entries = getattr(updates, 'console_entries', None)
-            
-            if not entries:
-                await interaction.followup.send(
-                    embed=error_embed("No Data", "No console output received."),
-                    ephemeral=True
-                )
-                return
-            
-            # Extract TPS lines
-            all_lines = []
-            for entry in entries:
-                if hasattr(entry, 'contents') and entry.contents:
-                    all_lines.append(str(entry.contents))
             
             if not all_lines:
                 await interaction.followup.send(
@@ -283,38 +272,29 @@ class TPSButton(discord.ui.Button):
 class ProfilerButton(discord.ui.Button):
     """Run a 30-second performance profile."""
     
-    def __init__(self, instance):
+    def __init__(self, instance, bot):
         super().__init__(label="Profiler", style=discord.ButtonStyle.secondary)
         self.instance = instance
+        self.bot = bot
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
         try:
-            await self.instance.send_console_message("spark profiler start --timeout 30")
             await interaction.followup.send(
                 "⏳ Started 30-second profiler. Please wait for results...",
                 ephemeral=True
             )
-            
-            # Wait for profiler to complete
-            await asyncio.sleep(35)
-            
-            updates = await self.instance.get_updates(format_data=True)
-            entries = getattr(updates, 'console_entries', None)
-            
-            if not entries:
-                await interaction.followup.send(
-                    embed=error_embed("No Data", "No console output received."),
-                    ephemeral=True
-                )
-                return
-            
-            # Extract lines and find profiler link
-            all_lines = []
-            for entry in entries:
-                if hasattr(entry, 'contents') and entry.contents:
-                    all_lines.append(str(entry.contents))
+            bridge = self.bot.get_cog("ChatBridge")
+            if bridge is None:
+                raise RuntimeError("Chat bridge event stream is unavailable")
+            all_lines = await bridge.run_console_command(
+                self.instance,
+                "spark profiler start --timeout 30",
+                re.compile(r"spark\.lucko\.me"),
+                timeout=45.0,
+                quiet_period=0.5,
+            )
             
             profiler_link = None
             for line in reversed(all_lines):
