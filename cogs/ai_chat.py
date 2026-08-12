@@ -283,6 +283,7 @@ class AIChat(commands.Cog):
         self._last_user: dict[int, float] = {}
         self._global: deque[float] = deque()
         self._active = 0
+        self._clocked_requests: set[int] = set()
         self._pending: deque[discord.Message] = deque()
         self._queue_wake = asyncio.Event()
         self._dispatcher_task: asyncio.Task | None = None
@@ -527,15 +528,28 @@ class AIChat(commands.Cog):
         finally:
             self._codex_login_tasks.pop(interaction.user.id, None)
 
-    async def _enqueue(self, message: discord.Message) -> int | None:
-        """Queue a request and return its 1-based position, or None if full."""
+    async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool]:
+        """Queue a request and report whether a configured limit delays it."""
         async with self._lock:
             if len(self._pending) >= self.settings["max_queued"]:
-                return None
+                return None, False
+            now = time.monotonic()
+            while self._global and now - self._global[0] >= 60:
+                self._global.popleft()
+            last = self._last_user.get(message.author.id)
+            pending_for_user = any(item.author.id == message.author.id for item in self._pending)
+            user_limited = pending_for_user or (
+                last is not None and now - last < self.settings["user_cooldown_seconds"])
+            global_limited = (
+                len(self._global) + len(self._pending)
+                >= self.settings["global_requests_per_minute"])
+            concurrency_limited = (
+                self._active + len(self._pending) >= self.settings["max_concurrent"])
+            delayed = user_limited or global_limited or concurrency_limited
             self._pending.append(message)
             position = len(self._pending)
         self._queue_wake.set()
-        return position
+        return position, delayed
 
     async def _take_ready(self):
         """Reserve the oldest eligible request and report when to retry."""
@@ -727,18 +741,20 @@ class AIChat(commands.Cog):
         ready, reason = self._configured()
         if not ready:
             log.warning("LLM mode enabled but unavailable: %s", reason); return
-        position = await self._enqueue(message)
+        position, delayed = await self._enqueue(message)
         if position is None:
             try:
                 await message.reply("The LLM request queue is full. Please try again later.", mention_author=False)
             except discord.HTTPException:
                 pass
             return
-        # A clock means accepted and queued, rather than rejected by a rate limit.
-        try:
-            await message.add_reaction("🕒")
-        except discord.HTTPException:
-            pass
+        # Only visibly mark requests that must wait on a configured limit.
+        if delayed:
+            self._clocked_requests.add(message.id)
+            try:
+                await message.add_reaction("🕒")
+            except discord.HTTPException:
+                self._clocked_requests.discard(message.id)
 
     async def _process_message(self, message: discord.Message):
         try:
@@ -758,6 +774,12 @@ class AIChat(commands.Cog):
             except discord.HTTPException:
                 pass
         finally:
+            if message.id in self._clocked_requests:
+                self._clocked_requests.discard(message.id)
+                try:
+                    await message.remove_reaction("🕒", self.bot.user)
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    pass
             await self._release()
 
     def _dashboard_embed(self) -> discord.Embed:
