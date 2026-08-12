@@ -62,7 +62,9 @@ A feature-rich Discord bot designed for Minecraft server communities. It offers 
 
 CalmBot can answer when directly mentioned or when a user replies to one of its messages. The mode is disabled by default and supports either an OpenAI-compatible Chat Completions endpoint or ChatGPT/Codex subscription credentials. Recent channel messages are supplied as conversational context.
 
-Keep credentials in the ignored `config.py` or environment variables:
+Configuration can be managed without editing files. `/llm configure` selects the provider, model, reasoning effort, and OpenAI-compatible endpoint. `/llm openai_auth` privately stores an API key, while `/llm codex_auth` starts ChatGPT/Codex device authentication. Credentials are written under the Git-ignored `data/credentials/` directory with owner-only permissions and are never displayed back in Discord.
+
+The file/environment settings below remain supported as initial defaults and for unattended deployments:
 
 ```python
 # OpenAI-compatible mode
@@ -84,7 +86,11 @@ CalmBot reads, refreshes, and atomically saves its own Codex credential file. Do
 Moderator commands:
 
 - `/llm enable` and `/llm disable` — toggle responses.
-- `/llm status` — show provider readiness and limits without revealing credentials.
+- `/llm status` — show provider readiness, model/reasoning, and limits without revealing credentials.
+- `/llm configure` — select provider, model, reasoning effort, and endpoint.
+- `/llm openai_auth` — save an OpenAI-compatible API key through an ephemeral modal.
+- `/llm codex_auth` — authenticate CalmBot's own ChatGPT/Codex subscription through a device code.
+- `/llm personality` — edit the personality text included in the system prompt.
 - `/llm limits` — configure per-user cooldown, global requests/minute, concurrency, and context depth.
 
 Rate-limited requests are silently suppressed with a clock reaction. Model output cannot ping users or roles.
