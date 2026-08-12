@@ -48,6 +48,7 @@ DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
             "personality": DEFAULT_PERSONALITY}
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
+MAX_TOOL_ROUNDS = 10
 
 
 def cfg(name: str, default: Any = None) -> Any:
@@ -680,7 +681,7 @@ class AIChat(commands.Cog):
             last["content"] = [{"type": "text", "text": last["content"]}] + [
                 {"type": "image_url", "image_url": {"url": url}} for url in images]
         session = await self._http()
-        for _ in range(4):
+        for _ in range(MAX_TOOL_ROUNDS):
             payload = {
                 "model": self._model(), "messages": conversation,
                 "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
@@ -709,7 +710,7 @@ class AIChat(commands.Cog):
                 conversation.append({"role": "tool", "tool_call_id": str(call.get("id", "")), "content": output})
         # A model can occasionally keep asking for tools despite already having enough
         # evidence. Force one tool-free synthesis instead of turning that into a user-facing
-        # generic failure.
+        # generic failure after the configured tool-round limit.
         payload = {
             "model": self._model(), "messages": conversation,
             "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
@@ -796,7 +797,7 @@ class AIChat(commands.Cog):
         if account:
             headers["ChatGPT-Account-Id"] = str(account)
         conversation = list(converted)
-        for _ in range(4):
+        for _ in range(MAX_TOOL_ROUNDS):
             payload = {"model": self._model(), "instructions": system, "input": conversation,
                        "tools": responses_tools(runtime.actor_is_admin), "tool_choice": "auto",
                        "parallel_tool_calls": False, "store": False, "stream": True,
@@ -819,7 +820,7 @@ class AIChat(commands.Cog):
                 output = await runtime.execute(str(call.get("name", "")), call.get("arguments", "{}"))
                 conversation.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": output})
         # Do one final tool-free pass. This guarantees a useful answer from the evidence
-        # already collected even if the model attempted a redundant fifth tool call.
+        # already collected even if the model attempted a redundant tool call after the round limit.
         payload = {"model": self._model(), "instructions": system, "input": conversation,
                    "tools": [], "tool_choice": "none", "store": False, "stream": True,
                    "include": ["reasoning.encrypted_content"]}
