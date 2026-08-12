@@ -86,7 +86,13 @@ class InstanceActionView(discord.ui.View):
 
 class InstanceControlView(discord.ui.View):
     """Control view with action buttons for a specific instance."""
-    
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await check_permissions(interaction):
+            log.warning("AMP control permission denied for %s", interaction.user)
+            return False
+        return True
+
     def __init__(self, instance, state: str, all_instances: list, bot: commands.Bot):
         super().__init__(timeout=60)
         self.instance = instance
@@ -140,6 +146,9 @@ class ConfirmServerActionModal(discord.ui.Modal):
         self.action = action
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await check_permissions(interaction):
+            log.warning("AMP modal permission denied for %s", interaction.user)
+            return
         await interaction.response.defer(ephemeral=True)
         name = self.instance.friendly_name or self.instance.instance_name
         method = {"restart": self.instance.restart_application, "stop": self.instance.stop_application,
