@@ -223,13 +223,20 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def openai_tools(include_write: bool) -> list[dict]:
+def _available_tool_names(include_write: bool, include_conversation_control: bool) -> set[str]:
     names = READ_TOOL_NAMES | ((ADMIN_READ_TOOL_NAMES | WRITE_TOOL_NAMES) if include_write else set())
+    if not include_conversation_control:
+        names -= {"stay_silent", "end_conversation"}
+    return names
+
+
+def openai_tools(include_write: bool, *, include_conversation_control: bool = True) -> list[dict]:
+    names = _available_tool_names(include_write, include_conversation_control)
     return [{"type": "function", "function": item} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
-def responses_tools(include_write: bool) -> list[dict]:
-    names = READ_TOOL_NAMES | ((ADMIN_READ_TOOL_NAMES | WRITE_TOOL_NAMES) if include_write else set())
+def responses_tools(include_write: bool, *, include_conversation_control: bool = True) -> list[dict]:
+    names = _available_tool_names(include_write, include_conversation_control)
     return [{"type": "function", **item, "strict": False} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
@@ -321,6 +328,7 @@ class LLMToolRuntime:
         self.tool_calls = 0
         self.image_data_urls: list[str] = []
         self.conversation_control: str | None = None
+        self.allow_conversation_control = not getattr(message, "_standalone_ask", False)
 
     @property
     def actor_is_admin(self) -> bool:
@@ -337,9 +345,13 @@ class LLMToolRuntime:
         except (TypeError, ValueError, json.JSONDecodeError):
             return json.dumps({"error": "Invalid tool arguments"})
         if name == "stay_silent":
+            if not self.allow_conversation_control:
+                return json.dumps({"error": "Conversation controls are unavailable for standalone requests"})
             self.conversation_control = "silent"
             return json.dumps({"ok": True, "result": "No Discord message will be sent; conversation remains active."})
         if name == "end_conversation":
+            if not self.allow_conversation_control:
+                return json.dumps({"error": "Conversation controls are unavailable for standalone requests"})
             self.conversation_control = "end"
             return json.dumps({"ok": True, "result": "No Discord message will be sent; conversation will be ended."})
 

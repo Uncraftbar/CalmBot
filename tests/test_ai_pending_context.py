@@ -67,6 +67,11 @@ class PendingContextTests(unittest.TestCase):
         self.assertEqual(batch.settle_seconds, 2)
         self.assertGreater(batch.ready_at, time.monotonic())
 
+    def test_standalone_batch_is_marked_and_has_no_settle_delay(self):
+        batch = PendingBatch(message(30), limit=4, standalone=True, settle_seconds=0)
+        self.assertTrue(batch.standalone)
+        self.assertLessEqual(batch.ready_at, time.monotonic())
+
     def test_queued_batch_is_bounded_scoped_and_delegates_trigger(self):
         batch = PendingBatch(message(2), limit=3, followup=True)
         for message_id in (3, 4, 5):

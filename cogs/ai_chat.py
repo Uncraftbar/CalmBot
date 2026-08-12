@@ -313,6 +313,32 @@ class LLMDashboardView(discord.ui.View):
         await interaction.response.edit_message(embed=self.cog._dashboard_embed(), view=self)
 
 
+class AskMessage:
+    """Minimal message-shaped adapter for a standalone slash-command request."""
+
+    def __init__(self, interaction: discord.Interaction, content: str, bot_user: discord.ClientUser):
+        self.interaction = interaction
+        self.id = interaction.id
+        self.guild = interaction.guild
+        self.channel = interaction.channel
+        self.author = interaction.user
+        self.content = content
+        self.attachments = ()
+        self.mentions = (bot_user,)
+        self.reference = None
+        self._standalone_ask = True
+
+    async def reply(self, content=None, **kwargs):
+        kwargs.pop("mention_author", None)
+        return await self.interaction.followup.send(content, wait=True, **kwargs)
+
+    async def add_reaction(self, emoji):
+        return None
+
+    async def remove_reaction(self, emoji, member):
+        return None
+
+
 class AIChat(commands.Cog):
     """Respond to direct bot mentions and replies through an LLM provider."""
     llm_group = app_commands.Group(name="llm", description="Configure LLM responses")
@@ -604,11 +630,11 @@ class AIChat(commands.Cog):
         finally:
             self._codex_login_tasks.pop(interaction.user.id, None)
 
-    async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool, bool]:
-        """Queue a request or merge it into this channel's single follow-up batch."""
+    async def _enqueue(self, message: discord.Message, *, standalone: bool = False) -> tuple[int | None, bool, bool]:
+        """Queue a request or merge automatic traffic into one channel batch."""
         async with self._lock:
             channel_key = self._conversation_key(message)
-            active_context = self._inflight_context.get(channel_key)
+            active_context = None if standalone else self._inflight_context.get(channel_key)
             if active_context is not None:
                 if not active_context.append(message):
                     self._enqueue_rejection[message.id] = "duplicate"
@@ -618,8 +644,9 @@ class AIChat(commands.Cog):
             # Until dispatch starts, every further channel message joins the one
             # queued batch and advances its effective trigger. This applies both to
             # an initially rate-limited request and to a post-response follow-up.
-            queued_batch = next(
-                (item for item in self._pending if item.key == channel_key), None)
+            queued_batch = None if standalone else next(
+                (item for item in self._pending
+                 if item.key == channel_key and not item.standalone), None)
             if queued_batch is not None:
                 if not queued_batch.append(message):
                     self._enqueue_rejection[message.id] = "duplicate"
@@ -651,7 +678,8 @@ class AIChat(commands.Cog):
             delayed = user_limited or global_limited or concurrency_limited
             self._pending.append(PendingBatch(
                 message, limit=self.settings["context_messages"],
-                settle_seconds=AUTO_RESPONSE_SETTLE_SECONDS))
+                standalone=standalone,
+                settle_seconds=0 if standalone else AUTO_RESPONSE_SETTLE_SECONDS))
             position = len(self._pending)
         self._queue_wake.set()
         return position, delayed, False
@@ -698,9 +726,10 @@ class AIChat(commands.Cog):
             self._global.append(now)
             self._active += 1
             self._processing_users.add((message.guild.id, message.channel.id, message.author.id))
-            self._inflight_context[self._conversation_key(message)] = PendingContext(
-                message.trigger, self.settings["context_messages"],
-                settle_seconds=AUTO_RESPONSE_SETTLE_SECONDS)
+            if not message.standalone:
+                self._inflight_context[self._conversation_key(message)] = PendingContext(
+                    message.trigger, self.settings["context_messages"],
+                    settle_seconds=AUTO_RESPONSE_SETTLE_SECONDS)
             return message, 0
 
     async def _dispatch_loop(self):
@@ -871,6 +900,10 @@ class AIChat(commands.Cog):
             "explicit request that the bot stop participating, or a clearly finished conversation. "
             "Do not end merely because one message is not directed at you."
         )
+        if getattr(message, "_standalone_ask", False):
+            prompt += ("\n\nThis request came from /ask. It is explicitly directed at you, so answer it "
+                       "rather than using stay_silent or end_conversation. It is a standalone request "
+                       "and must not start or extend automatic conversation mode.")
         remembered = self._memories.prompt_context(message.guild.id, message.author.id)
         if remembered:
             prompt += (
@@ -903,7 +936,10 @@ class AIChat(commands.Cog):
                 "model": model or self._model(), "messages": conversation,
                 "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
                 "temperature": float(self._setting("temperature", "AI_CHAT_TEMPERATURE", 0.7)),
-                "tools": openai_tools(runtime.actor_is_admin), "tool_choice": "auto",
+                "tools": openai_tools(
+                    runtime.actor_is_admin,
+                    include_conversation_control=runtime.allow_conversation_control),
+                "tool_choice": "auto",
             }
             async with session.post(url, json=payload,
                                     headers={"Authorization": f"Bearer {self._load_openai_key()}"}) as resp:
@@ -1018,7 +1054,10 @@ class AIChat(commands.Cog):
         conversation = list(converted)
         for _ in range(MAX_TOOL_ROUNDS):
             payload = {"model": model or self._model(), "instructions": system, "input": conversation,
-                       "tools": responses_tools(runtime.actor_is_admin), "tool_choice": "auto",
+                       "tools": responses_tools(
+                           runtime.actor_is_admin,
+                           include_conversation_control=runtime.allow_conversation_control),
+                       "tool_choice": "auto",
                        "parallel_tool_calls": False, "store": False, "stream": True,
                        # Stateless reasoning-model tool continuations must carry the
                        # encrypted reasoning item from the previous response.
@@ -1256,9 +1295,10 @@ class AIChat(commands.Cog):
             # Only explicit triggers receive an error. Passive conversation traffic
             # stays silent on provider failures instead of interrupting humans.
             try:
-                direct = await self._direct_trigger(message)
+                direct = getattr(message, "_standalone_ask", False) or await self._direct_trigger(message)
                 if direct:
-                    self._conversations.pop(self._conversation_key(message), None)
+                    if not getattr(message, "_standalone_ask", False):
+                        self._conversations.pop(self._conversation_key(message), None)
                     await message.reply("I couldn't generate a response right now. Please try again later.", mention_author=False)
             except discord.HTTPException:
                 pass
@@ -1326,6 +1366,37 @@ class AIChat(commands.Cog):
         task = asyncio.create_task(
             self._finish_codex_login(interaction, login), name=f"codex-login-{interaction.user.id}")
         self._codex_login_tasks[interaction.user.id] = task
+
+    @app_commands.command(name="ask", description="Ask CalmBot once without starting an automatic conversation")
+    @app_commands.describe(question="What you want to ask CalmBot")
+    async def ask(self, interaction: discord.Interaction, question: app_commands.Range[str, 1, 4000]):
+        if interaction.guild_id is None or interaction.channel is None:
+            await interaction.response.send_message("`/ask` is only available in server channels.", ephemeral=True)
+            return
+        if not self.settings["enabled"]:
+            await interaction.response.send_message("CalmBot's LLM mode is currently disabled.", ephemeral=True)
+            return
+        if not self._role_allowed(interaction.user):
+            await interaction.response.send_message("You do not have an allowed role for CalmBot's LLM mode.", ephemeral=True)
+            return
+        ready, reason = self._configured()
+        if not ready:
+            log.warning("/ask unavailable: %s", reason)
+            await interaction.response.send_message("CalmBot's LLM provider is not currently available.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True)
+        message = AskMessage(interaction, str(question).strip(), self.bot.user)
+        position, delayed, merged = await self._enqueue(message, standalone=True)
+        if position is None:
+            rejection = self._enqueue_rejection.pop(message.id, "full")
+            text = ("You already have an LLM request queued or running here."
+                    if rejection == "duplicate" else
+                    "The LLM request queue is full. Please try again later.")
+            await interaction.followup.send(text, ephemeral=True)
+            return
+        # The deferred interaction is the queue indicator; unlike automatic
+        # messages, slash commands do not need a clock reaction.
 
     @llm_group.command(name="dashboard", description="Open the complete LLM configuration dashboard")
     @admin_only()

@@ -20,13 +20,17 @@ class PendingBatch:
     """One bounded queued request whose newest message is the trigger."""
 
     def __init__(self, trigger: Any, limit: int, *, followup: bool = False,
-                 messages: Iterable[Any] = (), settle_seconds: float = 0):
+                 standalone: bool = False, messages: Iterable[Any] = (),
+                 settle_seconds: float = 0):
         key = message_channel_key(trigger)
         if key is None:
             raise ValueError("pending LLM batch requires a guild channel")
         self.key = key
         self.limit = max(1, int(limit))
         self.followup = bool(followup)
+        # Standalone requests (for example /ask) never open or participate in
+        # automatic channel conversations and do not collect later messages.
+        self.standalone = bool(standalone)
         self.settle_seconds = max(0.0, float(settle_seconds))
         self.ready_at = time.monotonic() + self.settle_seconds
         # Preserve the object that owns queue UI (such as the clock reaction),
