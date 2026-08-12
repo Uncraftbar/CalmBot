@@ -117,7 +117,9 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "connection_diagnostic",
-        "description": "Run a composite read-only connection diagnostic across public servers using uncached live AMP state and player metrics.",
+        "description": ("Run a composite read-only connection diagnostic for a public server. For administrators, "
+                        "this also automatically examines recent redacted AMP console history; prefer this for questions "
+                        "about why a connection failed earlier."),
         "parameters": {"type": "object", "properties": {
             "server": {"type": "string", "maxLength": 100, "description": "Optional exact public server name"}
         }, "additionalProperties": False},
@@ -528,11 +530,12 @@ class LLMToolRuntime:
         return {"query": query, "results": [{"source": "README.md", "line": line, "excerpt": text} for _, line, text in matches[:6]], "fresh_at": int(time.time()), "cached": False}
 
     async def _connection_diagnostic(self, args):
-        requested = str(args.get("server", "")).strip().casefold()
+        requested_raw = str(args.get("server", "")).strip()
+        requested = self._server_key(requested_raw)
         status = await self._server_status()
         servers = status["servers"]
         if requested:
-            exact = [item for item in servers if str(item.get("server", "")).casefold() == requested]
+            exact = [item for item in servers if self._server_key(item.get("server")) == requested]
             if not exact:
                 return {"verified": False, "reason": "public_server_not_found", "public_servers": [item.get("server") for item in servers]}
             servers = exact
@@ -542,7 +545,26 @@ class LLMToolRuntime:
             if state != "running": findings.append(f"{item['server']} is {item.get('state', 'Unknown')}")
             elif item.get("players") is None: findings.append(f"{item['server']} is running, but AMP player metrics are unavailable")
             else: findings.append(f"{item['server']} is running and AMP reports {item['players']} player(s)")
-        return {"verified": True, "findings": findings, "limits": ["This checks AMP state only; it cannot inspect the player's client, DNS path, firewall, account, or mod mismatch."], "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
+        result = {"verified": True, "findings": findings,
+                  "limits": ["Live AMP state cannot inspect the player's client, DNS path, firewall, account, or mod mismatch."],
+                  "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
+        # An administrator asking about one server should not have to guess that a
+        # second tool exists. Fold the passive console evidence into this composite
+        # diagnostic, while retaining the hard authorization check in that tool.
+        if self.actor_is_admin and len(servers) == 1:
+            console = json.loads(await self.execute("read_server_console", {
+                "server": servers[0].get("server", requested_raw), "minutes": 60
+            }))
+            result["console"] = console
+            if console.get("error"):
+                result["limits"].append(f"Console evidence unavailable: {console['error']}")
+            elif not console.get("entries"):
+                result["limits"].append(
+                    "No recent console entries were captured; do not claim the console was inspected for the earlier incident."
+                )
+            else:
+                result["source"] = "AMP live status and recent redacted AMP console history"
+        return result
 
     @staticmethod
     def _server_key(value):
