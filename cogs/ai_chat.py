@@ -749,6 +749,10 @@ class AIChat(commands.Cog):
                 return False
         return bool(getattr(resolved, "author", None) and resolved.author.id == self.bot.user.id)
 
+    def _is_game_bridge_message(self, message) -> bool:
+        bridge = self.bot.get_cog("ChatBridge")
+        return bool(bridge and bridge.is_game_bridge_message(message))
+
     def _role_allowed(self, member) -> bool:
         allowed = set(self.settings.get("allowed_role_ids", []))
         if not allowed:
@@ -756,9 +760,16 @@ class AIChat(commands.Cog):
         return any(getattr(role, "id", None) in allowed for role in getattr(member, "roles", ()))
 
     async def _triggered(self, message):
-        if not self.settings["enabled"] or not self.bot.user or message.author.bot or message.guild is None:
+        if not self.settings["enabled"] or not self.bot.user or message.guild is None:
             return False
-        if not self._role_allowed(message.author):
+        game_bridge = self._is_game_bridge_message(message)
+        if message.author.bot and not game_bridge:
+            return False
+        # The role whitelist applies to Discord members. Minecraft ingress is
+        # authenticated separately by the bridge-owned webhook ID. It still has
+        # no Discord administrator identity, so privileged tools remain denied
+        # by their independent runtime permission checks.
+        if not game_bridge and not self._role_allowed(message.author):
             return False
         direct = await self._direct_trigger(message)
         if direct:
@@ -796,7 +807,9 @@ class AIChat(commands.Cog):
         included.update(item.id for item in additions)
         previous = []
         async for item in trigger.channel.history(limit=self.settings["context_messages"] + 1, before=trigger):
-            if item.id not in included and (not item.author.bot or item.author.id == self.bot.user.id):
+            if item.id not in included and (
+                    not item.author.bot or item.author.id == self.bot.user.id
+                    or self._is_game_bridge_message(item)):
                 previous.append(item)
             if len(previous) + len(chain) >= self.settings["context_messages"]:
                 break
@@ -807,13 +820,16 @@ class AIChat(commands.Cog):
             if item.author.id == self.bot.user.id:
                 result.append({"role": "assistant", "content": text})
             else:
-                result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
+                source = "Minecraft" if self._is_game_bridge_message(item) else item.author.display_name
+                result.append({"role": "user", "content": f"[{source} / {item.author.display_name}]: {text}"})
         for item in additions:
             # Earlier messages in a queued batch precede its latest effective trigger.
             # Their attachments remain text-only; the trigger uses the normal pipeline.
             text = self._text(item, self.bot.user.id)[:4000]
-            result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
-        current = f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
+            source = "Minecraft" if self._is_game_bridge_message(item) else item.author.display_name
+            result.append({"role": "user", "content": f"[{source} / {item.author.display_name}]: {text}"})
+        trigger_source = "Minecraft" if self._is_game_bridge_message(trigger) else trigger.author.display_name
+        current = f"[{trigger_source} / {trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
         if attachment_text:
             current += "\n\n" + attachment_text
         result.append({"role": "user", "content": current[:20000]})
@@ -1194,8 +1210,12 @@ class AIChat(commands.Cog):
             await message.reply(chunks[0], mention_author=False, allowed_mentions=mentions)
             for chunk in chunks[1:]:
                 await message.channel.send(chunk, allowed_mentions=mentions)
+            if self._is_game_bridge_message(message):
+                bridge = self.bot.get_cog("ChatBridge")
+                await bridge.broadcast_llm_response(message, answer)
             self._usage["succeeded"] += 1
-            await self._extract_memories(message, answer)
+            if not self._is_game_bridge_message(message):
+                await self._extract_memories(message, answer)
             if runtime.pending_action:
                 await message.reply(
                     f"Administrator confirmation required: **{runtime.pending_action.action}** "

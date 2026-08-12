@@ -60,6 +60,9 @@ class ChatBridge(commands.Cog):
         # It intentionally does not persist potentially sensitive server logs to disk.
         self.console_history = {}
         self.webhook_cache = {}
+        # Webhook IDs owned by this bridge are the trust boundary for game-chat
+        # LLM ingress. A normal Discord user cannot impersonate one.
+        self.bridge_webhook_ids = set()
         self.send_locks = {}
         self.send_queues = {}
         self.send_workers = {}
@@ -801,6 +804,40 @@ class ChatBridge(commands.Cog):
         except Exception as exc:
             log.warning(f"Unable to obtain Discord invite: {exc}")
             return None
+
+    def is_game_bridge_message(self, message) -> bool:
+        """Return true only for messages created by this cog's owned webhook."""
+        webhook_id = getattr(message, "webhook_id", None)
+        if not webhook_id or int(webhook_id) not in self.bridge_webhook_ids:
+            return False
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        return any(
+            data.get("active", True) and data.get("channel_id") == channel_id
+            for data in self.bridge_data.get("groups", {}).values()
+        )
+
+    async def broadcast_llm_response(self, source_message, text: str) -> int:
+        """Send an LLM answer back to the game group that produced its prompt."""
+        if not self.is_game_bridge_message(source_message):
+            return 0
+        channel_id = source_message.channel.id
+        count = 0
+        for group_data in self.bridge_data.get("groups", {}).values():
+            if not group_data.get("active", True) or group_data.get("channel_id") != channel_id:
+                continue
+            for target_name in group_data.get("servers", []):
+                target = self.instances.get(target_name)
+                if not target:
+                    continue
+                safe_text = self._sanitize_for_minecraft(text)
+                if self._is_minecraft(target):
+                    cmd = self._minecraft_chat_json("CalmBot", text)
+                else:
+                    cmd = f'tellraw @a "[Discord] <CalmBot> {safe_text}"'
+                self._enqueue_send(target, cmd, target_name)
+                count += 1
+            break
+        return count
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -1547,15 +1584,18 @@ class ChatBridge(commands.Cog):
             return None
         cached = self.webhook_cache.get(channel.id)
         if cached:
+            self.bridge_webhook_ids.add(int(cached.id))
             return cached
         try:
             webhooks = await channel.webhooks()
             for wh in webhooks:
                 if wh.user == self.bot.user or wh.name == "CalmBot Bridge":
                     self.webhook_cache[channel.id] = wh
+                    self.bridge_webhook_ids.add(int(wh.id))
                     return wh
             webhook = await channel.create_webhook(name="CalmBot Bridge")
             self.webhook_cache[channel.id] = webhook
+            self.bridge_webhook_ids.add(int(webhook.id))
             return webhook
         except discord.Forbidden:
             log.warning(f"Missing Manage Webhooks permission in {channel.name}")
