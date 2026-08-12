@@ -1,9 +1,8 @@
-"""Race-safe, bounded state for messages folded into an active LLM request."""
+"""Race-safe, bounded state for deferred LLM follow-up batches."""
 from __future__ import annotations
 
-import asyncio
 from collections import deque
-from typing import Any
+from typing import Any, Iterable
 
 
 def message_channel_key(message: Any) -> tuple[int, int] | None:
@@ -16,8 +15,70 @@ def message_channel_key(message: Any) -> tuple[int, int] | None:
     return int(guild_id), int(channel_id)
 
 
+class PendingBatch:
+    """One bounded queued request whose newest message is the trigger."""
+
+    def __init__(self, trigger: Any, limit: int, *, followup: bool = False,
+                 messages: Iterable[Any] = ()):
+        key = message_channel_key(trigger)
+        if key is None:
+            raise ValueError("pending LLM batch requires a guild channel")
+        self.key = key
+        self.limit = max(1, int(limit))
+        self.followup = bool(followup)
+        # Preserve the object that owns queue UI (such as the clock reaction),
+        # even while later messages advance the effective response target.
+        self.anchor = trigger
+        self._messages: deque[Any] = deque(maxlen=self.limit)
+        self._ids: set[int] = set()
+        for message in messages:
+            self._append(message)
+        self._append(trigger)
+
+    def _append(self, message: Any) -> bool:
+        message_id = int(getattr(message, "id", 0) or 0)
+        if (not message_id or message_id in self._ids
+                or message_channel_key(message) != self.key):
+            return False
+        if len(self._messages) >= self.limit:
+            removed = self._messages.popleft()
+            self._ids.discard(int(removed.id))
+        self._messages.append(message)
+        self._ids.add(message_id)
+        return True
+
+    def append(self, message: Any) -> bool:
+        """Merge a later message, advancing the effective trigger."""
+        return self._append(message)
+
+    @property
+    def trigger(self) -> Any:
+        return self._messages[-1]
+
+    @property
+    def context_messages(self) -> list[Any]:
+        return list(self._messages)[:-1]
+
+    # Queue/rate-limit code can treat a batch like its effective trigger.
+    @property
+    def id(self):
+        return self.trigger.id
+
+    @property
+    def guild(self):
+        return self.trigger.guild
+
+    @property
+    def channel(self):
+        return self.trigger.channel
+
+    @property
+    def author(self):
+        return self.trigger.author
+
+
 class PendingContext:
-    """Additional messages for one in-flight request; the trigger lives separately."""
+    """Messages received after an immutable provider request was submitted."""
 
     def __init__(self, trigger: Any, limit: int):
         key = message_channel_key(trigger)
@@ -28,40 +89,27 @@ class PendingContext:
         self.limit = max(1, int(limit))
         self._messages: deque[Any] = deque()
         self._ids: set[int] = set()
-        self.revision = 0
-        self.changed = asyncio.Event()
-        self._closed = False
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
 
     def append(self, message: Any) -> bool:
-        """Append once when channel-scoped, evicting old additions at the hard cap."""
+        """Accumulate once without ever replacing the submitted trigger."""
         message_id = int(getattr(message, "id", 0) or 0)
-        if (self._closed or not message_id or message_id == self.trigger_id
-                or message_id in self._ids or message_channel_key(message) != self.key):
+        if (not message_id or message_id == self.trigger_id or message_id in self._ids
+                or message_channel_key(message) != self.key):
             return False
         if len(self._messages) >= self.limit:
             removed = self._messages.popleft()
             self._ids.discard(int(removed.id))
         self._messages.append(message)
         self._ids.add(message_id)
-        self.revision += 1
-        self.changed.set()
         return True
 
-    def snapshot(self) -> tuple[list[Any], int, asyncio.Event]:
-        """Return a stable ordered snapshot and a fresh change notification handle."""
-        self.changed.clear()
-        return list(self._messages), self.revision, self.changed
-
-    def close_if_unchanged(self, revision: int) -> bool:
-        """Atomically seal this snapshot if no newer message was appended."""
-        if self._closed or self.revision != revision:
-            return False
-        self._closed = True
-        return True
+    def followup(self) -> PendingBatch | None:
+        """Bundle all retained later messages, with the latest as trigger."""
+        if not self._messages:
+            return None
+        messages = list(self._messages)
+        return PendingBatch(messages[-1], self.limit, followup=True,
+                            messages=messages[:-1])
 
 
 # main.py discovers Python files under cogs; this module is import-only.

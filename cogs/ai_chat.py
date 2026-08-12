@@ -11,7 +11,6 @@ import json
 import os
 import re
 import time
-from contextlib import suppress
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -25,7 +24,7 @@ import config
 from cogs.utils import admin_only, get_logger, load_json, save_json
 from cogs.llm_tools import AMPActionConfirmView, LLMToolRuntime, openai_tools, responses_tools
 from cogs.ai_chat_input import collect_attachments
-from cogs.ai_pending_context import PendingContext
+from cogs.ai_pending_context import PendingBatch, PendingContext
 from cogs.ai_memory import (EXTRACTION_INSTRUCTIONS, MemoryStore, explicit_remember_candidate,
                             parse_memory_candidates)
 
@@ -55,8 +54,6 @@ DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
 MAX_TOOL_ROUNDS = 10
-PENDING_CONTEXT_DEBOUNCE_SECONDS = 0.15
-MAX_CONTEXT_GENERATION_ATTEMPTS = 3
 
 
 def cfg(name: str, default: Any = None) -> Any:
@@ -306,7 +303,7 @@ class AIChat(commands.Cog):
         self._global: deque[float] = deque()
         self._active = 0
         self._clocked_requests: set[int] = set()
-        self._pending: deque[discord.Message] = deque()
+        self._pending: deque[PendingBatch] = deque()
         self._queue_wake = asyncio.Event()
         self._dispatcher_task: asyncio.Task | None = None
         self._response_tasks: set[asyncio.Task] = set()
@@ -566,24 +563,31 @@ class AIChat(commands.Cog):
             self._codex_login_tasks.pop(interaction.user.id, None)
 
     async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool, bool]:
-        """Queue a request, or atomically fold it into this channel's active request."""
+        """Queue a request or merge it into this channel's single follow-up batch."""
         async with self._lock:
             channel_key = self._conversation_key(message)
             active_context = self._inflight_context.get(channel_key)
-            if active_context is not None and not active_context.closed:
-                # PendingContext independently verifies the channel and message id. The
-                # original trigger is never replaced and additions are hard-bounded.
-                merged = active_context.append(message)
-                if not merged:
+            if active_context is not None:
+                if not active_context.append(message):
                     self._enqueue_rejection[message.id] = "duplicate"
                     return None, False, False
                 return 0, False, True
+
+            # Until dispatch starts, every further channel message joins the one
+            # queued batch and advances its effective trigger. This applies both to
+            # an initially rate-limited request and to a post-response follow-up.
+            queued_batch = next(
+                (item for item in self._pending if item.key == channel_key), None)
+            if queued_batch is not None:
+                if not queued_batch.append(message):
+                    self._enqueue_rejection[message.id] = "duplicate"
+                    return None, False, False
+                return 0, False, True
+
             key = (message.guild.id, message.channel.id, message.author.id)
-            # Once the final bounded snapshot is sealed, later traffic becomes ordinary
-            # queued work rather than being accepted into context that cannot be sent.
-            processing_duplicate = key in self._processing_users and active_context is None
-            if processing_duplicate or any(
-                (item.guild.id, item.channel.id, item.author.id) == key for item in self._pending
+            if key in self._processing_users or any(
+                (item.guild.id, item.channel.id, item.author.id) == key
+                for item in self._pending
             ):
                 self._enqueue_rejection[message.id] = "duplicate"
                 return None, False, False
@@ -603,7 +607,8 @@ class AIChat(commands.Cog):
             concurrency_limited = (
                 self._active + len(self._pending) >= self.settings["max_concurrent"])
             delayed = user_limited or global_limited or concurrency_limited
-            self._pending.append(message)
+            self._pending.append(PendingBatch(
+                message, limit=self.settings["context_messages"]))
             position = len(self._pending)
         self._queue_wake.set()
         return position, delayed, False
@@ -647,7 +652,7 @@ class AIChat(commands.Cog):
             self._active += 1
             self._processing_users.add((message.guild.id, message.channel.id, message.author.id))
             self._inflight_context[self._conversation_key(message)] = PendingContext(
-                message, self.settings["context_messages"])
+                message.trigger, self.settings["context_messages"])
             return message, 0
 
     async def _dispatch_loop(self):
@@ -675,11 +680,17 @@ class AIChat(commands.Cog):
         async with self._lock:
             self._active = max(0, self._active - 1)
             if message is not None:
-                self._processing_users.discard((message.guild.id, message.channel.id, message.author.id))
+                self._processing_users.discard(
+                    (message.guild.id, message.channel.id, message.author.id))
                 channel_key = self._conversation_key(message)
                 active_context = self._inflight_context.get(channel_key)
                 if active_context is not None and active_context.trigger_id == message.id:
+                    # This hand-off is atomic with removal. No accepted message can fall
+                    # between active collection and the queued follow-up batch.
+                    followup = active_context.followup()
                     self._inflight_context.pop(channel_key, None)
+                    if followup is not None:
+                        self._pending.append(followup)
         self._queue_wake.set()
 
     def _conversation_key(self, message) -> tuple[int, int]:
@@ -741,7 +752,9 @@ class AIChat(commands.Cog):
 
     async def _context(self, trigger, attachment_text="", additions=()):
         chain = await self._reply_chain(trigger)
+        additions = tuple(additions)
         included = {item.id for item in chain}
+        included.update(item.id for item in additions)
         previous = []
         async for item in trigger.channel.history(limit=self.settings["context_messages"] + 1, before=trigger):
             if item.id not in included and (not item.author.bot or item.author.id == self.bot.user.id):
@@ -756,15 +769,15 @@ class AIChat(commands.Cog):
                 result.append({"role": "assistant", "content": text})
             else:
                 result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
-        current = f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
-        if attachment_text: current += "\n\n" + attachment_text
-        result.append({"role": "user", "content": current[:20000]})
         for item in additions:
-            # Additions are human Discord messages admitted by _triggered and scoped by
-            # PendingContext. Attachments remain subject to the original fetch pipeline;
-            # channel follow-ups contribute bounded text only.
+            # Earlier messages in a queued batch precede its latest effective trigger.
+            # Their attachments remain text-only; the trigger uses the normal pipeline.
             text = self._text(item, self.bot.user.id)[:4000]
             result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
+        current = f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
+        if attachment_text:
+            current += "\n\n" + attachment_text
+        result.append({"role": "user", "content": current[:20000]})
         return result
 
     def _system(self, message):
@@ -1104,58 +1117,34 @@ class AIChat(commands.Cog):
             except discord.HTTPException:
                 self._clocked_requests.discard(message.id)
 
-    async def _process_message(self, message: discord.Message):
+    async def _process_message(self, request: PendingBatch):
+        message = request.trigger
+        clock_message = request.anchor
+        additions = tuple(request.context_messages)
         try:
             self._usage["requests"] += 1
             prepared = await collect_attachments(await self._http(), getattr(message, "attachments", ()))
             if prepared.skipped:
                 log.info("LLM skipped %d attachment(s) for message %s", len(prepared.skipped), message.id)
             async with message.channel.typing():
-                # Brief fixed coalescing windows capture bursts without waiting forever.
-                # At most three provider attempts are made. Before the final attempt the
-                # snapshot is sealed, so later traffic queues as new work rather than
-                # being reported as merged and then omitted.
-                for attempt in range(MAX_CONTEXT_GENERATION_ATTEMPTS):
-                    await asyncio.sleep(PENDING_CONTEXT_DEBOUNCE_SECONDS)
-                    async with self._lock:
-                        pending_context = self._inflight_context[self._conversation_key(message)]
-                        additions, revision, changed = pending_context.snapshot()
-                        final_attempt = attempt + 1 == MAX_CONTEXT_GENERATION_ATTEMPTS
-                        if final_attempt:
-                            pending_context.close_if_unchanged(revision)
-                    runtime = LLMToolRuntime(self, message)
-                    runtime.image_data_urls = prepared.image_data_urls
-                    generate_task = asyncio.create_task(self._generate(
-                        await self._context(message, prepared.text, additions),
-                        self._system(message), runtime))
-                    if final_attempt:
-                        answer = await generate_task
-                        break
-
-                    change_task = asyncio.create_task(changed.wait())
-                    await asyncio.wait(
-                        {generate_task, change_task}, return_when=asyncio.FIRST_COMPLETED)
-                    async with self._lock:
-                        stable = pending_context.close_if_unchanged(revision)
-                    if stable:
-                        change_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await change_task
-                        answer = await generate_task
-                        break
-
-                    generate_task.cancel()
-                    change_task.cancel()
-                    with suppress(asyncio.CancelledError, Exception):
-                        await generate_task
-                    with suppress(asyncio.CancelledError):
-                        await change_task
-                else:  # Defensive: the configured attempt count is always positive.
-                    raise RuntimeError("LLM context generation attempts exhausted")
+                # Provider payloads are immutable after submission. Never cancel and
+                # regenerate: later messages stay in PendingContext for one follow-up.
+                runtime = LLMToolRuntime(self, message)
+                runtime.image_data_urls = prepared.image_data_urls
+                answer = await self._generate(
+                    await self._context(message, prepared.text, additions),
+                    self._system(message), runtime)
             self._usage["tool_calls"] += runtime.tool_calls
             if runtime.conversation_control:
                 if runtime.conversation_control == "end":
-                    self._conversations.pop(self._conversation_key(message), None)
+                    key = self._conversation_key(message)
+                    self._conversations.pop(key, None)
+                    # Explicitly ending the conversation also discards messages that
+                    # arrived while this immutable provider request was running.
+                    async with self._lock:
+                        active = self._inflight_context.get(key)
+                        if active is not None and active.trigger_id == message.id:
+                            self._inflight_context.pop(key, None)
                 self._usage["succeeded"] += 1
                 log.info("LLM chose %s for message %s", runtime.conversation_control, message.id)
                 return
@@ -1188,10 +1177,10 @@ class AIChat(commands.Cog):
             except discord.HTTPException:
                 pass
         finally:
-            if message.id in self._clocked_requests:
-                self._clocked_requests.discard(message.id)
+            if clock_message.id in self._clocked_requests:
+                self._clocked_requests.discard(clock_message.id)
                 try:
-                    await message.remove_reaction("🕒", self.bot.user)
+                    await clock_message.remove_reaction("🕒", self.bot.user)
                 except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                     pass
             await self._release(message)

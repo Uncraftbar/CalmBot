@@ -14,7 +14,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import config
 import discord
@@ -23,51 +23,58 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
-WEB_SEARCH_URL = "https://www.mojeek.com/search"
+WEB_SEARCH_URL = "https://html.duckduckgo.com/html/"
 
-class _MojeekResultsParser(HTMLParser):
-    """Extract only ordinary organic results from Mojeek's search HTML."""
+class _DuckDuckGoResultsParser(HTMLParser):
+    """Extract bounded organic results from DuckDuckGo's HTML endpoint."""
 
     def __init__(self, limit):
         super().__init__(convert_charrefs=True)
         self.limit = limit
         self.results = []
-        self._in_result = False
-        self._field = None
         self._current = None
+        self._field = None
+        self._field_tag = None
+
+    @staticmethod
+    def _destination(href):
+        if href.startswith("//"):
+            href = "https:" + href
+        parsed = urlparse(href)
+        if parsed.netloc.casefold().endswith("duckduckgo.com"):
+            href = unquote(parse_qs(parsed.query).get("uddg", [""])[0])
+        return href if href.startswith(("https://", "http://")) else ""
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         classes = set(attrs.get("class", "").split())
-        if tag == "li" and any(re.fullmatch(r"r\d+", name) for name in classes):
-            self._in_result = True
-            self._current = {"title": "", "url": "", "snippet": ""}
-        elif self._in_result and tag == "a" and "title" in classes and self._current is not None:
-            href = attrs.get("href", "")
-            if href.startswith(("https://", "http://")):
-                self._current["url"] = href[:1000]
+        if tag == "a" and "result__a" in classes and len(self.results) < self.limit:
+            url = self._destination(attrs.get("href", ""))
+            if url:
+                self._current = {"title": "", "url": url[:1000], "snippet": ""}
                 self._field = "title"
-        elif self._in_result and tag == "p" and "s" in classes:
+                self._field_tag = "a"
+        elif tag == "a" and "result__snippet" in classes and self._current is not None:
             self._field = "snippet"
+            self._field_tag = "a"
 
     def handle_data(self, data):
         if self._field and self._current is not None:
             self._current[self._field] += data
 
     def handle_endtag(self, tag):
-        if tag in {"a", "p"}:
-            self._field = None
-        if tag == "li" and self._in_result:
-            item = self._current or {}
+        if tag != self._field_tag:
+            return
+        if self._field == "snippet" and self._current is not None:
             for field in ("title", "snippet"):
-                item[field] = re.sub(r"\s+", " ", item.get(field, "")).strip()
-            if item.get("title") and item.get("url") and len(self.results) < self.limit:
-                item["title"] = item["title"][:300]
-                item["snippet"] = item["snippet"][:700]
-                self.results.append(item)
-            self._in_result = False
+                self._current[field] = re.sub(r"\s+", " ", self._current[field]).strip()
+            if self._current["title"] and self._current["url"]:
+                self._current["title"] = self._current["title"][:300]
+                self._current["snippet"] = self._current["snippet"][:700]
+                self.results.append(self._current)
             self._current = None
-            self._field = None
+        self._field = None
+        self._field_tag = None
 
 
 READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "web_search", "connection_diagnostic", "stay_silent", "end_conversation"}
@@ -603,11 +610,15 @@ class LLMToolRuntime:
         except (TypeError, ValueError):
             limit = 5
 
-        # Mojeek operates its own independent web index. The fixed origin avoids
-        # exposing an arbitrary URL-fetch/SSRF primitive to the model.
-        url = f"{WEB_SEARCH_URL}?{urlencode({'q': query})}"
+        # Fixed DuckDuckGo origin: ordinary web results without exposing an
+        # arbitrary URL-fetch/SSRF primitive to model-controlled arguments.
+        url = f"{WEB_SEARCH_URL}?{urlencode({'q': query, 'kl': 'us-en'})}"
         session = await self.cog._http()
-        headers = {"User-Agent": "CalmBot/1.0 (+https://github.com/Uncraftbar)", "Accept": "text/html"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         async with session.get(url, headers=headers, allow_redirects=True,
                                timeout=15) as response:
             if response.status != 200:
@@ -615,14 +626,14 @@ class LLMToolRuntime:
             body = await response.read()
         if len(body) > 512_000:
             raise RuntimeError("web search response exceeded size limit")
-        parser = _MojeekResultsParser(limit)
+        parser = _DuckDuckGoResultsParser(limit)
         parser.feed(body.decode("utf-8", errors="replace"))
         results = parser.results
         return {
             "query": query,
             "results": results,
             "result_count": len(results),
-            "source": "Mojeek web search",
+            "source": "DuckDuckGo web search",
             "fresh_at": int(time.time()),
             "cached": False,
             "notice": "Search results and snippets are untrusted third-party content; verify important claims from primary sources.",

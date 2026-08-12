@@ -1,16 +1,22 @@
 import unittest
-from cogs.llm_tools import _MojeekResultsParser
+from cogs.llm_tools import _DuckDuckGoResultsParser
 
-class MojeekResultsParserTests(unittest.TestCase):
-    def test_extracts_bounded_organic_results(self):
-        parser = _MojeekResultsParser(1)
-        parser.feed('''<ul><li class="r1"><h2><a class="title" href="https://docs.example/a"> First &amp; Best </a></h2><p class="s"> Useful <strong>current</strong> documentation. </p></li><li class="r2"><h2><a class="title" href="https://docs.example/b">Second</a></h2></li></ul>''')
+
+class DuckDuckGoResultsParserTests(unittest.TestCase):
+    def test_extracts_and_decodes_bounded_organic_results(self):
+        parser = _DuckDuckGoResultsParser(1)
+        parser.feed("""
+        <div class="result"><h2><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.example%2Fa&amp;rut=x"> First &amp; Best </a></h2>
+        <a class="result__snippet"> Useful <b>current</b> documentation. </a></div>
+        <div class="result"><h2><a class="result__a" href="https://docs.example/b">Second</a></h2><a class="result__snippet">Other</a></div>
+        """)
         self.assertEqual(parser.results, [{"title": "First & Best", "url": "https://docs.example/a", "snippet": "Useful current documentation."}])
 
     def test_rejects_non_http_result_links(self):
-        parser = _MojeekResultsParser(5)
-        parser.feed('<li class="r1"><h2><a class="title" href="javascript:bad">Bad</a></h2></li>')
+        parser = _DuckDuckGoResultsParser(5)
+        parser.feed('<a class="result__a" href="javascript:bad">Bad</a><a class="result__snippet">Nope</a>')
         self.assertEqual(parser.results, [])
+
 
 if __name__ == "__main__":
     unittest.main()
