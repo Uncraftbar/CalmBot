@@ -724,6 +724,7 @@ class AIChat(commands.Cog):
         session = await self._http()
         for attempt in range(2):
             events = []
+            output_items: dict[int, dict] = {}
             async with session.post(CODEX_URL, json=payload, headers=headers) as resp:
                 if resp.status == 401 and attempt == 0:
                     token, account = await self._codex_auth(force_refresh=True)
@@ -741,9 +742,20 @@ class AIChat(commands.Cog):
                         event = json.loads(line[6:])
                     except ValueError:
                         continue
-                    if event.get("type") == "response.completed" and isinstance(event.get("response"), dict):
-                        return event["response"]
-                    if event.get("type") in ("response.failed", "error"):
+                    event_type = event.get("type")
+                    if event_type in ("response.output_item.added", "response.output_item.done"):
+                        item = event.get("item")
+                        index = event.get("output_index")
+                        if isinstance(item, dict) and isinstance(index, int):
+                            # The ChatGPT Codex stream currently emits complete tool/message
+                            # items here but may leave response.completed.output empty.
+                            output_items[index] = item
+                    if event_type == "response.completed" and isinstance(event.get("response"), dict):
+                        response = event["response"]
+                        if not response.get("output") and output_items:
+                            response["output"] = [output_items[index] for index in sorted(output_items)]
+                        return response
+                    if event_type in ("response.failed", "error"):
                         raise RuntimeError("Codex stream failed")
                     events.append(event)
             text = "".join(str(event.get("delta", "")) for event in events
@@ -770,15 +782,22 @@ class AIChat(commands.Cog):
         for _ in range(4):
             payload = {"model": self._model(), "instructions": system, "input": conversation,
                        "tools": responses_tools(runtime.actor_is_admin), "tool_choice": "auto",
-                       "parallel_tool_calls": False, "store": False, "stream": True}
+                       "parallel_tool_calls": False, "store": False, "stream": True,
+                       # Stateless reasoning-model tool continuations must carry the
+                       # encrypted reasoning item from the previous response.
+                       "include": ["reasoning.encrypted_content"]}
             effort = self._reasoning()
             if effort in VALID_REASONING:
                 payload["reasoning"] = {"effort": effort}
             response = await self._codex_request(payload, headers)
-            calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
+            response_output = response.get("output", [])
+            calls = [item for item in response_output if item.get("type") == "function_call"]
             if not calls:
                 return self._codex_output(response)
-            conversation.extend(calls[:5])
+            # Preserve every model output item, especially encrypted reasoning.
+            # Sending only function calls loses required state when store=False;
+            # the follow-up can then complete with no assistant message.
+            conversation.extend(response_output)
             for call in calls[:5]:
                 output = await runtime.execute(str(call.get("name", "")), call.get("arguments", "{}"))
                 conversation.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": output})
