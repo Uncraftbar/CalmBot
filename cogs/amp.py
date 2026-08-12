@@ -62,6 +62,8 @@ class InstanceActionView(discord.ui.View):
             )
             return
         
+        selected_label = instance.friendly_name or instance.instance_name
+
         # Get current state
         state = "Unknown"
         try:
@@ -126,76 +128,49 @@ class BackButton(discord.ui.Button):
         )
 
 
+class ConfirmServerActionModal(discord.ui.Modal):
+    reason = discord.ui.TextInput(label="Reason", placeholder="Why is this action needed?", min_length=3, max_length=200)
+
+    def __init__(self, instance, action):
+        super().__init__(title=f"Confirm server {action}")
+        self.instance = instance
+        self.action = action
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        name = self.instance.friendly_name or self.instance.instance_name
+        method = {"restart": self.instance.restart_application, "stop": self.instance.stop_application,
+                  "start": self.instance.start_application}[self.action]
+        try:
+            await method()
+            reason = str(self.reason).strip()
+            await interaction.followup.send(embed=success_embed(self.action.title() + " requested", f"**{name}**: {reason}"), ephemeral=True)
+            log.warning(f"AMP AUDIT: {interaction.user} requested {self.action} for {name}; reason={reason!r}")
+        except Exception as exc:
+            log.error(f"Failed to {self.action} {name}: {exc}")
+            await interaction.followup.send(embed=error_embed(self.action.title() + " failed", str(exc)), ephemeral=True)
+
+
 class RestartButton(discord.ui.Button):
-    """Restart the server application."""
-    
     def __init__(self, instance):
         super().__init__(label="Restart", style=discord.ButtonStyle.primary)
         self.instance = instance
-    
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await self.instance.restart_application()
-            await interaction.followup.send(
-                embed=success_embed("Restarting", "Application is restarting..."),
-                ephemeral=True
-            )
-            log.info(f"{interaction.user} restarted {self.instance.friendly_name or self.instance.instance_name}")
-        except Exception as e:
-            log.error(f"Failed to restart: {e}")
-            await interaction.followup.send(
-                embed=error_embed("Restart Failed", str(e)),
-                ephemeral=True
-            )
-
+        await interaction.response.send_modal(ConfirmServerActionModal(self.instance, "restart"))
 
 class StopButton(discord.ui.Button):
-    """Stop the server application."""
-    
     def __init__(self, instance):
         super().__init__(label="Stop", style=discord.ButtonStyle.danger)
         self.instance = instance
-    
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await self.instance.stop_application()
-            await interaction.followup.send(
-                embed=success_embed("Stopping", "Application is stopping..."),
-                ephemeral=True
-            )
-            log.info(f"{interaction.user} stopped {self.instance.friendly_name or self.instance.instance_name}")
-        except Exception as e:
-            log.error(f"Failed to stop: {e}")
-            await interaction.followup.send(
-                embed=error_embed("Stop Failed", str(e)),
-                ephemeral=True
-            )
-
+        await interaction.response.send_modal(ConfirmServerActionModal(self.instance, "stop"))
 
 class StartButton(discord.ui.Button):
-    """Start the server application."""
-    
     def __init__(self, instance):
         super().__init__(label="Start", style=discord.ButtonStyle.success)
         self.instance = instance
-    
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await self.instance.start_application()
-            await interaction.followup.send(
-                embed=success_embed("Starting", "Application is starting..."),
-                ephemeral=True
-            )
-            log.info(f"{interaction.user} started {self.instance.friendly_name or self.instance.instance_name}")
-        except Exception as e:
-            log.error(f"Failed to start: {e}")
-            await interaction.followup.send(
-                embed=error_embed("Start Failed", str(e)),
-                ephemeral=True
-            )
+        await interaction.response.send_modal(ConfirmServerActionModal(self.instance, "start"))
 
 
 class TPSButton(discord.ui.Button):
@@ -328,6 +303,17 @@ class ProfilerButton(discord.ui.Button):
             )
 
 
+class PublicServersView(discord.ui.View):
+    def __init__(self, cog):
+        super().__init__(timeout=120)
+        self.cog = cog
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await self.cog.build_public_servers_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 # =============================================================================
 # COG
 # =============================================================================
@@ -339,6 +325,35 @@ class AMP(commands.Cog):
         self.bot = bot
         log.info("AMP cog initialized")
     
+    async def build_public_servers_embed(self):
+        instances = await fetch_valid_instances()
+        embed = discord.Embed(title="Game Servers", color=discord.Color.blue())
+        if not instances:
+            embed.description = "No game servers are currently available."
+            return embed
+        for inst in instances[:25]:
+            name = inst.friendly_name or inst.instance_name
+            state, users = "Unknown", None
+            try:
+                status = await asyncio.wait_for(inst.get_instance_status(), timeout=8)
+                state = get_instance_state(status)
+                raw_users = getattr(status, "active_users", None)
+                if isinstance(raw_users, (list, dict)):
+                    users = len(raw_users)
+            except Exception:
+                pass
+            emoji = "🟢" if state.lower() == "running" else "🔴" if state.lower() == "stopped" else "🟡"
+            detail = f"Status: **{state}**" + (f" · Players: **{users}**" if users is not None else "")
+            embed.add_field(name=f"{emoji} {name}"[:256], value=detail, inline=False)
+        embed.set_footer(text="Live AMP status · use Refresh for current data")
+        return embed
+
+    @app_commands.command(name="servers", description="View the current status of community game servers")
+    async def servers(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        embed = await self.build_public_servers_embed()
+        await interaction.followup.send(embed=embed, view=PublicServersView(self))
+
     @app_commands.command(name="amp", description="AMP server management dashboard")
     @admin_only()
     async def amp(self, interaction: discord.Interaction):

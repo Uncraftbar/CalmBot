@@ -68,6 +68,11 @@ class ChatBridge(commands.Cog):
         self.ws_entry_queues = {}
         self.last_fallback_poll = {}
         self.ws_base_url = self._make_ws_base_url(self.amp_url)
+        self.ws_alerted = set()
+        self.ws_disconnect_since = {}
+        self.last_health_alert = {}
+        self.send_failed = set()
+        self.discord_invite_cache = None
 
         self.sync_loop.start()
 
@@ -138,6 +143,12 @@ class ChatBridge(commands.Cog):
                     async with client.ws_connect(ws_url, heartbeat=30, autoping=True) as ws:
                         self.ws_connected.add(name)
                         self.failure_counts.pop(name, None)
+                        self.ws_disconnect_since.pop(name, None)
+                        if name in self.ws_alerted:
+                            self.ws_alerted.discard(name)
+                            asyncio.create_task(self._send_health_alert(
+                                f"✅ AMP event stream recovered for **{name}**; real-time delivery is active again."
+                            ))
                         delay = 1
                         log.info(f"AMP event stream connected for {name}")
                         async for message in ws:
@@ -155,11 +166,41 @@ class ChatBridge(commands.Cog):
                 raise
             except Exception as exc:
                 self.ws_connected.discard(name)
+                self.ws_disconnect_since.setdefault(name, datetime.now(timezone.utc))
                 log.warning(f"AMP event stream unavailable for {name}; polling fallback active: {exc}")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
             finally:
                 self.ws_connected.discard(name)
+
+    async def _send_health_alert(self, message):
+        settings = self.bridge_data.get("health_alerts", {})
+        if not settings.get("enabled") or not settings.get("channel_id"):
+            return
+        channel = self.bot.get_channel(settings["channel_id"])
+        if not channel:
+            return
+        key = message.split("**")[1] if "**" in message else message
+        now = datetime.now(timezone.utc)
+        if (now - self.last_health_alert.get(key, datetime.min.replace(tzinfo=timezone.utc))).total_seconds() < 60:
+            return
+        self.last_health_alert[key] = now
+        try:
+            await channel.send(message)
+        except Exception as exc:
+            log.warning(f"Failed to send bridge health alert: {exc}")
+
+    async def _check_stream_health(self):
+        now = datetime.now(timezone.utc)
+        for name, since in list(self.ws_disconnect_since.items()):
+            if name in self.ws_connected:
+                self.ws_disconnect_since.pop(name, None)
+                continue
+            if name not in self.ws_alerted and (now - since).total_seconds() >= 60:
+                self.ws_alerted.add(name)
+                await self._send_health_alert(
+                    f"⚠️ AMP event stream unavailable for **{name}** for 60 seconds; polling fallback remains active."
+                )
 
     def _queue_ws_console_entry(self, name, data):
         if not isinstance(data, dict):
@@ -666,6 +707,42 @@ class ChatBridge(commands.Cog):
         mod_internal = str(getattr(instance, 'module', '')).lower()
         return "minecraft" in mod_disp or "minecraft" in mod_internal
 
+    @staticmethod
+    def _discord_text_for_minecraft(text):
+        return re.sub(r"<a?:([A-Za-z0-9_]+):\d+>", r":\1:", text or "")
+
+    def _minecraft_chat_json(self, safe_user, text):
+        url_regex = r"(https?://[^\s<>]+?)(?=[.,!?;:)]*(?:\s|$))"
+        components = ["", {"text": "[Discord] ", "color": "blue"},
+                      {"text": f"<{safe_user}> ", "color": "white"}]
+        for part in re.split(url_regex, text):
+            if not part:
+                continue
+            component = {"text": part, "color": "white"}
+            if re.fullmatch(url_regex, part):
+                component.update({"color": "blue", "underlined": True,
+                                  "clickEvent": {"action": "open_url", "value": part}})
+            components.append(component)
+        return "tellraw @a " + json.dumps(components, ensure_ascii=False)
+
+    async def _discord_invite_url(self, channel):
+        if self.discord_invite_cache:
+            return self.discord_invite_cache
+        configured = getattr(config, "DISCORD_INVITE_URL", None)
+        if configured:
+            self.discord_invite_cache = configured
+            return configured
+        try:
+            guild = channel.guild
+            vanity = await guild.vanity_invite() if getattr(guild, "vanity_url_code", None) else None
+            invite = vanity or await channel.create_invite(max_age=0, max_uses=0, unique=False,
+                                                           reason="CalmBot in-game !discord command")
+            self.discord_invite_cache = invite.url
+            return invite.url
+        except Exception as exc:
+            log.warning(f"Unable to obtain Discord invite: {exc}")
+            return None
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
@@ -683,21 +760,34 @@ class ChatBridge(commands.Cog):
             if not instance_names: continue
 
             user = message.author.display_name
-            msg = message.content
-            
-            # SECURITY: Sanitize to prevent command injection
+            parts = []
+            reference = getattr(message, "reference", None)
+            resolved = getattr(reference, "resolved", None) if reference else None
+            if resolved and getattr(resolved, "author", None):
+                quoted = self._discord_text_for_minecraft(getattr(resolved, "content", ""))
+                quoted = re.sub(r"\s+", " ", quoted).strip()[:80]
+                parts.append(f"↪ {resolved.author.display_name}: {quoted or '[attachment]'} | ")
+            content = self._discord_text_for_minecraft(message.content)
+            if content:
+                parts.append(content)
+            attachments = list(getattr(message, "attachments", []))[:3]
+            if attachments:
+                parts.append("Attachments: " + " ".join(a.url for a in attachments))
+            msg = " ".join(parts).strip()
+            if not msg:
+                continue
+
             safe_user = self._sanitize_for_minecraft(user)
             safe_msg = self._sanitize_for_minecraft(msg)
-            
+
             for target_name in instance_names:
                 target = self.instances.get(target_name)
                 if target:
                     if self._is_minecraft(target):
-                        cmd = f'tellraw @a ["",{{"text":"[Discord] ", "color": "blue"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
+                        cmd = self._minecraft_chat_json(safe_user, msg)
                     else:
-                        # Hytale/Generic support
                         cmd = f'tellraw @a "[Discord] <{safe_user}> {safe_msg}"'
-                    
+
                     self._enqueue_send(target, cmd, target_name)
             
             # We found the group, no need to check others (assuming 1:1 mapping preference)
@@ -927,8 +1017,24 @@ class ChatBridge(commands.Cog):
                 help_msg = '["",{"text":"[System] ", "color": "gold"}, {"text": "Available Commands:\\n", "color": "yellow"}, {"text": "!online ", "color": "aqua"}, {"text": "- List online players", "color": "white"}, {"text": "\\n!item ", "color": "aqua"}, {"text": "- Show held item", "color": "white"}]'
                 final_cmd = f"tellraw {user} {help_msg}"
             else:
-                final_cmd = 'tellraw @a "[System] Available Commands: !online - List online players"'
+                final_cmd = 'tellraw @a "[System] Available Commands: !online, !discord"'
             
+            await self._send_message_safe(target, final_cmd, source_name)
+
+        elif command == "!discord":
+            channel_id = group_data.get("channel_id")
+            channel = self.bot.get_channel(channel_id) if channel_id else None
+            invite = await self._discord_invite_url(channel) if channel else None
+            if not invite:
+                final_cmd = f'tellraw {user} ["",{{"text":"[System] Discord invite is unavailable. Please ask a moderator.","color":"red"}}]'
+            elif is_minecraft:
+                payload = ["", {"text": "[System] ", "color": "gold"},
+                           {"text": "Join our Discord: ", "color": "yellow"},
+                           {"text": invite, "color": "blue", "underlined": True,
+                            "clickEvent": {"action": "open_url", "value": invite}}]
+                final_cmd = f"tellraw {user} " + json.dumps(payload, ensure_ascii=False)
+            else:
+                final_cmd = f'tellraw @a "[System] Join our Discord: {self._sanitize_for_minecraft(invite)}"'
             await self._send_message_safe(target, final_cmd, source_name)
 
         elif command == "!item":
@@ -1038,6 +1144,21 @@ class ChatBridge(commands.Cog):
         
         await interaction.followup.send(embed=embed)
 
+    @staticmethod
+    def _classify_server_event(message):
+        text = re.sub(r"^\[[^]]+\]\s*", "", message or "").strip()
+        if re.search(r"\b(joined the game|logged in with entity id)\b", text, re.I):
+            return "join"
+        if re.search(r"\b(left the game|lost connection:)\b", text, re.I):
+            return "leave"
+        if re.search(r"\b(has made the advancement|has completed the challenge|has reached the goal)\b", text, re.I):
+            return "advancement"
+        death_patterns = (r" was slain by ", r" was shot by ", r" fell ", r" drowned$", r" burned to death$",
+                          r" blew up$", r" hit the ground too hard$", r" tried to swim in lava$", r" died$")
+        if any(re.search(pattern, text, re.I) for pattern in death_patterns):
+            return "death"
+        return None
+
     @tasks.loop(seconds=0.25)
     async def sync_loop(self):
         if not self.bridge_data.get("groups"): return
@@ -1047,6 +1168,7 @@ class ChatBridge(commands.Cog):
         if not active_instances:
             return
         self._reconcile_ws_tasks(active_instances)
+        await self._check_stream_health()
 
         # 2. Drain pushed entries immediately. Poll only disconnected streams,
         # at the old cadence, so socket outages remain transparent.
@@ -1159,6 +1281,20 @@ class ChatBridge(commands.Cog):
                 entry_source = str(getattr(entry, 'source', ''))
                 if not entry_source or not msg: continue
 
+                # Optional low-noise server event relay. Never classify actual player chat
+                # as an event merely because somebody typed "joined the game".
+                event_kind = None if "chat" in msg_type else self._classify_server_event(msg)
+                if event_kind:
+                    for group_name, group_data in self.bridge_data.get("groups", {}).items():
+                        enabled = group_data.get("events", {})
+                        if source_name in group_data.get("servers", []) and enabled.get(event_kind, False):
+                            channel = self.bot.get_channel(group_data.get("channel_id"))
+                            if channel:
+                                alias = self.bridge_data.get("instance_settings", {}).get(source_name, {}).get("alias", source_name)
+                                asyncio.create_task(channel.send(f"**[{alias}]** {msg}"))
+                            break
+                    continue
+
                 # Check Comp Mode
                 settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
                 comp_mode = settings.get("comp_mode", False)
@@ -1211,7 +1347,7 @@ class ChatBridge(commands.Cog):
             if not parent_group: continue
 
             filtered_messages = []
-            valid_commands = {"!online", "!help", "!item"}
+            valid_commands = {"!online", "!help", "!item", "!discord"}
             
             for user, msg in messages:
                 first_word = msg.split(" ")[0].lower()
@@ -1405,10 +1541,20 @@ class ChatBridge(commands.Cog):
             for attempt in range(1, 3):
                 try:
                     await asyncio.wait_for(target.send_console_message(cmd), timeout=15.0)
+                    if target_name in self.send_failed:
+                        self.send_failed.discard(target_name)
+                        asyncio.create_task(self._send_health_alert(
+                            f"✅ AMP message delivery recovered for **{target_name}**."
+                        ))
                     return True
                 except Exception as e:
                     if attempt == 2:
                         log.warning(f"Failed to send message to {target_name} after {attempt} attempts: {e}")
+                        if target_name not in self.send_failed:
+                            self.send_failed.add(target_name)
+                            asyncio.create_task(self._send_health_alert(
+                                f"⚠️ AMP message delivery failed twice for **{target_name}**."
+                            ))
                         return False
                     await asyncio.sleep(0.75)
         return False
@@ -1451,6 +1597,31 @@ class ChatBridge(commands.Cog):
             await interaction.followup.send(f"✅ Broadcast sent to **{count}** servers in group '{group}': {message}")
         else:
             await interaction.followup.send(f"⚠️ No active servers found for group '{group}'.")
+
+    @app_commands.command(name="bridge_events", description="Configure optional Minecraft event relays")
+    @app_commands.describe(group="Bridge group", joins="Relay joins", leaves="Relay leaves", deaths="Relay deaths", advancements="Relay advancements")
+    @app_commands.autocomplete(group=group_autocomplete)
+    @admin_only()
+    async def bridge_events(self, interaction: discord.Interaction, group: str, joins: bool, leaves: bool, deaths: bool, advancements: bool):
+        actual = next((name for name in self.bridge_data.get("groups", {}) if name.lower() == group.lower()), None)
+        if not actual:
+            await interaction.response.send_message(f"Unknown bridge group: {group}", ephemeral=True)
+            return
+        self.bridge_data["groups"][actual]["events"] = {
+            "join": joins, "leave": leaves, "death": deaths, "advancement": advancements
+        }
+        save_json(CHAT_BRIDGE_FILE, self.bridge_data)
+        await interaction.response.send_message(
+            f"Event relay updated for **{actual}** — joins: {joins}, leaves: {leaves}, deaths: {deaths}, advancements: {advancements}",
+            ephemeral=True)
+
+    @app_commands.command(name="bridge_alerts", description="Configure staff alerts for bridge failures and recovery")
+    @admin_only()
+    async def bridge_alerts(self, interaction: discord.Interaction, channel: discord.TextChannel, enabled: bool = True):
+        self.bridge_data["health_alerts"] = {"enabled": enabled, "channel_id": channel.id}
+        save_json(CHAT_BRIDGE_FILE, self.bridge_data)
+        await interaction.response.send_message(
+            f"Bridge health alerts {'enabled' if enabled else 'disabled'} in {channel.mention}.", ephemeral=True)
 
     @app_commands.command(name="bridge", description="Open the Chat Bridge Control Center")
     @admin_only()
