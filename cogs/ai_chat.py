@@ -24,7 +24,8 @@ import config
 from cogs.utils import admin_only, get_logger, load_json, save_json
 from cogs.llm_tools import AMPActionConfirmView, LLMToolRuntime, openai_tools, responses_tools
 from cogs.ai_chat_input import collect_attachments
-from cogs.ai_memory import EXTRACTION_INSTRUCTIONS, MemoryStore, parse_memory_candidates
+from cogs.ai_memory import (EXTRACTION_INSTRUCTIONS, MemoryStore, explicit_remember_candidate,
+                            parse_memory_candidates)
 
 log = get_logger("ai_chat")
 AI_CHAT_FILE = os.path.join("data", "ai_chat.json")
@@ -944,7 +945,8 @@ class AIChat(commands.Cog):
         """Cheap gate: avoid a second provider call for clearly transient turns."""
         return bool(re.search(
             r"\b(?:i (?:prefer|like|love|dislike|hate|use|usually|often|play|work (?:with|on)|"
-            r"am (?:learning|building|working on)|want (?:answers|responses))|my favou?rite)\b",
+            r"am (?:learning|building|working on)|want (?:answers|responses))|my favou?rite|"
+            r"remember(?:\s+(?:that|to))?)\b",
             text, re.I,
         ))
 
@@ -956,6 +958,12 @@ class AIChat(commands.Cog):
         user_text = self._text(message, self.bot.user.id)[:4000]
         if not self._memory_worthy_text(user_text):
             return
+        # An explicit "remember to ..." is itself the user's persistence intent.
+        # Store safe response preferences deterministically; model extraction below
+        # still handles less explicit durable facts and projects.
+        explicit = explicit_remember_candidate(user_text)
+        if explicit:
+            self._memories.add_many(guild_id, user_id, [explicit])
         extraction_input = (
             "USER MESSAGE (the only source memories may quote):\n" + user_text +
             "\n\nASSISTANT RESPONSE (context only; never quote or memorize it):\n" + answer[:2000]
@@ -1218,7 +1226,7 @@ class AIChat(commands.Cog):
 
     @llm_group.command(name="memory_delete", description="Delete one of your persistent memories by its list number")
     async def memory_delete(self, interaction: discord.Interaction,
-                            number: app_commands.Range[int, 1, 12]):
+                            number: app_commands.Range[int, 1, 30]):
         if interaction.guild_id is None:
             await interaction.response.send_message("Persistent memories are guild-scoped and unavailable in DMs.", ephemeral=True)
             return

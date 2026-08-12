@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cogs.ai_memory import MemoryStore, parse_memory_candidates, safe_memory_text
+from cogs.ai_memory import (MemoryStore, explicit_remember_candidate,
+                            parse_memory_candidates, safe_memory_text)
 
 
 class MemorySafetyTests(unittest.TestCase):
@@ -18,6 +19,25 @@ class MemorySafetyTests(unittest.TestCase):
         self.assertEqual(
             parse_memory_candidates(raw, "I prefer concise Python examples for work."),
             ["Prefers concise Python examples."],
+        )
+
+
+    def test_explicit_remember_is_deterministic_and_safe(self):
+        self.assertEqual(
+            explicit_remember_candidate("remember to never recommend the CurseForge app to anyone. fullstop."),
+            "Wants responses to never recommend the CurseForge app to anyone. fullstop.",
+        )
+        self.assertIsNone(explicit_remember_candidate("remember to use API key [REDACTED]"))
+        self.assertIsNone(explicit_remember_candidate("I remember using Python"))
+
+    def test_explicit_remember_response_preference(self):
+        raw = json.dumps([{
+            "memory": "Wants responses to never recommend the CurseForge app.",
+            "quote": "remember to never recommend the curseforge app to anyone. fullstop."
+        }])
+        self.assertEqual(
+            parse_memory_candidates(raw, "remember to never recommend the curseforge app to anyone. fullstop."),
+            ["Wants responses to never recommend the CurseForge app."],
         )
 
     def test_sensitive_and_secret_values_are_rejected(self):
@@ -40,6 +60,11 @@ class MemoryStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+
+    def test_default_store_allows_expanded_capacity(self):
+        store = MemoryStore(self.path, now=lambda: self.clock[0])
+        self.assertEqual(store.max_entries, 30)
 
     def test_store_is_bounded_guild_scoped_and_private(self):
         self.store.add_many(1, 9, ["Uses Python.", "Likes Fabric mods.", "Prefers short answers."])

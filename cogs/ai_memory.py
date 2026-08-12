@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 MEMORY_FILE = os.path.join("data", "ai_memories.json")
-MAX_MEMORIES_PER_USER = 12
+MAX_MEMORIES_PER_USER = 30
 MAX_MEMORY_CHARS = 240
 MEMORY_TTL_DAYS = 180
-MAX_CONTEXT_CHARS = 2400
+MAX_CONTEXT_CHARS = 6000
 
 # Intentionally conservative: a harmless memory is less important than avoiding
 # durable storage of credentials, identifiers, or sensitive personal data.
@@ -54,7 +54,8 @@ Memory must be a short third-person-neutral fragment beginning with one of: Pref
 Works with, Works on, Enjoys, Is learning, Is building, Is working on, Has experience with, Often uses,
 Usually uses, Wants responses, Plays, Favorite.
 Save only clearly durable, useful preferences, recurring tools/technologies, ongoing projects, hobbies, or response-style preferences.
-Do not save transient requests, one-off tasks, guesses, jokes, instructions to the assistant, or facts stated by anyone else.
+An explicit request beginning with "remember" may describe a durable response preference; save it as a "Wants responses" memory when safe.
+Do not save transient requests, one-off tasks, guesses, jokes, unrelated instructions to the assistant, or facts stated by anyone else.
 Never save secrets or credentials; contact details; identifiers; exact location; real name; financial, legal, medical,
 political, religious, sexual, racial/ethnic, or similarly sensitive data; or information about another person.
 Maximum 3 objects and 180 characters per memory."""
@@ -80,6 +81,24 @@ def safe_memory_text(value: Any) -> str | None:
     if _LONG_SECRET_RE.search(text) or _FORBIDDEN_RE.search(text):
         return None
     return text
+
+
+def explicit_remember_candidate(user_text: str) -> str | None:
+    """Deterministically retain a safe explicit ``remember to ...`` preference.
+
+    Explicit memory commands should not depend on a second model deciding that
+    they look sufficiently preference-like. The normal safety filter remains
+    authoritative, so sensitive data and prompt-injection text still fail closed.
+    """
+    text = _plain_text(user_text, limit=500)
+    match = re.match(r"^remember\s+to\s+(.+)$", text, re.I)
+    if not match:
+        return None
+    instruction = match.group(1).strip()
+    if not instruction:
+        return None
+    instruction = instruction[0].lower() + instruction[1:]
+    return safe_memory_text(f"Wants responses to {instruction}")
 
 
 def parse_memory_candidates(raw: Any, user_text: str) -> list[str]:
