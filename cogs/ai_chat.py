@@ -43,7 +43,8 @@ DEFAULT_PERSONALITY = (
 )
 DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
             "global_requests_per_minute": 10, "max_concurrent": 2,
-            "context_messages": 12, "personality": DEFAULT_PERSONALITY}
+            "max_queued": 50, "context_messages": 12,
+            "personality": DEFAULT_PERSONALITY}
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
 
@@ -110,6 +111,10 @@ class AIChat(commands.Cog):
         self._last_user: dict[int, float] = {}
         self._global: deque[float] = deque()
         self._active = 0
+        self._pending: deque[discord.Message] = deque()
+        self._queue_wake = asyncio.Event()
+        self._dispatcher_task: asyncio.Task | None = None
+        self._response_tasks: set[asyncio.Task] = set()
         self._session: aiohttp.ClientSession | None = None
         self._codex_login_tasks: dict[int, asyncio.Task] = {}
 
@@ -118,6 +123,7 @@ class AIChat(commands.Cog):
         self.settings["user_cooldown_seconds"] = bounded(self.settings.get("user_cooldown_seconds"), 0, 3600, 30)
         self.settings["global_requests_per_minute"] = bounded(self.settings.get("global_requests_per_minute"), 1, 120, 10)
         self.settings["max_concurrent"] = bounded(self.settings.get("max_concurrent"), 1, 10, 2)
+        self.settings["max_queued"] = bounded(self.settings.get("max_queued"), 1, 500, 50)
         self.settings["context_messages"] = bounded(self.settings.get("context_messages"), 1, 40, 12)
         if "provider" in self.settings:
             self.settings["provider"] = str(self.settings["provider"]).strip().lower()
@@ -131,10 +137,17 @@ class AIChat(commands.Cog):
     def _save(self):
         save_json(AI_CHAT_FILE, self.settings)
 
+    async def cog_load(self):
+        self._dispatcher_task = asyncio.create_task(self._dispatch_loop(), name="llm-request-dispatcher")
+
     async def cog_unload(self):
-        for task in self._codex_login_tasks.values():
+        if self._dispatcher_task:
+            self._dispatcher_task.cancel()
+        for task in (*self._codex_login_tasks.values(), *self._response_tasks):
             task.cancel()
         self._codex_login_tasks.clear()
+        self._response_tasks.clear()
+        self._pending.clear()
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -342,24 +355,72 @@ class AIChat(commands.Cog):
         finally:
             self._codex_login_tasks.pop(interaction.user.id, None)
 
-    async def _reserve(self, user_id: int):
+    async def _enqueue(self, message: discord.Message) -> int | None:
+        """Queue a request and return its 1-based position, or None if full."""
+        async with self._lock:
+            if len(self._pending) >= self.settings["max_queued"]:
+                return None
+            self._pending.append(message)
+            position = len(self._pending)
+        self._queue_wake.set()
+        return position
+
+    async def _take_ready(self):
+        """Reserve the oldest eligible request and report when to retry."""
         now = time.monotonic()
         async with self._lock:
             while self._global and now - self._global[0] >= 60:
                 self._global.popleft()
-            last = self._last_user.get(user_id)
-            if last is not None and now - last < self.settings["user_cooldown_seconds"]:
-                return False
-            if len(self._global) >= self.settings["global_requests_per_minute"] or self._active >= self.settings["max_concurrent"]:
-                return False
-            self._last_user[user_id] = now
+            if not self._pending or self._active >= self.settings["max_concurrent"]:
+                return None, None
+            if len(self._global) >= self.settings["global_requests_per_minute"]:
+                return None, max(0.05, 60 - (now - self._global[0]))
+
+            cooldown = self.settings["user_cooldown_seconds"]
+            selected = None
+            retry_in = None
+            for index, message in enumerate(self._pending):
+                last = self._last_user.get(message.author.id)
+                wait = 0 if last is None else cooldown - (now - last)
+                if wait <= 0:
+                    selected = index
+                    break
+                retry_in = wait if retry_in is None else min(retry_in, wait)
+            if selected is None:
+                return None, max(0.05, retry_in or 0.05)
+
+            message = self._pending[selected]
+            del self._pending[selected]
+            self._last_user[message.author.id] = now
             self._global.append(now)
             self._active += 1
-            return True
+            return message, 0
+
+    async def _dispatch_loop(self):
+        try:
+            while True:
+                await self._queue_wake.wait()
+                while True:
+                    self._queue_wake.clear()
+                    message, retry_in = await self._take_ready()
+                    if message is not None:
+                        task = asyncio.create_task(self._process_message(message), name=f"llm-response-{message.id}")
+                        self._response_tasks.add(task)
+                        task.add_done_callback(self._response_tasks.discard)
+                        continue
+                    if retry_in is None:
+                        break
+                    try:
+                        await asyncio.wait_for(self._queue_wake.wait(), timeout=retry_in)
+                    except asyncio.TimeoutError:
+                        self._queue_wake.set()
+        except asyncio.CancelledError:
+            pass
 
     async def _release(self):
         async with self._lock:
             self._active = max(0, self._active - 1)
+        self._queue_wake.set()
 
     async def _triggered(self, message):
         if not self.settings["enabled"] or not self.bot.user or message.author.bot or message.guild is None:
@@ -494,12 +555,20 @@ class AIChat(commands.Cog):
         ready, reason = self._configured()
         if not ready:
             log.warning("LLM mode enabled but unavailable: %s", reason); return
-        if not await self._reserve(message.author.id):
+        position = await self._enqueue(message)
+        if position is None:
             try:
-                await message.add_reaction("🕒")
+                await message.reply("The LLM request queue is full. Please try again later.", mention_author=False)
             except discord.HTTPException:
                 pass
             return
+        # A clock means accepted and queued, rather than rejected by a rate limit.
+        try:
+            await message.add_reaction("🕒")
+        except discord.HTTPException:
+            pass
+
+    async def _process_message(self, message: discord.Message):
         try:
             async with message.channel.typing():
                 answer = await self._generate(await self._context(message), self._system(message))
@@ -544,6 +613,7 @@ class AIChat(commands.Cog):
             f"**Reasoning:** `{self._reasoning()}`\n"
             f"**Provider:** {'configured' if ready else 'not ready: ' + reason}\n"
             f"**Limits:** {self.settings['user_cooldown_seconds']}s/user, {self.settings['global_requests_per_minute']}/minute global, {self.settings['max_concurrent']} concurrent\n"
+            f"**Queue:** {len(self._pending)}/{self.settings['max_queued']} waiting, {self._active} active\n"
             f"**Context:** {self.settings['context_messages']} previous messages\n"
             f"**Personality:** {len(self.settings.get('personality', ''))} characters configured", ephemeral=True)
 
@@ -605,11 +675,13 @@ class AIChat(commands.Cog):
                      user_cooldown: app_commands.Range[int, 0, 3600],
                      global_per_minute: app_commands.Range[int, 1, 120],
                      max_concurrent: app_commands.Range[int, 1, 10],
-                     context_messages: app_commands.Range[int, 1, 40]):
+                     context_messages: app_commands.Range[int, 1, 40],
+                     max_queued: app_commands.Range[int, 1, 500] | None = None):
         self.settings.update(user_cooldown_seconds=user_cooldown,
                              global_requests_per_minute=global_per_minute,
                              max_concurrent=max_concurrent,
-                             context_messages=context_messages)
+                             context_messages=context_messages,
+                             max_queued=max_queued if max_queued is not None else self.settings["max_queued"])
         self._sanitize(); self._save()
         await interaction.response.send_message("LLM limits updated.", ephemeral=True)
 
