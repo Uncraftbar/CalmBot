@@ -285,3 +285,8 @@ class LLMToolRuntime:
         self.pending_action = PendingAMPAction(action, instance.instance_name, display, reason)
         return {"confirmation_required": True, "action": action, "server": display,
                 "message": "No action has run. The administrator must use the confirmation button."}
+
+# main.py auto-loads every Python module in cogs/. This module is a support
+# library rather than a Cog, so provide an intentional no-op extension hook.
+async def setup(bot):
+    return None
