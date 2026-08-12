@@ -95,6 +95,178 @@ class PersonalityModal(discord.ui.Modal, title="Configure CalmBot's personality"
         await interaction.response.send_message("CalmBot personality updated.", ephemeral=True)
 
 
+class ModelConfigModal(discord.ui.Modal, title="LLM model and endpoint"):
+    model = discord.ui.TextInput(label="Model", min_length=1, max_length=100)
+    endpoint = discord.ui.TextInput(
+        label="OpenAI-compatible endpoint (ignored for Codex)", required=False,
+        max_length=500, placeholder="https://example.com/v1/chat/completions")
+
+    def __init__(self, cog: "AIChat"):
+        super().__init__()
+        self.cog = cog
+        self.model.default = cog._model()
+        self.endpoint.default = cog._openai_url()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        model = str(self.model.value).strip()
+        endpoint = str(self.endpoint.value).strip()
+        if self.cog._provider() == "openai":
+            if not re.match(r"^https?://", endpoint) or len(endpoint) > 500:
+                await interaction.response.send_message(
+                    "OpenAI-compatible providers require a valid HTTP(S) endpoint.", ephemeral=True)
+                return
+            self.cog.settings["api_url"] = endpoint
+        self.cog.settings["model"] = model
+        self.cog._sanitize()
+        self.cog._save()
+        await interaction.response.send_message("LLM model settings updated.", ephemeral=True)
+
+
+class LimitsModal(discord.ui.Modal, title="LLM rate limits and context"):
+    user_cooldown = discord.ui.TextInput(label="Per-user cooldown (0-3600 seconds)", required=False, max_length=4)
+    global_per_minute = discord.ui.TextInput(label="Global requests/minute (1-120)", required=False, max_length=3)
+    max_concurrent = discord.ui.TextInput(label="Concurrent requests (1-10)", required=False, max_length=2)
+    context_messages = discord.ui.TextInput(label="Context messages (1-40)", required=False, max_length=2)
+    max_queued = discord.ui.TextInput(label="Maximum queued requests (1-500)", required=False, max_length=3)
+
+    FIELDS = {
+        "user_cooldown": ("user_cooldown_seconds", 0, 3600),
+        "global_per_minute": ("global_requests_per_minute", 1, 120),
+        "max_concurrent": ("max_concurrent", 1, 10),
+        "context_messages": ("context_messages", 1, 40),
+        "max_queued": ("max_queued", 1, 500),
+    }
+
+    def __init__(self, cog: "AIChat"):
+        super().__init__()
+        self.cog = cog
+        for field, (setting, _, _) in self.FIELDS.items():
+            getattr(self, field).default = str(cog.settings[setting])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        updates = {}
+        for field, (setting, low, high) in self.FIELDS.items():
+            raw = str(getattr(self, field).value).strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                await interaction.response.send_message(f"{field.replace('_', ' ').title()} must be a number.", ephemeral=True)
+                return
+            if not low <= value <= high:
+                await interaction.response.send_message(
+                    f"{field.replace('_', ' ').title()} must be between {low} and {high}.", ephemeral=True)
+                return
+            updates[setting] = value
+        if updates:
+            self.cog.settings.update(updates)
+            self.cog._sanitize()
+            self.cog._save()
+        await interaction.response.send_message(
+            "LLM limits updated." if updates else "No LLM limits were changed.", ephemeral=True)
+
+
+class ProviderSelect(discord.ui.Select):
+    def __init__(self, view: "LLMDashboardView"):
+        self.dashboard = view
+        current = view.cog._provider()
+        options = [
+            discord.SelectOption(label="OpenAI-compatible", value="openai", default=current == "openai"),
+            discord.SelectOption(label="ChatGPT/Codex subscription", value="codex", default=current == "codex"),
+        ]
+        super().__init__(placeholder="Provider", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.dashboard.cog.settings["provider"] = self.values[0]
+        self.dashboard.cog._sanitize()
+        self.dashboard.cog._save()
+        self.dashboard.rebuild_selects()
+        await interaction.response.edit_message(
+            embed=self.dashboard.cog._dashboard_embed(), view=self.dashboard)
+
+
+class ReasoningSelect(discord.ui.Select):
+    def __init__(self, view: "LLMDashboardView"):
+        self.dashboard = view
+        current = view.cog._reasoning()
+        options = [discord.SelectOption(label=x, value=x, default=x == current)
+                   for x in ("none", "low", "medium", "high", "xhigh", "max")]
+        super().__init__(placeholder="Reasoning effort", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.dashboard.cog.settings["reasoning_effort"] = self.values[0]
+        self.dashboard.cog._sanitize()
+        self.dashboard.cog._save()
+        self.dashboard.rebuild_selects()
+        await interaction.response.edit_message(
+            embed=self.dashboard.cog._dashboard_embed(), view=self.dashboard)
+
+
+class LLMDashboardView(discord.ui.View):
+    def __init__(self, cog: "AIChat", owner_id: int):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.rebuild_selects()
+        self._refresh_toggle()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This LLM dashboard belongs to another admin.", ephemeral=True)
+            return False
+        return True
+
+    def rebuild_selects(self):
+        for item in list(self.children):
+            if isinstance(item, (ProviderSelect, ReasoningSelect)):
+                self.remove_item(item)
+        self.add_item(ProviderSelect(self))
+        self.add_item(ReasoningSelect(self))
+
+    def _refresh_toggle(self):
+        self.toggle.label = "Disable" if self.cog.settings["enabled"] else "Enable"
+        self.toggle.style = discord.ButtonStyle.danger if self.cog.settings["enabled"] else discord.ButtonStyle.success
+
+    @discord.ui.button(label="Enable", style=discord.ButtonStyle.success, row=2)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.cog.settings["enabled"]:
+            ready, reason = self.cog._configured()
+            if not ready:
+                await interaction.response.send_message(f"Cannot enable LLM mode: {reason}.", ephemeral=True)
+                return
+        self.cog.settings["enabled"] = not self.cog.settings["enabled"]
+        self.cog._save()
+        self._refresh_toggle()
+        await interaction.response.edit_message(embed=self.cog._dashboard_embed(), view=self)
+
+    @discord.ui.button(label="Model / Endpoint", style=discord.ButtonStyle.primary, row=2)
+    async def model_endpoint(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ModelConfigModal(self.cog))
+
+    @discord.ui.button(label="Personality", style=discord.ButtonStyle.secondary, row=2)
+    async def personality(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PersonalityModal(self.cog))
+
+    @discord.ui.button(label="Limits", style=discord.ButtonStyle.secondary, row=2)
+    async def limits(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LimitsModal(self.cog))
+
+    @discord.ui.button(label="OpenAI API Key", style=discord.ButtonStyle.secondary, row=3)
+    async def openai_key(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(OpenAIKeyModal(self.cog))
+
+    @discord.ui.button(label="Codex Login", style=discord.ButtonStyle.secondary, row=3)
+    async def codex_login(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._start_codex_login(interaction)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, row=3)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rebuild_selects()
+        self._refresh_toggle()
+        await interaction.response.edit_message(embed=self.cog._dashboard_embed(), view=self)
+
+
 class AIChat(commands.Cog):
     """Respond to direct bot mentions and replies through an LLM provider."""
     llm_group = app_commands.Group(name="llm", description="Configure LLM responses")
@@ -588,102 +760,82 @@ class AIChat(commands.Cog):
         finally:
             await self._release()
 
-    @llm_group.command(name="enable", description="Enable mention/reply LLM responses")
-    @admin_only()
-    async def enable(self, interaction: discord.Interaction):
+    def _dashboard_embed(self) -> discord.Embed:
         ready, reason = self._configured()
+        embed = discord.Embed(
+            title="CalmBot LLM dashboard",
+            description="Configure mention/reply responses from one place.",
+            color=discord.Color.green() if self.settings["enabled"] else discord.Color.orange())
+        embed.add_field(name="Mode", value="Enabled" if self.settings["enabled"] else "Disabled", inline=True)
+        embed.add_field(name="Provider", value=f"`{self._provider()}`\n{'Ready' if ready else 'Not ready'}", inline=True)
+        embed.add_field(name="Model", value=f"`{self._model()}`\nReasoning: `{self._reasoning()}`", inline=True)
+        embed.add_field(
+            name="Limits",
+            value=(f"{self.settings['user_cooldown_seconds']}s per user · "
+                   f"{self.settings['global_requests_per_minute']}/min global · "
+                   f"{self.settings['max_concurrent']} concurrent\n"
+                   f"Queue: {len(self._pending)}/{self.settings['max_queued']} waiting · {self._active} active"),
+            inline=False)
+        embed.add_field(
+            name="Context and personality",
+            value=(f"{self.settings['context_messages']} previous messages · "
+                   f"{len(self.settings.get('personality', ''))} personality characters"),
+            inline=False)
         if not ready:
-            await interaction.response.send_message(f"Cannot enable LLM mode: {reason}.", ephemeral=True); return
-        self.settings["enabled"] = True; self._save()
-        await interaction.response.send_message(f"LLM responses enabled using `{self._provider()}` / `{self._model()}`.", ephemeral=True)
+            embed.add_field(name="Setup needed", value=reason[:1024], inline=False)
+        embed.set_footer(text="Provider and reasoning menus save immediately. Other settings open private forms.")
+        return embed
 
-    @llm_group.command(name="disable", description="Disable mention/reply LLM responses")
-    @admin_only()
-    async def disable(self, interaction: discord.Interaction):
-        self.settings["enabled"] = False; self._save()
-        await interaction.response.send_message("LLM responses disabled.", ephemeral=True)
-
-    @llm_group.command(name="status", description="Show LLM mode and limits")
-    @admin_only()
-    async def status(self, interaction: discord.Interaction):
-        ready, reason = self._configured()
-        await interaction.response.send_message(
-            f"**LLM mode:** {'enabled' if self.settings['enabled'] else 'disabled'}\n"
-            f"**Provider/model:** `{self._provider()}` / `{self._model()}`\n"
-            f"**Reasoning:** `{self._reasoning()}`\n"
-            f"**Provider:** {'configured' if ready else 'not ready: ' + reason}\n"
-            f"**Limits:** {self.settings['user_cooldown_seconds']}s/user, {self.settings['global_requests_per_minute']}/minute global, {self.settings['max_concurrent']} concurrent\n"
-            f"**Queue:** {len(self._pending)}/{self.settings['max_queued']} waiting, {self._active} active\n"
-            f"**Context:** {self.settings['context_messages']} previous messages\n"
-            f"**Personality:** {len(self.settings.get('personality', ''))} characters configured", ephemeral=True)
-
-    @llm_group.command(name="configure", description="Set the LLM provider, model, reasoning, and endpoint")
-    @app_commands.choices(
-        provider=[app_commands.Choice(name="OpenAI-compatible", value="openai"),
-                  app_commands.Choice(name="ChatGPT/Codex subscription", value="codex")],
-        reasoning=[app_commands.Choice(name=x, value=x) for x in ("none", "low", "medium", "high", "xhigh", "max")],
-    )
-    @admin_only()
-    async def configure(self, interaction: discord.Interaction,
-                        provider: app_commands.Choice[str], model: str,
-                        reasoning: app_commands.Choice[str], endpoint: str | None = None):
-        model = model.strip()
-        if not model or len(model) > 100:
-            await interaction.response.send_message("Model must be 1-100 characters.", ephemeral=True); return
-        if provider.value == "openai":
-            endpoint = (endpoint or self._openai_url()).strip()
-            if not re.match(r"^https?://", endpoint) or len(endpoint) > 500:
-                await interaction.response.send_message("OpenAI-compatible providers require a valid HTTP(S) endpoint.", ephemeral=True); return
-            self.settings["api_url"] = endpoint
-        self.settings.update(provider=provider.value, model=model, reasoning_effort=reasoning.value)
-        self._sanitize(); self._save()
-        ready, reason = self._configured()
-        await interaction.response.send_message(
-            f"LLM configured as `{self._provider()}` / `{self._model()}` with `{self._reasoning()}` reasoning. "
-            + ("Provider is ready." if ready else f"Next step: {reason}."), ephemeral=True)
-
-    @llm_group.command(name="openai_auth", description="Privately save the OpenAI-compatible API key")
-    @admin_only()
-    async def openai_auth(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(OpenAIKeyModal(self))
-
-    @llm_group.command(name="codex_auth", description="Authenticate a ChatGPT/Codex subscription")
-    @admin_only()
-    async def codex_auth(self, interaction: discord.Interaction):
+    async def _start_codex_login(self, interaction: discord.Interaction):
         existing = self._codex_login_tasks.get(interaction.user.id)
         if existing and not existing.done():
-            await interaction.response.send_message("A Codex login is already waiting for you.", ephemeral=True); return
+            await interaction.response.send_message("A Codex login is already waiting for you.", ephemeral=True)
+            return
         try:
             login = await self._request_codex_device_code()
         except Exception as exc:
             log.error("Could not start Codex device authentication: %s", exc)
-            await interaction.response.send_message("Could not start Codex authentication right now.", ephemeral=True); return
+            await interaction.response.send_message("Could not start Codex authentication right now.", ephemeral=True)
+            return
         await interaction.response.send_message(
             f"Open {CODEX_DEVICE_VERIFY_URL} and enter code **`{login['user_code']}`**. "
-            "I will save the credential privately after you approve it. The code expires in 15 minutes.", ephemeral=True)
-        task = asyncio.create_task(self._finish_codex_login(interaction, login), name=f"codex-login-{interaction.user.id}")
+            "I will save the credential privately after you approve it. The code expires in 15 minutes.",
+            ephemeral=True)
+        task = asyncio.create_task(
+            self._finish_codex_login(interaction, login), name=f"codex-login-{interaction.user.id}")
         self._codex_login_tasks[interaction.user.id] = task
 
-    @llm_group.command(name="personality", description="Edit the personality included in CalmBot's prompt")
+    @llm_group.command(name="dashboard", description="Open the complete LLM configuration dashboard")
     @admin_only()
-    async def personality(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(PersonalityModal(self))
+    async def dashboard(self, interaction: discord.Interaction):
+        view = LLMDashboardView(self, interaction.user.id)
+        await interaction.response.send_message(embed=self._dashboard_embed(), view=view, ephemeral=True)
 
-    @llm_group.command(name="limits", description="Set LLM anti-spam and context limits")
+    @llm_group.command(name="limits", description="Change one or more LLM limits; omitted values stay unchanged")
     @admin_only()
     async def limits(self, interaction: discord.Interaction,
-                     user_cooldown: app_commands.Range[int, 0, 3600],
-                     global_per_minute: app_commands.Range[int, 1, 120],
-                     max_concurrent: app_commands.Range[int, 1, 10],
-                     context_messages: app_commands.Range[int, 1, 40],
+                     user_cooldown: app_commands.Range[int, 0, 3600] | None = None,
+                     global_per_minute: app_commands.Range[int, 1, 120] | None = None,
+                     max_concurrent: app_commands.Range[int, 1, 10] | None = None,
+                     context_messages: app_commands.Range[int, 1, 40] | None = None,
                      max_queued: app_commands.Range[int, 1, 500] | None = None):
-        self.settings.update(user_cooldown_seconds=user_cooldown,
-                             global_requests_per_minute=global_per_minute,
-                             max_concurrent=max_concurrent,
-                             context_messages=context_messages,
-                             max_queued=max_queued if max_queued is not None else self.settings["max_queued"])
-        self._sanitize(); self._save()
-        await interaction.response.send_message("LLM limits updated.", ephemeral=True)
+        supplied = {
+            "user_cooldown_seconds": user_cooldown,
+            "global_requests_per_minute": global_per_minute,
+            "max_concurrent": max_concurrent,
+            "context_messages": context_messages,
+            "max_queued": max_queued,
+        }
+        updates = {key: value for key, value in supplied.items() if value is not None}
+        if not updates:
+            await interaction.response.send_message(
+                "No values supplied; nothing changed. Use `/llm dashboard` for the interactive editor.", ephemeral=True)
+            return
+        self.settings.update(updates)
+        self._sanitize()
+        self._save()
+        changed = ", ".join(key.replace("_", " ") for key in updates)
+        await interaction.response.send_message(f"LLM limits updated: {changed}.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
