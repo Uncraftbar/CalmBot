@@ -425,6 +425,12 @@ def get_player_data(status) -> tuple[list[str], Optional[int]]:
         users = getattr(metrics, "active_users", None) if metrics is not None else None
 
     if isinstance(users, dict):
+        # ampapi currently leaves MetricsData as a mapping.  In that shape,
+        # raw_value is the live player count; counting the metric fields would
+        # report 8 players (raw_value, max_value, percent, units, colours, ...).
+        raw_value = users.get("raw_value")
+        if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+            return [], max(0, int(raw_value))
         names = [str(value) for value in users.keys()]
         return names, len(names)
     if isinstance(users, (list, tuple, set)):
