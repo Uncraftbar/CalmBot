@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 import traceback
+from collections import deque
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote
@@ -55,6 +56,9 @@ class ChatBridge(commands.Cog):
         self.high_water_marks = {}
         self.failure_counts = {}
         self.console_listeners = []
+        # Bounded in-memory console history powers authorized, read-only LLM diagnostics.
+        # It intentionally does not persist potentially sensitive server logs to disk.
+        self.console_history = {}
         self.webhook_cache = {}
         self.send_locks = {}
         self.send_queues = {}
@@ -220,6 +224,61 @@ class ChatBridge(commands.Cog):
                 pass
             log.warning(f"Dropped oldest queued AMP event for {name}")
         queue.put_nowait(entry)
+
+    @staticmethod
+    def _console_timestamp(value):
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        raw = str(value or "")
+        amp_epoch = re.fullmatch(r"/Date\((\d+)(?:[+-]\d+)?\)/", raw)
+        try:
+            return (datetime.fromtimestamp(int(amp_epoch.group(1)) / 1000, tz=timezone.utc)
+                    if amp_epoch else datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except (ValueError, OSError, OverflowError):
+            return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _redact_console_line(text):
+        """Remove common credentials and network identifiers before LLM exposure."""
+        value = str(text or "").replace("\x00", "")[:2000]
+        value = re.sub(r"(?i)\b(authorization|password|passwd|token|secret|api[_ -]?key)\s*[:=]\s*\S+",
+                       r"\1=[REDACTED]", value)
+        value = re.sub(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]+=*", r"\1 [REDACTED]", value)
+        value = re.sub(r"(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?", "[IP REDACTED]", value)
+        return value
+
+    def _remember_console_entries(self, source_name, entries):
+        history = self.console_history.setdefault(source_name, deque(maxlen=2000))
+        for entry in entries:
+            contents = str(getattr(entry, "contents", "") or "").strip()
+            if not contents:
+                continue
+            history.append({
+                "timestamp": self._console_timestamp(getattr(entry, "timestamp", None)),
+                "source": str(getattr(entry, "source", "") or "")[:80],
+                "type": str(getattr(entry, "type", "") or "")[:40],
+                "contents": contents[:2000],
+            })
+
+    def recent_console(self, source_name, *, minutes=15, limit=120):
+        """Return a bounded, redacted snapshot; this never sends a console command."""
+        minutes = max(1, min(int(minutes), 60))
+        limit = max(1, min(int(limit), 200))
+        cutoff = datetime.now(timezone.utc).timestamp() - minutes * 60
+        result = []
+        for item in reversed(self.console_history.get(source_name, ())):
+            if item["timestamp"].timestamp() < cutoff:
+                break
+            result.append({
+                "timestamp": item["timestamp"].isoformat(),
+                "source": item["source"],
+                "type": item["type"],
+                "contents": self._redact_console_line(item["contents"]),
+            })
+            if len(result) >= limit:
+                break
+        result.reverse()
+        return result
 
     async def run_console_command(self, instance, command, pattern, timeout=10.0, quiet_period=0.5):
         """Register a pushed-event listener before sending a console command."""
@@ -1215,6 +1274,7 @@ class ChatBridge(commands.Cog):
 
         for source_name, updates in updates_map.items():
             if not updates.console_entries: continue
+            self._remember_console_entries(source_name, updates.console_entries)
 
             # Pre-process and sort entries by timestamp
             parsed_entries = []

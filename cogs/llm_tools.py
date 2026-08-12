@@ -23,6 +23,7 @@ log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
 
 READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "connection_diagnostic", "stay_silent", "end_conversation"}
+ADMIN_READ_TOOL_NAMES = {"read_server_console"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 
 TOOL_DEFINITIONS = [
@@ -122,6 +123,19 @@ TOOL_DEFINITIONS = [
         }, "additionalProperties": False},
     },
     {
+        "name": "read_server_console",
+        "description": (
+            "Read recent, redacted AMP console history for one public server to diagnose an earlier "
+            "connection failure. This is passive and sends no console command. Administrator-only."
+        ),
+        "parameters": {
+            "type": "object", "properties": {
+                "server": {"type": "string", "maxLength": 100, "description": "Public server name; spaces and punctuation are ignored when matching"},
+                "minutes": {"type": "integer", "minimum": 1, "maximum": 60, "default": 15},
+            }, "required": ["server"], "additionalProperties": False,
+        },
+    },
+    {
         "name": "request_amp_action",
         "description": (
             "Prepare an administrator confirmation for starting, stopping, or restarting an AMP server. "
@@ -139,12 +153,12 @@ TOOL_DEFINITIONS = [
 
 
 def openai_tools(include_write: bool) -> list[dict]:
-    names = READ_TOOL_NAMES | (WRITE_TOOL_NAMES if include_write else set())
+    names = READ_TOOL_NAMES | ((ADMIN_READ_TOOL_NAMES | WRITE_TOOL_NAMES) if include_write else set())
     return [{"type": "function", "function": item} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
 def responses_tools(include_write: bool) -> list[dict]:
-    names = READ_TOOL_NAMES | (WRITE_TOOL_NAMES if include_write else set())
+    names = READ_TOOL_NAMES | ((ADMIN_READ_TOOL_NAMES | WRITE_TOOL_NAMES) if include_write else set())
     return [{"type": "function", **item, "strict": False} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
@@ -275,6 +289,8 @@ class LLMToolRuntime:
                 return json.dumps(await self._search_community_docs(args), ensure_ascii=False)
             if name == "connection_diagnostic":
                 return json.dumps(await self._connection_diagnostic(args), ensure_ascii=False)
+            if name == "read_server_console":
+                return json.dumps(await self._read_server_console(args), ensure_ascii=False)
             if name == "request_amp_action":
                 return json.dumps(await self._request_amp_action(args), ensure_ascii=False)
             return json.dumps({"error": "Unknown or unavailable tool"})
@@ -527,6 +543,57 @@ class LLMToolRuntime:
             elif item.get("players") is None: findings.append(f"{item['server']} is running, but AMP player metrics are unavailable")
             else: findings.append(f"{item['server']} is running and AMP reports {item['players']} player(s)")
         return {"verified": True, "findings": findings, "limits": ["This checks AMP state only; it cannot inspect the player's client, DNS path, firewall, account, or mod mismatch."], "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
+
+    @staticmethod
+    def _server_key(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    async def _read_server_console(self, args):
+        # Console output can contain private operational data. Authorization is
+        # enforced here in ordinary code; model output alone can never bypass it.
+        if not self.actor_is_admin:
+            log.warning("LLM console permission denied: guild=%s user=%s",
+                        getattr(self.message.guild, "id", None), self.message.author.id)
+            return {"error": "Denied: Discord Administrator permission is required"}
+        requested = self._server_key(str(args.get("server", ""))[:100])
+        if not requested:
+            return {"error": "A public server name is required"}
+        public_instances = await self._public_instances()
+        matches = []
+        for instance in public_instances:
+            aliases = {self._server_key(instance.instance_name), self._server_key(instance.friendly_name)}
+            if requested in aliases:
+                matches.append(instance)
+        if len(matches) != 1:
+            public = [x.friendly_name or x.instance_name for x in public_instances]
+            return {"error": "Server name did not identify exactly one public server", "public_servers": public}
+        instance = matches[0]
+        display = instance.friendly_name or instance.instance_name
+        bridge = self.cog.bot.get_cog("ChatBridge")
+        if bridge is None or not hasattr(bridge, "recent_console"):
+            return {"error": "Recent console history is unavailable"}
+        try:
+            minutes = max(1, min(int(args.get("minutes", 15)), 60))
+        except (TypeError, ValueError):
+            minutes = 15
+        history_name = next((name for name, value in bridge.instances.items()
+                             if value.instance_name == instance.instance_name), display)
+        entries = bridge.recent_console(history_name, minutes=minutes, limit=120)
+        return {
+            "verified": True,
+            "server": display,
+            "minutes": minutes,
+            "entries": entries,
+            "entry_count": len(entries),
+            "limits": [
+                "History is in-memory and only covers console events observed since CalmBot started.",
+                "Sensitive-looking credentials and IP addresses are redacted before model access.",
+                "No console command was sent.",
+            ],
+            "source": "AMP real-time console event stream with polling fallback",
+            "fresh_at": int(time.time()),
+            "cached": False,
+        }
 
     async def _request_amp_action(self, args):
         # Hard authorization gate in ordinary code, independent of model instructions.
