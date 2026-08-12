@@ -18,6 +18,7 @@ from cogs.utils import (
     admin_only,
     fetch_valid_instances, 
     get_instance_state,
+    get_player_data,
     info_embed,
     error_embed,
     success_embed
@@ -383,9 +384,7 @@ class AMP(commands.Cog):
             try:
                 status = await asyncio.wait_for(inst.get_instance_status(), timeout=8)
                 state = get_instance_state(status)
-                raw_users = getattr(status, "active_users", None)
-                if isinstance(raw_users, (list, dict)):
-                    users = len(raw_users)
+                _names, users = get_player_data(status)
             except Exception:
                 pass
             emoji = "🟢" if state.lower() == "running" else "🔴" if state.lower() == "stopped" else "🟡"

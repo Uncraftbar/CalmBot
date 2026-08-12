@@ -11,9 +11,10 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import config
 import discord
 
-from cogs.utils import fetch_valid_instances, get_instance_state, get_logger
+from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, get_player_data
 
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
@@ -196,14 +197,29 @@ class LLMToolRuntime:
     async def _instances(self):
         return await asyncio.wait_for(fetch_valid_instances(), timeout=15)
 
+    async def _public_instances(self):
+        """Apply the same public-server allowlist used by /servers."""
+        instances = await self._instances()
+        allowlist = {
+            str(name).strip().casefold()
+            for name in getattr(config, "PUBLIC_SERVER_ALLOWLIST", [])
+            if str(name).strip()
+        }
+        if not allowlist:
+            return instances
+        return [
+            instance for instance in instances
+            if str(instance.instance_name).casefold() in allowlist
+            or str(instance.friendly_name or "").casefold() in allowlist
+        ]
+
     async def _server_status(self):
         result = []
-        for instance in await self._instances():
+        for instance in await self._public_instances():
             name = instance.friendly_name or instance.instance_name
             try:
                 status = await asyncio.wait_for(instance.get_instance_status(), timeout=8)
-                users = getattr(status, "active_users", None)
-                count = len(users) if isinstance(users, (list, dict)) else users if isinstance(users, int) else None
+                _names, count = get_player_data(status)
                 result.append({"server": name, "state": get_instance_state(status), "players": count})
             except Exception:
                 result.append({"server": name, "state": "Unknown", "players": None})
@@ -211,18 +227,17 @@ class LLMToolRuntime:
 
     async def _online_players(self):
         result = []
-        for instance in await self._instances():
+        for instance in await self._public_instances():
             name = instance.friendly_name or instance.instance_name
             try:
                 status = await asyncio.wait_for(instance.get_instance_status(), timeout=8)
-                users = getattr(status, "active_users", None)
-                if isinstance(users, dict):
-                    players = [str(x) for x in users.keys()]
-                elif isinstance(users, list):
-                    players = [str(getattr(x, "name", x)) for x in users]
-                else:
-                    players = []
-                result.append({"server": name, "players": players[:100], "count": len(players)})
+                players, count = get_player_data(status)
+                item = {"server": name, "players": players[:100], "count": count}
+                if count is None:
+                    item["error"] = "player count unavailable"
+                elif count and not players:
+                    item["note"] = "AMP reports a count but not player names"
+                result.append(item)
             except Exception:
                 result.append({"server": name, "error": "status unavailable"})
         return {"servers": result}

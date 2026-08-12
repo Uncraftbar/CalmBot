@@ -417,6 +417,31 @@ async def fetch_valid_instances() -> list:
         return []
 
 
+def get_player_data(status) -> tuple[list[str], Optional[int]]:
+    """Extract player names/count from AMP status, including MetricsData."""
+    users = getattr(status, "active_users", None)
+    if users is None:
+        metrics = getattr(status, "metrics", None)
+        users = getattr(metrics, "active_users", None) if metrics is not None else None
+
+    if isinstance(users, dict):
+        names = [str(value) for value in users.keys()]
+        return names, len(names)
+    if isinstance(users, (list, tuple, set)):
+        names = [
+            str(getattr(value, "user_name", getattr(value, "name", value)))
+            for value in users
+        ]
+        return names, len(names)
+    if isinstance(users, (int, float)) and not isinstance(users, bool):
+        return [], max(0, int(users))
+
+    raw_value = getattr(users, "raw_value", None)
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return [], max(0, int(raw_value))
+    return [], None
+
+
 def get_instance_state(status) -> str:
     """
     Extract human-readable state from AMP instance status.
