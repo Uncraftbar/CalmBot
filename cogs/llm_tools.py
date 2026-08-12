@@ -19,7 +19,7 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
 
-READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack"}
+READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 
 TOOL_DEFINITIONS = [
@@ -49,6 +49,33 @@ TOOL_DEFINITIONS = [
             "type": "object", "properties": {
                 "id": {"type": "integer", "minimum": 1},
             }, "required": ["id"], "additionalProperties": False,
+        },
+    },
+    {
+        "name": "query_modpack_index",
+        "description": (
+            "Query any public Modpack Index API resource. Supports listing and details for authors, "
+            "categories, launchers, Minecraft versions, modpacks, and mods; category/launcher/version "
+            "mod and modpack memberships; mods in a modpack; and modpacks containing a mod."
+        ),
+        "parameters": {
+            "type": "object", "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [
+                        "list_authors", "get_author", "list_categories", "get_category",
+                        "category_mods", "category_modpacks", "list_launchers", "get_launcher",
+                        "launcher_mods", "launcher_modpacks", "list_minecraft_versions",
+                        "get_minecraft_version", "minecraft_version_mods",
+                        "minecraft_version_modpacks", "list_modpacks", "get_modpack",
+                        "modpack_mods", "list_mods", "get_mod", "mod_modpacks"
+                    ]
+                },
+                "id": {"type": "integer", "minimum": 1, "description": "Required for get/relationship operations"},
+                "name": {"type": "string", "maxLength": 100, "description": "Optional name search for list_mods/list_modpacks"},
+                "page": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10}
+            }, "required": ["operation"], "additionalProperties": False
         },
     },
     {
@@ -187,6 +214,8 @@ class LLMToolRuntime:
                 return json.dumps(await self._search_modpacks(args), ensure_ascii=False)
             if name == "get_modpack":
                 return json.dumps(await self._get_modpack(args), ensure_ascii=False)
+            if name == "query_modpack_index":
+                return json.dumps(await self._query_modpack_index(args), ensure_ascii=False)
             if name == "request_amp_action":
                 return json.dumps(await self._request_amp_action(args), ensure_ascii=False)
             return json.dumps({"error": "Unknown or unavailable tool"})
@@ -245,10 +274,78 @@ class LLMToolRuntime:
     async def _mpi_get(self, path: str, params: dict | None = None):
         session = await self.cog._http()
         url = f"{MODPACK_INDEX_URL}/{path.lstrip('/')}"
-        async with session.get(url, params=params, headers={"Accept": "application/json"}) as response:
+        async with session.get(url, params=params, headers={"Accept": "application/json", "User-Agent": "CalmBot/1.0 (Discord integration; github.com/Uncraftbar/CalmBot)"}) as response:
             if response.status != 200:
                 raise RuntimeError(f"Modpack Index HTTP {response.status}")
             return await response.json(content_type=None)
+
+    @staticmethod
+    def _bounded_api_value(value, *, depth: int = 0):
+        """Keep API results useful without letting huge relationships consume the LLM context."""
+        if depth >= 5:
+            return "[nested data omitted]"
+        if isinstance(value, dict):
+            return {str(k)[:80]: LLMToolRuntime._bounded_api_value(v, depth=depth + 1)
+                    for k, v in list(value.items())[:60]}
+        if isinstance(value, list):
+            items = [LLMToolRuntime._bounded_api_value(v, depth=depth + 1) for v in value[:25]]
+            if len(value) > 25:
+                items.append({"omitted_items": len(value) - 25})
+            return items
+        if isinstance(value, str):
+            return value[:1000]
+        return value
+
+    async def _query_modpack_index(self, args):
+        operations = {
+            "list_authors": ("authors", False, False),
+            "get_author": ("author/{id}", True, False),
+            "list_categories": ("categories", False, False),
+            "get_category": ("category/{id}", True, False),
+            "category_mods": ("category/{id}/mods", True, True),
+            "category_modpacks": ("category/{id}/modpacks", True, True),
+            "list_launchers": ("launchers", False, False),
+            "get_launcher": ("launcher/{id}", True, False),
+            "launcher_mods": ("launcher/{id}/mods", True, True),
+            "launcher_modpacks": ("launcher/{id}/modpacks", True, True),
+            "list_minecraft_versions": ("minecraft/versions", False, False),
+            "get_minecraft_version": ("minecraft/version/{id}", True, False),
+            "minecraft_version_mods": ("minecraft/version/{id}/mods", True, True),
+            "minecraft_version_modpacks": ("minecraft/version/{id}/modpacks", True, True),
+            "list_modpacks": ("modpacks", False, True),
+            "get_modpack": ("modpack/{id}", True, False),
+            "modpack_mods": ("modpack/{id}/mods", True, False),
+            "list_mods": ("mods", False, True),
+            "get_mod": ("mod/{id}", True, False),
+            "mod_modpacks": ("mod/{id}/modpacks", True, True),
+        }
+        operation = str(args.get("operation", ""))
+        spec = operations.get(operation)
+        if spec is None:
+            return {"error": "Unsupported Modpack Index operation"}
+        path, needs_id, paginated = spec
+        if needs_id:
+            try:
+                item_id = int(args.get("id"))
+            except (TypeError, ValueError):
+                return {"error": "This operation requires a valid numeric id"}
+            if item_id < 1:
+                return {"error": "This operation requires a valid numeric id"}
+            path = path.format(id=item_id)
+        params = None
+        if paginated or operation.startswith("list_"):
+            try:
+                page = max(1, int(args.get("page", 1)))
+                limit = min(25, max(1, int(args.get("limit", 10))))
+            except (TypeError, ValueError):
+                return {"error": "page and limit must be integers"}
+            params = {"page": page, "limit": limit}
+            if operation in {"list_mods", "list_modpacks"}:
+                query = str(args.get("name", "")).strip()[:100]
+                if query:
+                    params["name"] = query
+        payload = await self._mpi_get(path, params)
+        return {"operation": operation, "result": self._bounded_api_value(payload)}
 
     async def _search_modpacks(self, args):
         name = str(args.get("name", "")).strip()[:100]
@@ -267,7 +364,7 @@ class LLMToolRuntime:
             return {"error": "A valid numeric modpack ID is required"}
         payload = await self._mpi_get(f"modpack/{pack_id}")
         data = payload.get("data", payload) if isinstance(payload, dict) else payload
-        return self._pack_summary(data, detailed=True) if isinstance(data, dict) else {"error": "Unexpected API response"}
+        return self._bounded_api_value(data) if isinstance(data, dict) else {"error": "Unexpected API response"}
 
     @staticmethod
     def _pack_summary(pack: dict, detailed: bool = False):

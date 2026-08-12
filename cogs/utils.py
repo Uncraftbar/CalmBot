@@ -443,30 +443,45 @@ def get_player_data(status) -> tuple[list[str], Optional[int]]:
 
 
 def get_instance_state(status) -> str:
-    """
-    Extract human-readable state from AMP instance status.
-    
-    Args:
-        status: AMP instance status object
-        
-    Returns:
-        Human-readable state string
+    """Return the managed application's state, not merely AMP's container state.
+
+    AMP exposes both ``running`` (the AMP instance/container is reachable) and
+    ``app_state`` (the actual game process). A stopped game inside a running AMP
+    container must be reported as stopped.
     """
     try:
-        if hasattr(status, 'state') and status.state:
-            state_str = str(status.state)
-            if '.' in state_str:
-                state_val = state_str.split('.')[-1].replace('_', ' ').capitalize()
-            else:
-                state_val = state_str.replace('_', ' ').capitalize()
-            
-            # Treat 'Ready' as 'Running' for user clarity
-            return 'Running' if state_val.lower() == 'ready' else state_val
-            
-        elif hasattr(status, 'running'):
-            return 'Running' if status.running else 'Stopped'
-            
+        # app_state is authoritative for the game/application. Depending on the
+        # ampapi/AMP version it can be an enum, integer, or string.
+        app_state = getattr(status, "app_state", None)
+        if app_state is not None:
+            name = getattr(app_state, "name", None)
+            raw = name if name is not None else app_state
+            numeric_states = {
+                -1: "Unknown", 0: "Stopped", 5: "Pre start", 7: "Configuring",
+                10: "Starting", 20: "Running", 30: "Restarting", 40: "Stopping",
+                45: "Preparing for sleep", 50: "Sleeping", 60: "Waiting",
+                70: "Installing", 75: "Updating", 80: "Awaiting user input",
+                100: "Failed", 200: "Suspended", 250: "Maintenance", 999: "Unknown",
+            }
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                return numeric_states.get(int(raw), str(int(raw)))
+            value = str(raw).split(".")[-1].replace("_", " ").strip()
+            if value and value.casefold() not in {"undefined", "indeterminate", "none"}:
+                return "Running" if value.casefold() == "ready" else value.capitalize()
+
+        # Some API responses use state for the application state.
+        state = getattr(status, "state", None)
+        if state is not None:
+            raw = getattr(state, "name", state)
+            value = str(raw).split(".")[-1].replace("_", " ").strip()
+            if value and value.casefold() not in {"undefined", "indeterminate", "none"}:
+                return "Running" if value.casefold() == "ready" else value.capitalize()
+
+        # Last-resort fallback: this says whether AMP itself is reachable, and is
+        # intentionally used only when no application state was supplied.
+        running = getattr(status, "running", None)
+        if isinstance(running, bool):
+            return "Running" if running else "Stopped"
     except Exception:
         pass
-    
-    return 'Unknown'
+    return "Unknown"
