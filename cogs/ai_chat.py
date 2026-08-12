@@ -23,6 +23,7 @@ from discord.ext import commands
 import config
 from cogs.utils import admin_only, get_logger, load_json, save_json
 from cogs.llm_tools import AMPActionConfirmView, LLMToolRuntime, openai_tools, responses_tools
+from cogs.ai_chat_input import collect_attachments
 
 log = get_logger("ai_chat")
 AI_CHAT_FILE = os.path.join("data", "ai_chat.json")
@@ -45,6 +46,7 @@ DEFAULT_PERSONALITY = (
 DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
             "global_requests_per_minute": 10, "max_concurrent": 2,
             "max_queued": 50, "context_messages": 12,
+            "followup_seconds": 300, "fallback_model": "",
             "personality": DEFAULT_PERSONALITY}
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
@@ -102,12 +104,16 @@ class ModelConfigModal(discord.ui.Modal, title="LLM model and endpoint"):
     endpoint = discord.ui.TextInput(
         label="OpenAI-compatible endpoint (ignored for Codex)", required=False,
         max_length=500, placeholder="https://example.com/v1/chat/completions")
+    fallback_model = discord.ui.TextInput(label="Fallback model (optional)", required=False, max_length=100)
+    followup_seconds = discord.ui.TextInput(label="Follow-up window seconds (0-1800)", required=False, max_length=4)
 
     def __init__(self, cog: "AIChat"):
         super().__init__()
         self.cog = cog
         self.model.default = cog._model()
         self.endpoint.default = cog._openai_url()
+        self.fallback_model.default = str(cog.settings.get("fallback_model") or "")
+        self.followup_seconds.default = str(cog.settings.get("followup_seconds", 300))
 
     async def on_submit(self, interaction: discord.Interaction):
         model = str(self.model.value).strip()
@@ -119,6 +125,14 @@ class ModelConfigModal(discord.ui.Modal, title="LLM model and endpoint"):
                 return
             self.cog.settings["api_url"] = endpoint
         self.cog.settings["model"] = model
+        self.cog.settings["fallback_model"] = str(self.fallback_model.value).strip()
+        try:
+            followup = int(str(self.followup_seconds.value or "300"))
+        except ValueError:
+            await interaction.response.send_message("Follow-up window must be an integer from 0 to 1800.", ephemeral=True); return
+        if not 0 <= followup <= 1800:
+            await interaction.response.send_message("Follow-up window must be from 0 to 1800 seconds.", ephemeral=True); return
+        self.cog.settings["followup_seconds"] = followup
         self.cog._sanitize()
         self.cog._save()
         await interaction.response.send_message("LLM model settings updated.", ephemeral=True)
@@ -292,6 +306,11 @@ class AIChat(commands.Cog):
         self._response_tasks: set[asyncio.Task] = set()
         self._session: aiohttp.ClientSession | None = None
         self._codex_login_tasks: dict[int, asyncio.Task] = {}
+        self._followups: dict[tuple[int, int, int], float] = {}
+        self._processing_users: set[tuple[int, int, int]] = set()
+        self._enqueue_rejection: dict[int, str] = {}
+        self._usage = {"requests": 0, "succeeded": 0, "failed": 0, "tool_calls": 0}
+        self._recent_failures: deque[dict[str, Any]] = deque(maxlen=8)
 
     def _sanitize(self):
         self.settings["enabled"] = bool(self.settings.get("enabled", False))
@@ -300,6 +319,8 @@ class AIChat(commands.Cog):
         self.settings["max_concurrent"] = bounded(self.settings.get("max_concurrent"), 1, 10, 2)
         self.settings["max_queued"] = bounded(self.settings.get("max_queued"), 1, 500, 50)
         self.settings["context_messages"] = bounded(self.settings.get("context_messages"), 1, 40, 12)
+        self.settings["followup_seconds"] = bounded(self.settings.get("followup_seconds"), 0, 1800, 300)
+        self.settings["fallback_model"] = str(self.settings.get("fallback_model") or "").strip()[:100]
         if "provider" in self.settings:
             self.settings["provider"] = str(self.settings["provider"]).strip().lower()
             if self.settings["provider"] not in VALID_PROVIDERS:
@@ -533,7 +554,14 @@ class AIChat(commands.Cog):
     async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool]:
         """Queue a request and report whether a configured limit delays it."""
         async with self._lock:
+            key = (message.guild.id, message.channel.id, message.author.id)
+            if key in self._processing_users or any(
+                (item.guild.id, item.channel.id, item.author.id) == key for item in self._pending
+            ):
+                self._enqueue_rejection[message.id] = "duplicate"
+                return None, False
             if len(self._pending) >= self.settings["max_queued"]:
+                self._enqueue_rejection[message.id] = "full"
                 return None, False
             now = time.monotonic()
             while self._global and now - self._global[0] >= 60:
@@ -582,6 +610,7 @@ class AIChat(commands.Cog):
             self._last_user[message.author.id] = now
             self._global.append(now)
             self._active += 1
+            self._processing_users.add((message.guild.id, message.channel.id, message.author.id))
             return message, 0
 
     async def _dispatch_loop(self):
@@ -605,15 +634,20 @@ class AIChat(commands.Cog):
         except asyncio.CancelledError:
             pass
 
-    async def _release(self):
+    async def _release(self, message=None):
         async with self._lock:
             self._active = max(0, self._active - 1)
+            if message is not None:
+                self._processing_users.discard((message.guild.id, message.channel.id, message.author.id))
         self._queue_wake.set()
 
     async def _triggered(self, message):
         if not self.settings["enabled"] or not self.bot.user or message.author.bot or message.guild is None:
             return False
         if self.bot.user in message.mentions:
+            return True
+        key = (message.guild.id, message.channel.id, message.author.id)
+        if self._followups.get(key, 0) > time.monotonic():
             return True
         ref = message.reference
         if not ref or not ref.message_id:
@@ -628,25 +662,44 @@ class AIChat(commands.Cog):
 
     @staticmethod
     def _text(message, bot_id):
-        text = re.sub(rf"<@!?{bot_id}>", "", message.content or "").strip()
-        urls = [a.url for a in getattr(message, "attachments", [])[:3]]
-        return ((text + "\nAttachments: " + " ".join(urls)).strip() if urls else text) or "(no text)"
+        return re.sub(rf"<@!?{bot_id}>", "", message.content or "").strip() or "(no text)"
 
-    async def _context(self, trigger):
+    async def _reply_chain(self, trigger):
+        chain, seen, current = [], set(), trigger
+        for _ in range(min(12, self.settings["context_messages"])):
+            ref = getattr(current, "reference", None)
+            if not ref or not ref.message_id or ref.message_id in seen:
+                break
+            seen.add(ref.message_id)
+            parent = getattr(ref, "resolved", None)
+            if parent is None:
+                try:
+                    parent = await trigger.channel.fetch_message(ref.message_id)
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    break
+            chain.append(parent); current = parent
+        return list(reversed(chain))
+
+    async def _context(self, trigger, attachment_text=""):
+        chain = await self._reply_chain(trigger)
+        included = {item.id for item in chain}
         previous = []
         async for item in trigger.channel.history(limit=self.settings["context_messages"] + 1, before=trigger):
-            if not item.author.bot or item.author.id == self.bot.user.id:
+            if item.id not in included and (not item.author.bot or item.author.id == self.bot.user.id):
                 previous.append(item)
-            if len(previous) >= self.settings["context_messages"]:
+            if len(previous) + len(chain) >= self.settings["context_messages"]:
                 break
+        ordered = (list(reversed(previous)) + chain)[-self.settings["context_messages"]:]
         result = []
-        for item in reversed(previous):
+        for item in ordered:
             text = self._text(item, self.bot.user.id)[:4000]
             if item.author.id == self.bot.user.id:
                 result.append({"role": "assistant", "content": text})
             else:
                 result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
-        result.append({"role": "user", "content": f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"[:4000]})
+        current = f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
+        if attachment_text: current += "\n\n" + attachment_text
+        result.append({"role": "user", "content": current[:20000]})
         return result
 
     def _system(self, message):
@@ -670,12 +723,12 @@ class AIChat(commands.Cog):
             result["tool_calls"] = message["tool_calls"]
         return result
 
-    async def _openai(self, messages, system, runtime: LLMToolRuntime):
+    async def _openai(self, messages, system, runtime: LLMToolRuntime, model: str | None = None):
         url = self._openai_url().rstrip("/")
         if url.endswith("/v1"):
             url += "/chat/completions"
         conversation = [{"role": "system", "content": system}, *messages]
-        images = self._image_urls(runtime.message)
+        images = list(getattr(runtime, "image_data_urls", []))
         if images:
             last = conversation[-1]
             last["content"] = [{"type": "text", "text": last["content"]}] + [
@@ -683,7 +736,7 @@ class AIChat(commands.Cog):
         session = await self._http()
         for _ in range(MAX_TOOL_ROUNDS):
             payload = {
-                "model": self._model(), "messages": conversation,
+                "model": model or self._model(), "messages": conversation,
                 "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
                 "temperature": float(self._setting("temperature", "AI_CHAT_TEMPERATURE", 0.7)),
                 "tools": openai_tools(runtime.actor_is_admin), "tool_choice": "auto",
@@ -712,7 +765,7 @@ class AIChat(commands.Cog):
         # evidence. Force one tool-free synthesis instead of turning that into a user-facing
         # generic failure after the configured tool-round limit.
         payload = {
-            "model": self._model(), "messages": conversation,
+            "model": model or self._model(), "messages": conversation,
             "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
             "temperature": float(self._setting("temperature", "AI_CHAT_TEMPERATURE", 0.7)),
             "tool_choice": "none",
@@ -783,13 +836,13 @@ class AIChat(commands.Cog):
             raise RuntimeError("Codex stream ended without a completed response")
         raise RuntimeError("Codex authentication failed after refresh")
 
-    async def _codex(self, messages, system, runtime: LLMToolRuntime):
+    async def _codex(self, messages, system, runtime: LLMToolRuntime, model: str | None = None):
         token, account = await self._codex_auth()
         converted = [{"type": "message", "role": item["role"],
                       "content": [{"type": "output_text" if item["role"] == "assistant" else "input_text",
                                    "text": item["content"]}]}
                      for item in messages]
-        images = self._image_urls(runtime.message)
+        images = list(getattr(runtime, "image_data_urls", []))
         if images:
             converted[-1]["content"].extend({"type": "input_image", "image_url": url} for url in images)
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
@@ -798,7 +851,7 @@ class AIChat(commands.Cog):
             headers["ChatGPT-Account-Id"] = str(account)
         conversation = list(converted)
         for _ in range(MAX_TOOL_ROUNDS):
-            payload = {"model": self._model(), "instructions": system, "input": conversation,
+            payload = {"model": model or self._model(), "instructions": system, "input": conversation,
                        "tools": responses_tools(runtime.actor_is_admin), "tool_choice": "auto",
                        "parallel_tool_calls": False, "store": False, "stream": True,
                        # Stateless reasoning-model tool continuations must carry the
@@ -821,7 +874,7 @@ class AIChat(commands.Cog):
                 conversation.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": output})
         # Do one final tool-free pass. This guarantees a useful answer from the evidence
         # already collected even if the model attempted a redundant tool call after the round limit.
-        payload = {"model": self._model(), "instructions": system, "input": conversation,
+        payload = {"model": model or self._model(), "instructions": system, "input": conversation,
                    "tools": [], "tool_choice": "none", "store": False, "stream": True,
                    "include": ["reasoning.encrypted_content"]}
         effort = self._reasoning()
@@ -846,9 +899,19 @@ class AIChat(commands.Cog):
         return result
 
     async def _generate(self, messages, system, runtime: LLMToolRuntime):
-        if self._provider() == "codex":
-            return await self._codex(messages, system, runtime)
-        return await self._openai(messages, system, runtime)
+        provider = self._provider()
+        try:
+            if provider == "codex":
+                return await self._codex(messages, system, runtime)
+            return await self._openai(messages, system, runtime)
+        except Exception:
+            fallback = self.settings.get("fallback_model", "")
+            if not fallback or fallback == self._model():
+                raise
+            log.warning("Primary LLM model failed; trying configured fallback model")
+            if provider == "codex":
+                return await self._codex(messages, system, runtime, fallback)
+            return await self._openai(messages, system, runtime, fallback)
 
     @staticmethod
     def _chunks(text, limit=1900):
@@ -871,8 +934,11 @@ class AIChat(commands.Cog):
             log.warning("LLM mode enabled but unavailable: %s", reason); return
         position, delayed = await self._enqueue(message)
         if position is None:
+            rejection = self._enqueue_rejection.pop(message.id, "full")
+            text = ("You already have an LLM request queued or running here." if rejection == "duplicate"
+                    else "The LLM request queue is full. Please try again later.")
             try:
-                await message.reply("The LLM request queue is full. Please try again later.", mention_author=False)
+                await message.reply(text, mention_author=False)
             except discord.HTTPException:
                 pass
             return
@@ -886,9 +952,14 @@ class AIChat(commands.Cog):
 
     async def _process_message(self, message: discord.Message):
         try:
+            self._usage["requests"] += 1
             runtime = LLMToolRuntime(self, message)
+            prepared = await collect_attachments(await self._http(), getattr(message, "attachments", ()))
+            runtime.image_data_urls = prepared.image_data_urls
+            if prepared.skipped:
+                log.info("LLM skipped %d attachment(s) for message %s", len(prepared.skipped), message.id)
             async with message.channel.typing():
-                answer = await self._generate(await self._context(message), self._system(message), runtime)
+                answer = await self._generate(await self._context(message, prepared.text), self._system(message), runtime)
             if not answer:
                 raise RuntimeError("Empty LLM response")
             chunks = self._chunks(answer)
@@ -896,6 +967,10 @@ class AIChat(commands.Cog):
             await message.reply(chunks[0], mention_author=False, allowed_mentions=mentions)
             for chunk in chunks[1:]:
                 await message.channel.send(chunk, allowed_mentions=mentions)
+            self._usage["succeeded"] += 1
+            self._usage["tool_calls"] += runtime.tool_calls
+            if self.settings["followup_seconds"]:
+                self._followups[(message.guild.id, message.channel.id, message.author.id)] = time.monotonic() + self.settings["followup_seconds"]
             if runtime.pending_action:
                 await message.reply(
                     f"Administrator confirmation required: **{runtime.pending_action.action}** "
@@ -903,7 +978,9 @@ class AIChat(commands.Cog):
                     mention_author=False, allowed_mentions=mentions,
                     view=AMPActionConfirmView(runtime.pending_action, message.author.id, message.guild.id))
         except Exception as exc:
-            log.error("LLM response failed: %s", exc)
+            self._usage["failed"] += 1
+            self._recent_failures.appendleft({"when": int(time.time()), "type": type(exc).__name__})
+            log.error("LLM response failed (%s)", type(exc).__name__)
             try:
                 await message.reply("I couldn't generate a response right now. Please try again later.", mention_author=False)
             except discord.HTTPException:
@@ -915,7 +992,7 @@ class AIChat(commands.Cog):
                     await message.remove_reaction("🕒", self.bot.user)
                 except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                     pass
-            await self._release()
+            await self._release(message)
 
     def _dashboard_embed(self) -> discord.Embed:
         ready, reason = self._configured()
@@ -931,13 +1008,21 @@ class AIChat(commands.Cog):
             value=(f"{self.settings['user_cooldown_seconds']}s per user · "
                    f"{self.settings['global_requests_per_minute']}/min global · "
                    f"{self.settings['max_concurrent']} concurrent\n"
-                   f"Queue: {len(self._pending)}/{self.settings['max_queued']} waiting · {self._active} active"),
+                   f"Queue: {len(self._pending)}/{self.settings['max_queued']} waiting · {self._active} active\n"
+                   f"Follow-up: {self.settings['followup_seconds']}s · fallback: `{self.settings.get('fallback_model') or 'off'}`"),
             inline=False)
         embed.add_field(
             name="Context and personality",
             value=(f"{self.settings['context_messages']} previous messages · "
                    f"{len(self.settings.get('personality', ''))} personality characters"),
             inline=False)
+        embed.add_field(name="Usage since restart", value=(
+            f"{self._usage['requests']} requests · {self._usage['succeeded']} succeeded · "
+            f"{self._usage['failed']} failed · {self._usage['tool_calls']} tool calls\n"
+            "Exact token/cost totals are unavailable unless the provider reports them."), inline=False)
+        if self._recent_failures:
+            embed.add_field(name="Recent sanitized failures", value="\n".join(
+                f"<t:{item['when']}:R> · `{item['type']}`" for item in self._recent_failures)[:1024], inline=False)
         if not ready:
             embed.add_field(name="Setup needed", value=reason[:1024], inline=False)
         embed.set_footer(text="Provider and reasoning menus save immediately. Other settings open private forms.")
@@ -993,6 +1078,32 @@ class AIChat(commands.Cog):
         self._save()
         changed = ", ".join(key.replace("_", " ") for key in updates)
         await interaction.response.send_message(f"LLM limits updated: {changed}.", ephemeral=True)
+
+
+    @llm_group.command(name="forget", description="Forget your current LLM follow-up context in this channel")
+    async def forget(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("LLM conversations are not retained in DMs.", ephemeral=True); return
+        self._followups.pop((interaction.guild_id, interaction.channel_id, interaction.user.id), None)
+        await interaction.response.send_message("Your CalmBot follow-up window in this channel was cleared.", ephemeral=True)
+
+    @llm_group.command(name="cancel", description="Cancel your queued LLM request in this channel")
+    async def cancel(self, interaction: discord.Interaction):
+        if interaction.guild_id is None:
+            await interaction.response.send_message("There is no guild request to cancel.", ephemeral=True); return
+        removed = []
+        async with self._lock:
+            keep = deque()
+            for item in self._pending:
+                if item.guild.id == interaction.guild_id and item.channel.id == interaction.channel_id and item.author.id == interaction.user.id: removed.append(item)
+                else: keep.append(item)
+            self._pending = keep
+        for item in removed:
+            self._clocked_requests.discard(item.id)
+            try: await item.remove_reaction("🕒", self.bot.user)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden): pass
+        self._queue_wake.set()
+        await interaction.response.send_message("Queued request cancelled." if removed else "You have no queued request in this channel. Running requests cannot be interrupted safely.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

@@ -13,3 +13,5 @@ data/*.json
 *~
 
 data/credentials/
+
+data/*.jsonl

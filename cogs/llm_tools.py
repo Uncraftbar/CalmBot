@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +22,7 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
 
-READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod"}
+READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "connection_diagnostic"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 
 TOOL_DEFINITIONS = [
@@ -91,6 +94,20 @@ TOOL_DEFINITIONS = [
                 "mod": {"type": "string", "minLength": 2, "maxLength": 100},
             }, "required": ["modpack", "mod"], "additionalProperties": False,
         },
+    },
+    {
+        "name": "search_community_docs",
+        "description": "Search CalmBot's local public README/help documentation. Returns quoted excerpts and source names.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "minLength": 2, "maxLength": 100}
+        }, "required": ["query"], "additionalProperties": False},
+    },
+    {
+        "name": "connection_diagnostic",
+        "description": "Run a composite read-only connection diagnostic across public servers using uncached live AMP state and player metrics.",
+        "parameters": {"type": "object", "properties": {
+            "server": {"type": "string", "maxLength": 100, "description": "Optional exact public server name"}
+        }, "additionalProperties": False},
     },
     {
         "name": "request_amp_action",
@@ -204,6 +221,8 @@ class LLMToolRuntime:
         self.cog = cog
         self.message = message
         self.pending_action: PendingAMPAction | None = None
+        self.tool_calls = 0
+        self.image_data_urls: list[str] = []
 
     @property
     def actor_is_admin(self) -> bool:
@@ -212,6 +231,7 @@ class LLMToolRuntime:
         return is_administrator(self.message.author)
 
     async def execute(self, name: str, arguments: Any) -> str:
+        self.tool_calls += 1
         try:
             args = arguments if isinstance(arguments, dict) else json.loads(arguments or "{}")
             if not isinstance(args, dict):
@@ -232,6 +252,10 @@ class LLMToolRuntime:
                 return json.dumps(await self._query_modpack_index(args), ensure_ascii=False)
             if name == "check_modpack_contains_mod":
                 return json.dumps(await self._check_modpack_contains_mod(args), ensure_ascii=False)
+            if name == "search_community_docs":
+                return json.dumps(await self._search_community_docs(args), ensure_ascii=False)
+            if name == "connection_diagnostic":
+                return json.dumps(await self._connection_diagnostic(args), ensure_ascii=False)
             if name == "request_amp_action":
                 return json.dumps(await self._request_amp_action(args), ensure_ascii=False)
             return json.dumps({"error": "Unknown or unavailable tool"})
@@ -268,7 +292,7 @@ class LLMToolRuntime:
                 result.append({"server": name, "state": get_instance_state(status), "players": count})
             except Exception:
                 result.append({"server": name, "state": "Unknown", "players": None})
-        return {"servers": result}
+        return {"servers": result, "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
 
     async def _online_players(self):
         result = []
@@ -285,15 +309,27 @@ class LLMToolRuntime:
                 result.append(item)
             except Exception:
                 result.append({"server": name, "error": "status unavailable"})
-        return {"servers": result}
+        return {"servers": result, "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
 
     async def _mpi_get(self, path: str, params: dict | None = None):
+        cache = getattr(self.cog, "_public_tool_cache", None)
+        if cache is None:
+            cache = self.cog._public_tool_cache = {}
+        key = (path, json.dumps(params or {}, sort_keys=True))
+        now = time.monotonic()
+        cached = cache.get(key)
+        if cached and now - cached[0] < 120:
+            return cached[1]
         session = await self.cog._http()
         url = f"{MODPACK_INDEX_URL}/{path.lstrip('/')}"
         async with session.get(url, params=params, headers={"Accept": "application/json", "User-Agent": "CalmBot/1.0 (Discord integration; github.com/Uncraftbar/CalmBot)"}) as response:
             if response.status != 200:
                 raise RuntimeError(f"Modpack Index HTTP {response.status}")
-            return await response.json(content_type=None)
+            payload = await response.json(content_type=None)
+        cache[key] = (now, payload)
+        if len(cache) > 200:
+            for stale in list(cache)[:50]: cache.pop(stale, None)
+        return payload
 
     @staticmethod
     def _bounded_api_value(value, *, depth: int = 0):
@@ -386,6 +422,8 @@ class LLMToolRuntime:
         candidates = exact or packs
         if not candidates:
             return {"verified": False, "reason": "modpack_not_found", "modpack_query": pack_query}
+        if len(candidates) > 1 and not exact:
+            return {"verified": False, "reason": "ambiguous_modpack", "candidates": [self._pack_summary(x) for x in candidates[:10]]}
         pack = candidates[0]
 
         # This relationship endpoint currently ignores pagination/name parameters and returns
@@ -433,6 +471,43 @@ class LLMToolRuntime:
                 if pack.get(key) is not None:
                     result[key] = pack[key]
         return result
+
+    async def _search_community_docs(self, args):
+        query = str(args.get("query", "")).strip()[:100]
+        terms = [term.casefold() for term in re.findall(r"[A-Za-z0-9_.-]{2,}", query)]
+        if not terms:
+            return {"error": "A searchable query is required"}
+        path = Path("README.md")
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {"error": "Community documentation is unavailable"}
+        matches = []
+        for index, line in enumerate(lines):
+            folded = line.casefold()
+            score = sum(term in folded for term in terms)
+            if score:
+                excerpt = " ".join(part.strip() for part in lines[max(0,index-1):min(len(lines),index+2)] if part.strip())
+                matches.append((score, index + 1, excerpt[:700]))
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        return {"query": query, "results": [{"source": "README.md", "line": line, "excerpt": text} for _, line, text in matches[:6]], "fresh_at": int(time.time()), "cached": False}
+
+    async def _connection_diagnostic(self, args):
+        requested = str(args.get("server", "")).strip().casefold()
+        status = await self._server_status()
+        servers = status["servers"]
+        if requested:
+            exact = [item for item in servers if str(item.get("server", "")).casefold() == requested]
+            if not exact:
+                return {"verified": False, "reason": "public_server_not_found", "public_servers": [item.get("server") for item in servers]}
+            servers = exact
+        findings = []
+        for item in servers:
+            state = str(item.get("state", "unknown")).casefold()
+            if state != "running": findings.append(f"{item['server']} is {item.get('state', 'Unknown')}")
+            elif item.get("players") is None: findings.append(f"{item['server']} is running, but AMP player metrics are unavailable")
+            else: findings.append(f"{item['server']} is running and AMP reports {item['players']} player(s)")
+        return {"verified": True, "findings": findings, "limits": ["This checks AMP state only; it cannot inspect the player's client, DNS path, firewall, account, or mod mismatch."], "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
 
     async def _request_amp_action(self, args):
         # Hard authorization gate in ordinary code, independent of model instructions.
