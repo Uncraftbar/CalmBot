@@ -436,6 +436,14 @@ class AIChat(commands.Cog):
     def _openai_url(self) -> str:
         return str(self._setting("api_url", "AI_CHAT_API_URL", "")).strip()
 
+    def _endpoint_host(self) -> str:
+        """Return only the configured endpoint host for safe routing audits."""
+        try:
+            from urllib.parse import urlsplit
+            return urlsplit(self._openai_url()).hostname or "unconfigured"
+        except (TypeError, ValueError):
+            return "invalid"
+
     def _configured(self):
         if self._provider() == "openai":
             if not self._openai_url() or not self._load_openai_key():
@@ -1182,6 +1190,16 @@ class AIChat(commands.Cog):
             if prepared.skipped:
                 log.info("LLM skipped %d attachment(s) for message %s", len(prepared.skipped), message.id)
             async with message.channel.typing():
+                # Record deterministic, secret-free routing metadata before dispatch.
+                # This makes provider attribution auditable without storing prompts,
+                # responses, API keys, or full endpoint paths/query strings.
+                provider = self._provider()
+                route = "chatgpt.com" if provider == "codex" else self._endpoint_host()
+                model = self._model()
+                log.info(
+                    "LLM request routed message=%s provider=%s model=%s endpoint_host=%s",
+                    message.id, provider, model, route,
+                )
                 # Provider payloads are immutable after submission. Never cancel and
                 # regenerate: later messages stay in PendingContext for one follow-up.
                 runtime = LLMToolRuntime(self, message)
