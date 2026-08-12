@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+from contextlib import suppress
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import config
 from cogs.utils import admin_only, get_logger, load_json, save_json
 from cogs.llm_tools import AMPActionConfirmView, LLMToolRuntime, openai_tools, responses_tools
 from cogs.ai_chat_input import collect_attachments
+from cogs.ai_pending_context import PendingContext
 from cogs.ai_memory import (EXTRACTION_INSTRUCTIONS, MemoryStore, explicit_remember_candidate,
                             parse_memory_candidates)
 
@@ -53,6 +55,8 @@ DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
 MAX_TOOL_ROUNDS = 10
+PENDING_CONTEXT_DEBOUNCE_SECONDS = 0.15
+MAX_CONTEXT_GENERATION_ATTEMPTS = 3
 
 
 def cfg(name: str, default: Any = None) -> Any:
@@ -313,6 +317,9 @@ class AIChat(commands.Cog):
         # measured from the opening message and is deliberately not extended by traffic.
         self._conversations: dict[tuple[int, int], float] = {}
         self._processing_users: set[tuple[int, int, int]] = set()
+        # At most one generated response owns a channel. Later human messages are
+        # folded into that request under _lock instead of becoming duplicate work.
+        self._inflight_context: dict[tuple[int, int], PendingContext] = {}
         self._enqueue_rejection: dict[int, str] = {}
         self._usage = {"requests": 0, "succeeded": 0, "failed": 0, "tool_calls": 0}
         self._recent_failures: deque[dict[str, Any]] = deque(maxlen=8)
@@ -350,6 +357,7 @@ class AIChat(commands.Cog):
         self._codex_login_tasks.clear()
         self._response_tasks.clear()
         self._pending.clear()
+        self._inflight_context.clear()
         if self._session and not self._session.closed:
             await self._session.close()
 
@@ -557,18 +565,31 @@ class AIChat(commands.Cog):
         finally:
             self._codex_login_tasks.pop(interaction.user.id, None)
 
-    async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool]:
-        """Queue a request and report whether a configured limit delays it."""
+    async def _enqueue(self, message: discord.Message) -> tuple[int | None, bool, bool]:
+        """Queue a request, or atomically fold it into this channel's active request."""
         async with self._lock:
+            channel_key = self._conversation_key(message)
+            active_context = self._inflight_context.get(channel_key)
+            if active_context is not None and not active_context.closed:
+                # PendingContext independently verifies the channel and message id. The
+                # original trigger is never replaced and additions are hard-bounded.
+                merged = active_context.append(message)
+                if not merged:
+                    self._enqueue_rejection[message.id] = "duplicate"
+                    return None, False, False
+                return 0, False, True
             key = (message.guild.id, message.channel.id, message.author.id)
-            if key in self._processing_users or any(
+            # Once the final bounded snapshot is sealed, later traffic becomes ordinary
+            # queued work rather than being accepted into context that cannot be sent.
+            processing_duplicate = key in self._processing_users and active_context is None
+            if processing_duplicate or any(
                 (item.guild.id, item.channel.id, item.author.id) == key for item in self._pending
             ):
                 self._enqueue_rejection[message.id] = "duplicate"
-                return None, False
+                return None, False, False
             if len(self._pending) >= self.settings["max_queued"]:
                 self._enqueue_rejection[message.id] = "full"
-                return None, False
+                return None, False, False
             now = time.monotonic()
             while self._global and now - self._global[0] >= 60:
                 self._global.popleft()
@@ -585,7 +606,7 @@ class AIChat(commands.Cog):
             self._pending.append(message)
             position = len(self._pending)
         self._queue_wake.set()
-        return position, delayed
+        return position, delayed, False
 
     async def _take_ready(self):
         """Reserve the oldest eligible request and report when to retry."""
@@ -601,7 +622,11 @@ class AIChat(commands.Cog):
             cooldown = self.settings["user_cooldown_seconds"]
             selected = None
             retry_in = None
+            blocked_by_channel = False
             for index, message in enumerate(self._pending):
+                if self._conversation_key(message) in self._inflight_context:
+                    blocked_by_channel = True
+                    continue
                 last = self._last_user.get(message.author.id)
                 wait = 0 if last is None else cooldown - (now - last)
                 if wait <= 0:
@@ -609,6 +634,10 @@ class AIChat(commands.Cog):
                     break
                 retry_in = wait if retry_in is None else min(retry_in, wait)
             if selected is None:
+                # Same-channel work is released by _release(), which wakes the dispatcher.
+                # Do not poll every 50ms when that is the only reason work is blocked.
+                if retry_in is None and blocked_by_channel:
+                    return None, None
                 return None, max(0.05, retry_in or 0.05)
 
             message = self._pending[selected]
@@ -617,6 +646,8 @@ class AIChat(commands.Cog):
             self._global.append(now)
             self._active += 1
             self._processing_users.add((message.guild.id, message.channel.id, message.author.id))
+            self._inflight_context[self._conversation_key(message)] = PendingContext(
+                message, self.settings["context_messages"])
             return message, 0
 
     async def _dispatch_loop(self):
@@ -645,6 +676,10 @@ class AIChat(commands.Cog):
             self._active = max(0, self._active - 1)
             if message is not None:
                 self._processing_users.discard((message.guild.id, message.channel.id, message.author.id))
+                channel_key = self._conversation_key(message)
+                active_context = self._inflight_context.get(channel_key)
+                if active_context is not None and active_context.trigger_id == message.id:
+                    self._inflight_context.pop(channel_key, None)
         self._queue_wake.set()
 
     def _conversation_key(self, message) -> tuple[int, int]:
@@ -704,7 +739,7 @@ class AIChat(commands.Cog):
             chain.append(parent); current = parent
         return list(reversed(chain))
 
-    async def _context(self, trigger, attachment_text=""):
+    async def _context(self, trigger, attachment_text="", additions=()):
         chain = await self._reply_chain(trigger)
         included = {item.id for item in chain}
         previous = []
@@ -724,6 +759,12 @@ class AIChat(commands.Cog):
         current = f"[{trigger.author.display_name}]: {self._text(trigger, self.bot.user.id)}"
         if attachment_text: current += "\n\n" + attachment_text
         result.append({"role": "user", "content": current[:20000]})
+        for item in additions:
+            # Additions are human Discord messages admitted by _triggered and scoped by
+            # PendingContext. Attachments remain subject to the original fetch pipeline;
+            # channel follow-ups contribute bounded text only.
+            text = self._text(item, self.bot.user.id)[:4000]
+            result.append({"role": "user", "content": f"[{item.author.display_name}]: {text}"})
         return result
 
     def _system(self, message):
@@ -1041,7 +1082,9 @@ class AIChat(commands.Cog):
         ready, reason = self._configured()
         if not ready:
             log.warning("LLM mode enabled but unavailable: %s", reason); return
-        position, delayed = await self._enqueue(message)
+        position, delayed, merged = await self._enqueue(message)
+        if merged:
+            return
         if position is None:
             rejection = self._enqueue_rejection.pop(message.id, "full")
             text = ("You already have an LLM request queued or running here." if rejection == "duplicate"
@@ -1064,13 +1107,51 @@ class AIChat(commands.Cog):
     async def _process_message(self, message: discord.Message):
         try:
             self._usage["requests"] += 1
-            runtime = LLMToolRuntime(self, message)
             prepared = await collect_attachments(await self._http(), getattr(message, "attachments", ()))
-            runtime.image_data_urls = prepared.image_data_urls
             if prepared.skipped:
                 log.info("LLM skipped %d attachment(s) for message %s", len(prepared.skipped), message.id)
             async with message.channel.typing():
-                answer = await self._generate(await self._context(message, prepared.text), self._system(message), runtime)
+                # Brief fixed coalescing windows capture bursts without waiting forever.
+                # At most three provider attempts are made. Before the final attempt the
+                # snapshot is sealed, so later traffic queues as new work rather than
+                # being reported as merged and then omitted.
+                for attempt in range(MAX_CONTEXT_GENERATION_ATTEMPTS):
+                    await asyncio.sleep(PENDING_CONTEXT_DEBOUNCE_SECONDS)
+                    async with self._lock:
+                        pending_context = self._inflight_context[self._conversation_key(message)]
+                        additions, revision, changed = pending_context.snapshot()
+                        final_attempt = attempt + 1 == MAX_CONTEXT_GENERATION_ATTEMPTS
+                        if final_attempt:
+                            pending_context.close_if_unchanged(revision)
+                    runtime = LLMToolRuntime(self, message)
+                    runtime.image_data_urls = prepared.image_data_urls
+                    generate_task = asyncio.create_task(self._generate(
+                        await self._context(message, prepared.text, additions),
+                        self._system(message), runtime))
+                    if final_attempt:
+                        answer = await generate_task
+                        break
+
+                    change_task = asyncio.create_task(changed.wait())
+                    await asyncio.wait(
+                        {generate_task, change_task}, return_when=asyncio.FIRST_COMPLETED)
+                    async with self._lock:
+                        stable = pending_context.close_if_unchanged(revision)
+                    if stable:
+                        change_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await change_task
+                        answer = await generate_task
+                        break
+
+                    generate_task.cancel()
+                    change_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await generate_task
+                    with suppress(asyncio.CancelledError):
+                        await change_task
+                else:  # Defensive: the configured attempt count is always positive.
+                    raise RuntimeError("LLM context generation attempts exhausted")
             self._usage["tool_calls"] += runtime.tool_calls
             if runtime.conversation_control:
                 if runtime.conversation_control == "end":
