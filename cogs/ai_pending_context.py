@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+import time
 from typing import Any, Iterable
 
 
@@ -19,13 +20,15 @@ class PendingBatch:
     """One bounded queued request whose newest message is the trigger."""
 
     def __init__(self, trigger: Any, limit: int, *, followup: bool = False,
-                 messages: Iterable[Any] = ()):
+                 messages: Iterable[Any] = (), settle_seconds: float = 0):
         key = message_channel_key(trigger)
         if key is None:
             raise ValueError("pending LLM batch requires a guild channel")
         self.key = key
         self.limit = max(1, int(limit))
         self.followup = bool(followup)
+        self.settle_seconds = max(0.0, float(settle_seconds))
+        self.ready_at = time.monotonic() + self.settle_seconds
         # Preserve the object that owns queue UI (such as the clock reaction),
         # even while later messages advance the effective response target.
         self.anchor = trigger
@@ -45,6 +48,10 @@ class PendingBatch:
             self._ids.discard(int(removed.id))
         self._messages.append(message)
         self._ids.add(message_id)
+        # Debounce channel chatter: dispatch only after the newest accepted
+        # message has had a brief quiet period. This lets rapid multi-user turns
+        # become one model request instead of one response per message.
+        self.ready_at = time.monotonic() + self.settle_seconds
         return True
 
     def append(self, message: Any) -> bool:
@@ -80,13 +87,14 @@ class PendingBatch:
 class PendingContext:
     """Messages received after an immutable provider request was submitted."""
 
-    def __init__(self, trigger: Any, limit: int):
+    def __init__(self, trigger: Any, limit: int, *, settle_seconds: float = 0):
         key = message_channel_key(trigger)
         if key is None:
             raise ValueError("pending LLM context requires a guild channel")
         self.key = key
         self.trigger_id = int(trigger.id)
         self.limit = max(1, int(limit))
+        self.settle_seconds = max(0.0, float(settle_seconds))
         self._messages: deque[Any] = deque()
         self._ids: set[int] = set()
 
@@ -109,7 +117,7 @@ class PendingContext:
             return None
         messages = list(self._messages)
         return PendingBatch(messages[-1], self.limit, followup=True,
-                            messages=messages[:-1])
+                            messages=messages[:-1], settle_seconds=self.settle_seconds)
 
 
 # main.py discovers Python files under cogs; this module is import-only.

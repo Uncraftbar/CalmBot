@@ -54,6 +54,9 @@ DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
 VALID_PROVIDERS = {"openai", "codex"}
 VALID_REASONING = {"none", "low", "medium", "high", "xhigh", "max"}
 MAX_TOOL_ROUNDS = 10
+# Wait briefly for consecutive channel messages before submitting an immutable
+# provider request. Each accepted message resets this quiet-period timer.
+AUTO_RESPONSE_SETTLE_SECONDS = 2.0
 
 
 def cfg(name: str, default: Any = None) -> Any:
@@ -647,7 +650,8 @@ class AIChat(commands.Cog):
                 self._active + len(self._pending) >= self.settings["max_concurrent"])
             delayed = user_limited or global_limited or concurrency_limited
             self._pending.append(PendingBatch(
-                message, limit=self.settings["context_messages"]))
+                message, limit=self.settings["context_messages"],
+                settle_seconds=AUTO_RESPONSE_SETTLE_SECONDS))
             position = len(self._pending)
         self._queue_wake.set()
         return position, delayed, False
@@ -668,6 +672,10 @@ class AIChat(commands.Cog):
             retry_in = None
             blocked_by_channel = False
             for index, message in enumerate(self._pending):
+                settle_wait = message.ready_at - now
+                if settle_wait > 0:
+                    retry_in = settle_wait if retry_in is None else min(retry_in, settle_wait)
+                    continue
                 if self._conversation_key(message) in self._inflight_context:
                     blocked_by_channel = True
                     continue
@@ -691,7 +699,8 @@ class AIChat(commands.Cog):
             self._active += 1
             self._processing_users.add((message.guild.id, message.channel.id, message.author.id))
             self._inflight_context[self._conversation_key(message)] = PendingContext(
-                message.trigger, self.settings["context_messages"])
+                message.trigger, self.settings["context_messages"],
+                settle_seconds=AUTO_RESPONSE_SETTLE_SECONDS)
             return message, 0
 
     async def _dispatch_loop(self):

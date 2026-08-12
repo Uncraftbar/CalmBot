@@ -1,3 +1,4 @@
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -49,6 +50,22 @@ class PendingContextTests(unittest.TestCase):
         self.assertTrue(batch.append(message(5)))
         self.assertEqual(batch.trigger.id, 5)
         self.assertEqual([item.id for item in batch.context_messages], [2, 3, 4])
+
+    def test_settle_window_resets_when_another_message_is_bundled(self):
+        batch = PendingBatch(message(1), limit=4, settle_seconds=2)
+        first_deadline = batch.ready_at
+        time.sleep(0.01)
+        self.assertTrue(batch.append(message(2)))
+        self.assertGreater(batch.ready_at, first_deadline)
+        self.assertEqual(batch.trigger.id, 2)
+        self.assertEqual([item.id for item in batch.context_messages], [1])
+
+    def test_followup_inherits_settle_window(self):
+        pending = PendingContext(message(1), limit=4, settle_seconds=2)
+        pending.append(message(2))
+        batch = pending.followup()
+        self.assertEqual(batch.settle_seconds, 2)
+        self.assertGreater(batch.ready_at, time.monotonic())
 
     def test_queued_batch_is_bounded_scoped_and_delegates_trigger(self):
         batch = PendingBatch(message(2), limit=3, followup=True)
