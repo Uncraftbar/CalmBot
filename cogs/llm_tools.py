@@ -22,10 +22,22 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
 
-READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "connection_diagnostic"}
+READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "connection_diagnostic", "stay_silent", "end_conversation"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 
 TOOL_DEFINITIONS = [
+    {
+        "name": "stay_silent",
+        "description": ("Send no Discord response to this message while keeping the active conversation open. "
+                        "Use when the message is not directed at CalmBot, asks CalmBot not to reply, or a reply would be intrusive."),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "end_conversation",
+        "description": ("Send no Discord response and completely end the current channel's automatic conversation. "
+                        "Use only when someone clearly dismisses CalmBot, asks it to stop/shut up/go away, or the conversation is clearly over."),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
     {
         "name": "server_status",
         "description": "Get live read-only state and player counts for CalmBot's AMP game servers.",
@@ -223,6 +235,7 @@ class LLMToolRuntime:
         self.pending_action: PendingAMPAction | None = None
         self.tool_calls = 0
         self.image_data_urls: list[str] = []
+        self.conversation_control: str | None = None
 
     @property
     def actor_is_admin(self) -> bool:
@@ -238,6 +251,12 @@ class LLMToolRuntime:
                 raise ValueError("arguments must be an object")
         except (TypeError, ValueError, json.JSONDecodeError):
             return json.dumps({"error": "Invalid tool arguments"})
+        if name == "stay_silent":
+            self.conversation_control = "silent"
+            return json.dumps({"ok": True, "result": "No Discord message will be sent; conversation remains active."})
+        if name == "end_conversation":
+            self.conversation_control = "end"
+            return json.dumps({"ok": True, "result": "No Discord message will be sent; conversation will be ended."})
 
         try:
             if name == "server_status":
