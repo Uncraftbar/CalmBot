@@ -5,6 +5,9 @@ Provides server management commands for Minecraft instances.
 
 import asyncio
 import re
+import time
+
+import config
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -307,11 +310,30 @@ class PublicServersView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=120)
         self.cog = cog
+        self.refresh_lock = asyncio.Lock()
+        self.last_refresh_at = 0.0
+        self.refresh_cooldown = max(
+            1.0, float(getattr(config, "PUBLIC_SERVER_REFRESH_COOLDOWN_SECONDS", 15))
+        )
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = await self.cog.build_public_servers_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+        # The cooldown is shared by this message. This prevents several users (or
+        # one enthusiastic clicker) from hammering every AMP instance at once.
+        retry_after = self.refresh_cooldown - (time.monotonic() - self.last_refresh_at)
+        if self.refresh_lock.locked() or retry_after > 0:
+            if self.refresh_lock.locked():
+                message = "A server refresh is already in progress."
+            else:
+                message = f"Please wait {max(1, int(retry_after + 0.999))}s before refreshing again."
+            await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        async with self.refresh_lock:
+            self.last_refresh_at = time.monotonic()
+            await interaction.response.defer()
+            embed = await self.cog.build_public_servers_embed()
+            await interaction.edit_original_response(embed=embed, view=self)
 
 
 # =============================================================================
@@ -327,6 +349,21 @@ class AMP(commands.Cog):
     
     async def build_public_servers_embed(self):
         instances = await fetch_valid_instances()
+
+        # An empty allowlist preserves the historical behavior (show all). Values
+        # can use either AMP's internal instance name or its friendly name.
+        allowlist = {
+            str(name).strip().casefold()
+            for name in getattr(config, "PUBLIC_SERVER_ALLOWLIST", [])
+            if str(name).strip()
+        }
+        if allowlist:
+            instances = [
+                inst for inst in instances
+                if inst.instance_name.casefold() in allowlist
+                or (inst.friendly_name and inst.friendly_name.casefold() in allowlist)
+            ]
+
         embed = discord.Embed(title="Game Servers", color=discord.Color.blue())
         if not instances:
             embed.description = "No game servers are currently available."

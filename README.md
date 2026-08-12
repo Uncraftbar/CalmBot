@@ -98,7 +98,16 @@ Rate-limited requests are silently suppressed with a clock reaction. Model outpu
 ## Commands
 
 ### AMP Management
+- `/servers` - Show the public server-status dashboard.
 - `/amp` - Open the server management dashboard.
+
+The public dashboard can be restricted to selected AMP instances and its refresh cooldown can be adjusted in `config.py`:
+
+```python
+# Empty means all servers. Entries match AMP instance names or friendly names.
+PUBLIC_SERVER_ALLOWLIST = ["Community SMP", "Creative"]
+PUBLIC_SERVER_REFRESH_COOLDOWN_SECONDS = 15
+```
 
 ### Auto-Send
 - `/autosend add` - Create a new auto-responder.
