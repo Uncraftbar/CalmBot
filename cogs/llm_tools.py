@@ -19,7 +19,7 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
 
-READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index"}
+READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 
 TOOL_DEFINITIONS = [
@@ -76,6 +76,20 @@ TOOL_DEFINITIONS = [
                 "page": {"type": "integer", "minimum": 1, "maximum": 100000, "default": 1},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10}
             }, "required": ["operation"], "additionalProperties": False
+        },
+    },
+    {
+        "name": "check_modpack_contains_mod",
+        "description": (
+            "Check whether a named modpack contains a named mod. This performs the pack lookup and "
+            "searches its complete Modpack Index mod list in one call. Use this instead of chaining "
+            "search_modpacks/get_modpack/query_modpack_index for membership questions."
+        ),
+        "parameters": {
+            "type": "object", "properties": {
+                "modpack": {"type": "string", "minLength": 2, "maxLength": 100},
+                "mod": {"type": "string", "minLength": 2, "maxLength": 100},
+            }, "required": ["modpack", "mod"], "additionalProperties": False,
         },
     },
     {
@@ -216,6 +230,8 @@ class LLMToolRuntime:
                 return json.dumps(await self._get_modpack(args), ensure_ascii=False)
             if name == "query_modpack_index":
                 return json.dumps(await self._query_modpack_index(args), ensure_ascii=False)
+            if name == "check_modpack_contains_mod":
+                return json.dumps(await self._check_modpack_contains_mod(args), ensure_ascii=False)
             if name == "request_amp_action":
                 return json.dumps(await self._request_amp_action(args), ensure_ascii=False)
             return json.dumps({"error": "Unknown or unavailable tool"})
@@ -346,6 +362,48 @@ class LLMToolRuntime:
                     params["name"] = query
         payload = await self._mpi_get(path, params)
         return {"operation": operation, "result": self._bounded_api_value(payload)}
+
+    @staticmethod
+    def _catalog_items(payload):
+        if isinstance(payload, dict):
+            data = payload.get("data", [])
+            return data if isinstance(data, list) else []
+        return payload if isinstance(payload, list) else []
+
+    @staticmethod
+    def _normalized_name(value):
+        return "".join(ch for ch in str(value).casefold() if ch.isalnum())
+
+    async def _check_modpack_contains_mod(self, args):
+        pack_query = str(args.get("modpack", "")).strip()[:100]
+        mod_query = str(args.get("mod", "")).strip()[:100]
+        if len(pack_query) < 2 or len(mod_query) < 2:
+            return {"error": "Both modpack and mod names must contain at least two characters"}
+
+        packs = self._catalog_items(await self._mpi_get("modpacks", {"name": pack_query, "limit": 10}))
+        wanted_pack = self._normalized_name(pack_query)
+        exact = [p for p in packs if self._normalized_name(p.get("name")) == wanted_pack]
+        candidates = exact or packs
+        if not candidates:
+            return {"verified": False, "reason": "modpack_not_found", "modpack_query": pack_query}
+        pack = candidates[0]
+
+        # This relationship endpoint currently ignores pagination/name parameters and returns
+        # the complete list. Filter locally so the model gets a small, decisive result.
+        mods = self._catalog_items(await self._mpi_get(f"modpack/{int(pack['id'])}/mods"))
+        wanted_mod = self._normalized_name(mod_query)
+        exact_mods = [m for m in mods if self._normalized_name(m.get("name")) == wanted_mod]
+        partial_mods = [m for m in mods if wanted_mod in self._normalized_name(m.get("name"))
+                        or self._normalized_name(m.get("name")) in wanted_mod]
+        matches = exact_mods or partial_mods
+        return {
+            "verified": True,
+            "contains": bool(matches),
+            "modpack": {"id": pack.get("id"), "name": pack.get("name"), "page_url": pack.get("page_url")},
+            "mod_query": mod_query,
+            "matches": [self._pack_summary(item) for item in matches[:10]],
+            "mods_checked": len(mods),
+        }
 
     async def _search_modpacks(self, args):
         name = str(args.get("name", "")).strip()[:100]

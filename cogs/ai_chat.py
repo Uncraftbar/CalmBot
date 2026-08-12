@@ -707,7 +707,24 @@ class AIChat(commands.Cog):
                 function = call.get("function", {})
                 output = await runtime.execute(str(function.get("name", "")), function.get("arguments", "{}"))
                 conversation.append({"role": "tool", "tool_call_id": str(call.get("id", "")), "content": output})
-        raise RuntimeError("LLM exceeded the tool-call limit")
+        # A model can occasionally keep asking for tools despite already having enough
+        # evidence. Force one tool-free synthesis instead of turning that into a user-facing
+        # generic failure.
+        payload = {
+            "model": self._model(), "messages": conversation,
+            "max_tokens": bounded(self._setting("max_tokens", "AI_CHAT_MAX_TOKENS", 700), 64, 4000, 700),
+            "temperature": float(self._setting("temperature", "AI_CHAT_TEMPERATURE", 0.7)),
+            "tool_choice": "none",
+        }
+        async with session.post(url, json=payload,
+                                headers={"Authorization": f"Bearer {self._load_openai_key()}"}) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"LLM endpoint returned HTTP {resp.status}")
+            data = await resp.json(content_type=None)
+        try:
+            return str(data["choices"][0]["message"].get("content") or "").strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("LLM could not synthesize tool results") from exc
 
     @staticmethod
     def _codex_output(response: dict) -> str:
@@ -801,7 +818,19 @@ class AIChat(commands.Cog):
             for call in calls[:5]:
                 output = await runtime.execute(str(call.get("name", "")), call.get("arguments", "{}"))
                 conversation.append({"type": "function_call_output", "call_id": call.get("call_id"), "output": output})
-        raise RuntimeError("LLM exceeded the tool-call limit")
+        # Do one final tool-free pass. This guarantees a useful answer from the evidence
+        # already collected even if the model attempted a redundant fifth tool call.
+        payload = {"model": self._model(), "instructions": system, "input": conversation,
+                   "tools": [], "tool_choice": "none", "store": False, "stream": True,
+                   "include": ["reasoning.encrypted_content"]}
+        effort = self._reasoning()
+        if effort in VALID_REASONING:
+            payload["reasoning"] = {"effort": effort}
+        response = await self._codex_request(payload, headers)
+        answer = self._codex_output(response)
+        if not answer:
+            raise RuntimeError("LLM could not synthesize tool results")
+        return answer
 
     @staticmethod
     def _image_urls(message) -> list[str]:
