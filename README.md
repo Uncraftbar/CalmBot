@@ -73,11 +73,13 @@ AI_CHAT_MODEL = "model-name"
 
 # Alternatively, ChatGPT/Codex subscription mode
 AI_CHAT_PROVIDER = "codex"
-AI_CHAT_CODEX_AUTH_PATH = "/path/to/codex_auth.json"
+AI_CHAT_CODEX_AUTH_PATH = "data/credentials/codex_auth.json"  # CalmBot-owned, chmod 600
 AI_CHAT_CODEX_AUTH_INDEX = 0
 AI_CHAT_MODEL = "gpt-5.6-luna"
 AI_CHAT_REASONING_EFFORT = "low"
 ```
+
+CalmBot reads, refreshes, and atomically saves its own Codex credential file. Do not point this at another application's live credential store. OAuth credentials and everything under `data/credentials/` are ignored by Git.
 
 Moderator commands:
 

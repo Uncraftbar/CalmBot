@@ -6,6 +6,7 @@ variables; runtime enablement and rate limits live in ignored data.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -25,6 +26,10 @@ from cogs.utils import admin_only, get_logger, load_json, save_json
 log = get_logger("ai_chat")
 AI_CHAT_FILE = os.path.join("data", "ai_chat.json")
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_REFRESH_MARGIN = 300
+DEFAULT_CODEX_AUTH_PATH = os.path.join("data", "credentials", "codex_auth.json")
 DEFAULTS = {"enabled": False, "user_cooldown_seconds": 30,
             "global_requests_per_minute": 10, "max_concurrent": 2,
             "context_messages": 12}
@@ -53,6 +58,7 @@ class AIChat(commands.Cog):
             self.settings.update(stored)
         self._sanitize()
         self._lock = asyncio.Lock()
+        self._codex_refresh_lock = asyncio.Lock()
         self._last_user: dict[int, float] = {}
         self._global: deque[float] = deque()
         self._active = 0
@@ -85,38 +91,104 @@ class AIChat(commands.Cog):
         default = "gpt-5.6-luna" if self._provider() == "codex" else "gpt-4o-mini"
         return str(cfg("AI_CHAT_MODEL", default)).strip()
 
-    @staticmethod
-    def _shadow(path: Path):
-        index = bounded(cfg("AI_CHAT_CODEX_AUTH_INDEX", 0), 0, 99, 0)
-        return path.with_name(f"{path.stem}_{index}{path.suffix}")
-
     def _configured(self):
         if self._provider() == "openai":
             if not cfg("AI_CHAT_API_URL", "") or not cfg("AI_CHAT_API_KEY", ""):
                 return False, "AI_CHAT_API_URL/API_KEY are not configured"
             return True, ""
         if self._provider() == "codex":
-            path = Path(str(cfg("AI_CHAT_CODEX_AUTH_PATH", "/opt/odin/data/codex_auth.json")))
-            return ((True, "") if path.exists() or self._shadow(path).exists()
-                    else (False, "Codex auth file was not found"))
+            path = self._codex_auth_path()
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return False, "CalmBot's Codex auth file was not found or is invalid"
+            if isinstance(data, list):
+                index = bounded(cfg("AI_CHAT_CODEX_AUTH_INDEX", 0), 0, 99, 0)
+                data = data[index] if index < len(data) else None
+            return ((True, "") if isinstance(data, dict) and data.get("access_token")
+                    else (False, "CalmBot's Codex auth file has no usable credential"))
         return False, "AI_CHAT_PROVIDER must be openai or codex"
 
-    def _codex_auth(self):
-        path = Path(str(cfg("AI_CHAT_CODEX_AUTH_PATH", "/opt/odin/data/codex_auth.json")))
-        index = bounded(cfg("AI_CHAT_CODEX_AUTH_INDEX", 0), 0, 99, 0)
-        choices = []
-        for candidate in (self._shadow(path), path):
-            try:
-                data = json.loads(candidate.read_text())
-                if isinstance(data, list):
-                    data = data[index] if index < len(data) else None
-                if isinstance(data, dict) and data.get("access_token"):
-                    choices.append(data)
-            except (OSError, ValueError, TypeError):
-                pass
-        if not choices:
-            raise RuntimeError("No usable Codex credential")
-        creds = max(choices, key=lambda x: int(x.get("expires_at", 0) or 0))
+    def _codex_auth_path(self) -> Path:
+        return Path(str(cfg("AI_CHAT_CODEX_AUTH_PATH", DEFAULT_CODEX_AUTH_PATH)))
+
+    @staticmethod
+    def _jwt_claims(token: str) -> dict:
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            profile = data.get("https://api.openai.com/profile", {})
+            auth = data.get("https://api.openai.com/auth", {})
+            if isinstance(profile, dict):
+                data.update({k: v for k, v in profile.items() if k not in data})
+            if isinstance(auth, dict):
+                data.update({k: v for k, v in auth.items() if k not in data})
+            return data
+        except Exception:
+            return {}
+
+    def _load_codex_auth(self) -> dict:
+        data = json.loads(self._codex_auth_path().read_text())
+        if isinstance(data, list):
+            index = bounded(cfg("AI_CHAT_CODEX_AUTH_INDEX", 0), 0, 99, 0)
+            data = data[index] if index < len(data) else None
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise RuntimeError("No usable CalmBot Codex credential")
+        return data
+
+    def _save_codex_auth(self, creds: dict) -> None:
+        path = self._codex_auth_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, json.dumps(creds, indent=2).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+
+    async def _refresh_codex_auth(self, stale_token: str | None = None) -> dict:
+        async with self._codex_refresh_lock:
+            creds = self._load_codex_auth()
+            if stale_token and creds.get("access_token") != stale_token:
+                return creds
+            refresh_token = creds.get("refresh_token")
+            if not refresh_token:
+                raise RuntimeError("CalmBot's Codex credential has no refresh token")
+            session = await self._http()
+            async with session.post(
+                CODEX_TOKEN_URL,
+                data={"grant_type": "refresh_token", "client_id": CODEX_CLIENT_ID,
+                      "refresh_token": refresh_token},
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Accept-Encoding": "identity"},
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"CalmBot Codex token refresh returned HTTP {resp.status}")
+                data = await resp.json(content_type=None)
+            token = data["access_token"]
+            claims = self._jwt_claims(token)
+            updated = {
+                "access_token": token,
+                "refresh_token": data.get("refresh_token", refresh_token),
+                "expires_at": int(time.time()) + int(data.get("expires_in", 3600)),
+            }
+            for key, claim in (("account_id", "chatgpt_account_id"),
+                               ("email", "email"), ("plan_type", "chatgpt_plan_type")):
+                value = claims.get(claim) or creds.get(key)
+                if value:
+                    updated[key] = value
+            self._save_codex_auth(updated)
+            log.info("CalmBot Codex credential refreshed")
+            return updated
+
+    async def _codex_auth(self, force_refresh: bool = False) -> tuple[str, Any]:
+        creds = self._load_codex_auth()
+        if force_refresh or time.time() >= int(creds.get("expires_at", 0) or 0) - CODEX_REFRESH_MARGIN:
+            creds = await self._refresh_codex_auth(creds.get("access_token"))
         return str(creds["access_token"]), creds.get("account_id")
 
     async def _reserve(self, user_id: int):
@@ -207,7 +279,7 @@ class AIChat(commands.Cog):
         return str(content).strip()
 
     async def _codex(self, messages, system):
-        token, account = self._codex_auth()
+        token, account = await self._codex_auth()
         converted = [{"type": "message", "role": m["role"],
                       "content": [{"type": "output_text" if m["role"] == "assistant" else "input_text", "text": m["content"]}]}
                      for m in messages]
@@ -218,26 +290,34 @@ class AIChat(commands.Cog):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "identity"}
         if account:
             headers["ChatGPT-Account-Id"] = str(account)
-        parts = []
         session = await self._http()
-        async with session.post(CODEX_URL, json=payload, headers=headers) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"Codex endpoint returned HTTP {resp.status}")
-            async for raw in resp.content:
-                line = raw.decode(errors="replace").strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
+        for attempt in range(2):
+            parts = []
+            async with session.post(CODEX_URL, json=payload, headers=headers) as resp:
+                if resp.status == 401 and attempt == 0:
+                    token, account = await self._codex_auth(force_refresh=True)
+                    headers["Authorization"] = f"Bearer {token}"
+                    if account:
+                        headers["ChatGPT-Account-Id"] = str(account)
                     continue
-                try:
-                    event = json.loads(line[6:])
-                except ValueError:
-                    continue
-                if event.get("type") == "response.output_text.delta":
-                    parts.append(event.get("delta", ""))
-                elif event.get("type") == "response.output_text.done" and not parts:
-                    parts.append(event.get("text", ""))
-                elif event.get("type") in ("response.failed", "error"):
-                    raise RuntimeError("Codex stream failed")
-        return "".join(parts).strip()
+                if resp.status >= 400:
+                    raise RuntimeError(f"Codex endpoint returned HTTP {resp.status}")
+                async for raw in resp.content:
+                    line = raw.decode(errors="replace").strip()
+                    if not line.startswith("data: ") or line == "data: [DONE]":
+                        continue
+                    try:
+                        event = json.loads(line[6:])
+                    except ValueError:
+                        continue
+                    if event.get("type") == "response.output_text.delta":
+                        parts.append(event.get("delta", ""))
+                    elif event.get("type") == "response.output_text.done" and not parts:
+                        parts.append(event.get("text", ""))
+                    elif event.get("type") in ("response.failed", "error"):
+                        raise RuntimeError("Codex stream failed")
+                return "".join(parts).strip()
+        raise RuntimeError("Codex authentication failed after refresh")
 
     async def _generate(self, messages, system):
         return await (self._codex(messages, system) if self._provider() == "codex" else self._openai(messages, system))
