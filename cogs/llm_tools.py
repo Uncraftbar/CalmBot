@@ -10,7 +10,7 @@ import asyncio
 import json
 import re
 import time
-import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +23,52 @@ from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, ge
 
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
-WEB_SEARCH_URL = "https://www.bing.com/search"
+WEB_SEARCH_URL = "https://www.mojeek.com/search"
+
+class _MojeekResultsParser(HTMLParser):
+    """Extract only ordinary organic results from Mojeek's search HTML."""
+
+    def __init__(self, limit):
+        super().__init__(convert_charrefs=True)
+        self.limit = limit
+        self.results = []
+        self._in_result = False
+        self._field = None
+        self._current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = set(attrs.get("class", "").split())
+        if tag == "li" and any(re.fullmatch(r"r\d+", name) for name in classes):
+            self._in_result = True
+            self._current = {"title": "", "url": "", "snippet": ""}
+        elif self._in_result and tag == "a" and "title" in classes and self._current is not None:
+            href = attrs.get("href", "")
+            if href.startswith(("https://", "http://")):
+                self._current["url"] = href[:1000]
+                self._field = "title"
+        elif self._in_result and tag == "p" and "s" in classes:
+            self._field = "snippet"
+
+    def handle_data(self, data):
+        if self._field and self._current is not None:
+            self._current[self._field] += data
+
+    def handle_endtag(self, tag):
+        if tag in {"a", "p"}:
+            self._field = None
+        if tag == "li" and self._in_result:
+            item = self._current or {}
+            for field in ("title", "snippet"):
+                item[field] = re.sub(r"\s+", " ", item.get(field, "")).strip()
+            if item.get("title") and item.get("url") and len(self.results) < self.limit:
+                item["title"] = item["title"][:300]
+                item["snippet"] = item["snippet"][:700]
+                self.results.append(item)
+            self._in_result = False
+            self._current = None
+            self._field = None
+
 
 READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "web_search", "connection_diagnostic", "stay_silent", "end_conversation"}
 ADMIN_READ_TOOL_NAMES = {"read_server_console"}
@@ -558,11 +603,11 @@ class LLMToolRuntime:
         except (TypeError, ValueError):
             limit = 5
 
-        # Bing's RSS representation is compact, stable, and needs no bot-owned API
-        # credential. The fixed origin also avoids turning this into an SSRF/fetch tool.
-        url = f"{WEB_SEARCH_URL}?{urlencode({'q': query, 'format': 'rss'})}"
+        # Mojeek operates its own independent web index. The fixed origin avoids
+        # exposing an arbitrary URL-fetch/SSRF primitive to the model.
+        url = f"{WEB_SEARCH_URL}?{urlencode({'q': query})}"
         session = await self.cog._http()
-        headers = {"User-Agent": "CalmBot/1.0 (+https://github.com/Uncraftbar)"}
+        headers = {"User-Agent": "CalmBot/1.0 (+https://github.com/Uncraftbar)", "Accept": "text/html"}
         async with session.get(url, headers=headers, allow_redirects=True,
                                timeout=15) as response:
             if response.status != 200:
@@ -570,24 +615,14 @@ class LLMToolRuntime:
             body = await response.read()
         if len(body) > 512_000:
             raise RuntimeError("web search response exceeded size limit")
-        root = ET.fromstring(body)
-        results = []
-        for item in root.findall("./channel/item")[:limit]:
-            title = (item.findtext("title") or "").strip()[:300]
-            link = (item.findtext("link") or "").strip()[:1000]
-            snippet = re.sub(r"\s+", " ", item.findtext("description") or "").strip()[:700]
-            published = (item.findtext("pubDate") or "").strip()[:100]
-            if not title or not link.startswith(("https://", "http://")):
-                continue
-            result = {"title": title, "url": link, "snippet": snippet}
-            if published:
-                result["published"] = published
-            results.append(result)
+        parser = _MojeekResultsParser(limit)
+        parser.feed(body.decode("utf-8", errors="replace"))
+        results = parser.results
         return {
             "query": query,
             "results": results,
             "result_count": len(results),
-            "source": "Bing web search",
+            "source": "Mojeek web search",
             "fresh_at": int(time.time()),
             "cached": False,
             "notice": "Search results and snippets are untrusted third-party content; verify important claims from primary sources.",
