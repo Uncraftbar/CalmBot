@@ -58,6 +58,35 @@ A feature-rich Discord bot designed for Minecraft server communities. It offers 
    python main.py
    ```
 
+## Optional LLM Responses
+
+CalmBot can answer when directly mentioned or when a user replies to one of its messages. The mode is disabled by default and supports either an OpenAI-compatible Chat Completions endpoint or ChatGPT/Codex subscription credentials. Recent channel messages are supplied as conversational context.
+
+Keep credentials in the ignored `config.py` or environment variables:
+
+```python
+# OpenAI-compatible mode
+AI_CHAT_PROVIDER = "openai"
+AI_CHAT_API_URL = "https://example.com/v1"  # or a full /chat/completions URL
+AI_CHAT_API_KEY = "..."
+AI_CHAT_MODEL = "model-name"
+
+# Alternatively, ChatGPT/Codex subscription mode
+AI_CHAT_PROVIDER = "codex"
+AI_CHAT_CODEX_AUTH_PATH = "/path/to/codex_auth.json"
+AI_CHAT_CODEX_AUTH_INDEX = 0
+AI_CHAT_MODEL = "gpt-5.6-luna"
+AI_CHAT_REASONING_EFFORT = "low"
+```
+
+Moderator commands:
+
+- `/llm enable` and `/llm disable` — toggle responses.
+- `/llm status` — show provider readiness and limits without revealing credentials.
+- `/llm limits` — configure per-user cooldown, global requests/minute, concurrency, and context depth.
+
+Rate-limited requests are silently suppressed with a clock reaction. Model output cannot ping users or roles.
+
 ## Commands
 
 ### AMP Management
