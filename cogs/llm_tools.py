@@ -80,6 +80,7 @@ class _DuckDuckGoResultsParser(HTMLParser):
 READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_modpack", "query_modpack_index", "check_modpack_contains_mod", "search_community_docs", "web_search", "connection_diagnostic", "stay_silent", "end_conversation"}
 ADMIN_READ_TOOL_NAMES = {"read_server_console"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
+STATUS_WRITE_TOOL_NAMES = {"add_status_line"}
 
 TOOL_DEFINITIONS = [
     {
@@ -207,6 +208,22 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "add_status_line",
+        "description": (
+            "Add one new line to CalmBot's rotating Discord statuses. This tool is available only "
+            "inside the dedicated /status command. Call it exactly once after composing a safe, "
+            "original status matching the existing community style."
+        ),
+        "parameters": {
+            "type": "object", "properties": {
+                "status": {
+                    "type": "string", "minLength": 1, "maxLength": 128,
+                    "description": "The final standalone status line, without quotes or commentary",
+                },
+            }, "required": ["status"], "additionalProperties": False,
+        },
+    },
+    {
         "name": "request_amp_action",
         "description": (
             "Prepare an administrator confirmation for starting, stopping, or restarting an AMP server. "
@@ -223,20 +240,25 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def _available_tool_names(include_write: bool, include_conversation_control: bool) -> set[str]:
+def _available_tool_names(include_write: bool, include_conversation_control: bool,
+                          include_status_write: bool = False) -> set[str]:
     names = READ_TOOL_NAMES | ((ADMIN_READ_TOOL_NAMES | WRITE_TOOL_NAMES) if include_write else set())
+    if include_status_write:
+        names |= STATUS_WRITE_TOOL_NAMES
     if not include_conversation_control:
         names -= {"stay_silent", "end_conversation"}
     return names
 
 
-def openai_tools(include_write: bool, *, include_conversation_control: bool = True) -> list[dict]:
-    names = _available_tool_names(include_write, include_conversation_control)
+def openai_tools(include_write: bool, *, include_conversation_control: bool = True,
+                 include_status_write: bool = False) -> list[dict]:
+    names = _available_tool_names(include_write, include_conversation_control, include_status_write)
     return [{"type": "function", "function": item} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
-def responses_tools(include_write: bool, *, include_conversation_control: bool = True) -> list[dict]:
-    names = _available_tool_names(include_write, include_conversation_control)
+def responses_tools(include_write: bool, *, include_conversation_control: bool = True,
+                    include_status_write: bool = False) -> list[dict]:
+    names = _available_tool_names(include_write, include_conversation_control, include_status_write)
     return [{"type": "function", **item, "strict": False} for item in TOOL_DEFINITIONS if item["name"] in names]
 
 
@@ -329,6 +351,8 @@ class LLMToolRuntime:
         self.image_data_urls: list[str] = []
         self.conversation_control: str | None = None
         self.allow_conversation_control = not getattr(message, "_standalone_ask", False)
+        self.allow_status_write = bool(getattr(message, "_status_request", False))
+        self.status_added: str | None = None
 
     @property
     def actor_is_admin(self) -> bool:
@@ -378,6 +402,8 @@ class LLMToolRuntime:
                 return json.dumps(await self._read_server_console(args), ensure_ascii=False)
             if name == "request_amp_action":
                 return json.dumps(await self._request_amp_action(args), ensure_ascii=False)
+            if name == "add_status_line":
+                return json.dumps(await self._add_status_line(args), ensure_ascii=False)
             return json.dumps({"error": "Unknown or unavailable tool"})
         except Exception as exc:
             log.warning("LLM read tool %s failed: %s", name, exc)
@@ -738,6 +764,25 @@ class LLMToolRuntime:
             "fresh_at": int(time.time()),
             "cached": False,
         }
+
+    async def _add_status_line(self, args):
+        # The model never receives this tool in ordinary chat or /ask, and this
+        # runtime gate independently rejects forged or accidental calls.
+        if not self.allow_status_write:
+            return {"error": "Denied: status writes are only available through /status"}
+        if self.status_added is not None:
+            return {"error": "A status was already added by this request"}
+        status_cog = self.cog.bot.get_cog("StatusRotator")
+        if status_cog is None or not hasattr(status_cog, "add_status"):
+            return {"error": "The status rotator is unavailable"}
+        status = " ".join(str(args.get("status", "")).split()).strip()
+        ok, result = await status_cog.add_status(status)
+        if not ok:
+            return {"error": result}
+        self.status_added = result
+        log.info("LLM status AUDIT: guild=%s user=%s status=%r",
+                 getattr(self.message.guild, "id", None), self.message.author.id, result)
+        return {"ok": True, "added": result, "message": "The new status is live in the rotation."}
 
     async def _request_amp_action(self, args):
         # Hard authorization gate in ordinary code, independent of model instructions.
