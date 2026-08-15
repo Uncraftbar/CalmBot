@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from cogs.game_profiles import get_game_profile, plain_chat_command
+from cogs.modpack import Modpack
 
 
 class GameProfilesTests(unittest.TestCase):
@@ -39,3 +40,15 @@ class GameSetupSurfaceTests(unittest.TestCase):
     def test_future_facing_setup_command_exists(self):
         from cogs.modpack import Modpack
         self.assertEqual(Modpack.setup_game.name, "setup_game")
+
+
+class ConnectionInfoLabelTests(unittest.TestCase):
+    def test_edit_connection_info_offers_both_url_labels(self):
+        choices = Modpack.edit_connection_info._params["url_type"].choices
+        self.assertEqual({choice.value for choice in choices}, {"Game URL", "Modpack URL"})
+
+    def test_setup_game_uses_shared_setup_command(self):
+        import inspect
+        source = inspect.getsource(Modpack.setup_modpack.callback)
+        self.assertIn('command_name == "setup_game"', source)
+        self.assertIn('link_label = "Game URL"', source)

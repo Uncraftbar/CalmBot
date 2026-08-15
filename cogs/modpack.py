@@ -123,9 +123,12 @@ class Modpack(commands.Cog):
             )
             created_channels.append(connection_info)
             
-            # Send connection info message
+            # setup_game reuses this workflow, but its link is a game/store page rather
+            # than necessarily a modpack. Preserve the distinction in the public message.
+            command_name = getattr(getattr(interaction, "command", None), "name", "")
+            link_label = "Game URL" if command_name == "setup_game" else "Modpack URL"
             await connection_info.send(
-                f"**Modpack URL:** {modpack_link}\n**Connection URL:** {connection_ip}"
+                f"**{link_label}:** {modpack_link}\n**Connection URL:** {connection_ip}"
             )
             
             # Handle role creation
@@ -490,11 +493,16 @@ class Modpack(commands.Cog):
     
     @app_commands.command(name="edit_connection_info", description="Edit the connection info message")
     @app_commands.describe(
-        category_name="Name of the modpack",
-        modpack_link="New modpack link (leave empty to keep current)",
+        category_name="Name of the game or modpack category",
+        modpack_link="New game or modpack link (leave empty to keep current)",
         connection_ip="New connection IP (leave empty to keep current)",
-        additional_info="Additional info (use 'REMOVE' to clear)"
+        additional_info="Additional info (use 'REMOVE' to clear)",
+        url_type="Label the link as a Game URL or Modpack URL (leave empty to keep current)",
     )
+    @app_commands.choices(url_type=[
+        app_commands.Choice(name="Game URL", value="Game URL"),
+        app_commands.Choice(name="Modpack URL", value="Modpack URL"),
+    ])
     @admin_only()
     async def edit_connection_info(
         self,
@@ -502,9 +510,10 @@ class Modpack(commands.Cog):
         category_name: str,
         modpack_link: str = None,
         connection_ip: str = None,
-        additional_info: str = None
+        additional_info: str = None,
+        url_type: str = None,
     ):
-        """Update the connection info message in a modpack category."""
+        """Update the connection info message in a game or modpack category."""
         guild = interaction.guild
         if not guild:
             await interaction.response.send_message(
@@ -539,28 +548,36 @@ class Modpack(commands.Cog):
         
         # Find existing bot message
         last_message = None
-        current_modpack = None
+        current_link = None
+        current_link_label = None
         current_connection = None
         current_additional = None
-        
+
         async for message in connection_info.history(limit=10):
-            if message.author == self.bot.user and "Modpack URL:" in message.content:
-                last_message = message
-                content = message.content
-                
-                if "**Modpack URL:**" in content:
-                    current_modpack = content.split("**Modpack URL:**")[1].split("\n")[0].strip()
+            if message.author != self.bot.user:
+                continue
+            content = message.content
+            for candidate in ("Game URL", "Modpack URL"):
+                marker = f"**{candidate}:**"
+                if marker in content:
+                    last_message = message
+                    current_link_label = candidate
+                    current_link = content.split(marker, 1)[1].split("\n", 1)[0].strip()
+                    break
+            if last_message:
                 if "**Connection URL:**" in content:
-                    current_connection = content.split("**Connection URL:**")[1].split("\n")[0].strip()
+                    current_connection = content.split("**Connection URL:**", 1)[1].split("\n", 1)[0].strip()
                 if "**Additional Information:**" in content:
-                    current_additional = content.split("**Additional Information:**")[1].strip()
+                    current_additional = content.split("**Additional Information:**", 1)[1].strip()
                 break
-        
-        # Build new message
-        final_modpack = modpack_link or current_modpack
+
+        # Build new message. url_type is an explicit choice, while omitted values
+        # preserve the existing label for older connection-info posts.
+        final_link = modpack_link or current_link
+        final_link_label = url_type if url_type else (current_link_label or "Modpack URL")
         final_connection = connection_ip or current_connection
         
-        if not final_modpack and not final_connection:
+        if not final_link and not final_connection:
             await interaction.edit_original_response(
                 content=None,
                 embed=error_embed("No Data", "No connection info found and no new values provided.")
@@ -568,8 +585,8 @@ class Modpack(commands.Cog):
             return
         
         new_content = ""
-        if final_modpack:
-            new_content += f"**Modpack URL:** {final_modpack}\n"
+        if final_link:
+            new_content += f"**{final_link_label}:** {final_link}\n"
         if final_connection:
             new_content += f"**Connection URL:** {final_connection}"
         
