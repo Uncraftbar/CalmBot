@@ -1,5 +1,5 @@
 """
-CalmBot - A feature-rich Discord bot for Minecraft server communities.
+CalmBot - A feature-rich Discord bot for multi-game server communities.
 
 Main entry point with improved config loading, logging, and error handling.
 """

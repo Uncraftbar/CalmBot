@@ -159,6 +159,29 @@ class Modpack(commands.Cog):
                 embed=error_embed("Error", f"Failed to create modpack: {e}")
             )
     
+    @app_commands.command(name="setup_game", description="Create channels and an optional notification role for a game server")
+    @app_commands.describe(
+        name="Game or server name",
+        platform="Platform (optional, e.g. Steam)",
+        game_link="Official, store, or community link",
+        connection_address="Server connection address",
+        role_emoji="Emoji for the notification role (optional)",
+    )
+    @admin_only()
+    async def setup_game(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        game_link: str,
+        connection_address: str,
+        platform: str = None,
+        role_emoji: str = None,
+    ):
+        """Future-facing alias for the proven channel/role setup workflow."""
+        await self.setup_modpack.callback(
+            self, interaction, name, game_link, connection_address, platform, role_emoji
+        )
+
     async def _cleanup_failed_modpack(self, category, channels):
         for channel in reversed(channels):
             try:

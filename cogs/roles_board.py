@@ -1,6 +1,6 @@
 """
 Roles board management for CalmBot.
-Handles reaction roles for modpack notifications.
+Handles reaction roles for game and server notifications.
 """
 
 import discord
@@ -132,7 +132,7 @@ class RolesBoard(commands.Cog):
         # Build embed
         embed = discord.Embed(
             title="📋 Available Server Roles",
-            description="React to get roles for modpack updates and notifications!",
+            description="React to get roles for game and server updates!",
             color=discord.Color.blue()
         )
         
@@ -256,7 +256,7 @@ class RolesBoard(commands.Cog):
         interaction: discord.Interaction,
         channel: discord.TextChannel,
         title: str = "Modpack Update Notifications",
-        description: str = "React to get roles for modpack updates and notifications"
+        description: str = "React to get roles for game and server updates"
     ):
         """Create a new roles board or update the existing one."""
         guild = interaction.guild

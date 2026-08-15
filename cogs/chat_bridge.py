@@ -21,6 +21,7 @@ from ampapi.dataclass import APIParams
 from mcstatus import JavaServer
 
 import config
+from cogs.game_profiles import get_game_profile, plain_chat_command
 from cogs.utils import (
     get_logger,
     load_json,
@@ -114,7 +115,7 @@ class ChatBridge(commands.Cog):
             if not group_data.get("active", True):
                 continue
             for name in group_data.get("servers", []):
-                if name in self.instances:
+                if name in self.instances and self._profile(self.instances[name]).chat_receive:
                     active[name] = self.instances[name]
         return active
 
@@ -762,12 +763,11 @@ class ChatBridge(commands.Cog):
             return [snbt_cmd]
         return [modern_cmd, legacy_cmd, snbt_cmd]
 
+    def _profile(self, instance):
+        return get_game_profile(instance)
+
     def _is_minecraft(self, instance):
-        if not instance: return False
-        # Check multiple attributes for robustness
-        mod_disp = str(getattr(instance, 'module_display_name', '')).lower()
-        mod_internal = str(getattr(instance, 'module', '')).lower()
-        return "minecraft" in mod_disp or "minecraft" in mod_internal
+        return bool(instance and self._profile(instance).minecraft)
 
     @staticmethod
     def _discord_text_for_minecraft(text):
@@ -833,9 +833,10 @@ class ChatBridge(commands.Cog):
                 if self._is_minecraft(target):
                     cmd = self._minecraft_chat_json("CalmBot", text)
                 else:
-                    cmd = f'tellraw @a "[Discord] <CalmBot> {safe_text}"'
-                self._enqueue_send(target, cmd, target_name)
-                count += 1
+                    cmd = plain_chat_command(self._profile(target), f"[Discord] <CalmBot> {safe_text}")
+                if cmd:
+                    self._enqueue_send(target, cmd, target_name)
+                    count += 1
             break
         return count
 
@@ -882,9 +883,9 @@ class ChatBridge(commands.Cog):
                     if self._is_minecraft(target):
                         cmd = self._minecraft_chat_json(safe_user, msg)
                     else:
-                        cmd = f'tellraw @a "[Discord] <{safe_user}> {safe_msg}"'
-
-                    self._enqueue_send(target, cmd, target_name)
+                        cmd = plain_chat_command(self._profile(target), f"[Discord] <{safe_user}> {safe_msg}")
+                    if cmd:
+                        self._enqueue_send(target, cmd, target_name)
             
             # We found the group, no need to check others (assuming 1:1 mapping preference)
             break
@@ -935,11 +936,14 @@ class ChatBridge(commands.Cog):
         for target_name in unique_targets:
             target = self.instances.get(target_name)
             if target:
-                count += 1
                 if self._is_minecraft(target):
                     self._enqueue_send(target, f"tellraw @a {json_cmd}", target_name)
+                    count += 1
                 else:
-                    self._enqueue_send(target, plain_cmd, target_name)
+                    command = plain_chat_command(self._profile(target), f"[System] {safe_plain_message}")
+                    if command:
+                        self._enqueue_send(target, command, target_name)
+                        count += 1
         return count
 
     async def _get_online_players(self, group_data):
@@ -1500,8 +1504,9 @@ class ChatBridge(commands.Cog):
                             if self._is_minecraft(target):
                                 cmd = f'tellraw @a ["",{{"text":"[{safe_source}] ", "color": "{color}"}}, {{ "text": "<{safe_user}> ", "color": "white" }}, {{ "text": "{safe_msg}", "color": "white" }}]'
                             else:
-                                cmd = f'tellraw @a "[{safe_source}] <{safe_user}> {safe_msg}"'
-                            self._enqueue_send(target, cmd, target_name)
+                                cmd = plain_chat_command(self._profile(target), f"[{safe_source}] <{safe_user}> {safe_msg}")
+                            if cmd:
+                                self._enqueue_send(target, cmd, target_name)
 
                     if discord_channel:
                         avatar_url = f"https://mc-heads.net/avatar/{quote(user, safe='')}" if is_minecraft_source else None

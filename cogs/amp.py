@@ -12,6 +12,8 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+from cogs.game_profiles import get_game_profile
+
 from cogs.utils import (
     get_logger, 
     check_permissions, 
@@ -105,8 +107,10 @@ class InstanceControlView(discord.ui.View):
         if state.lower() == 'running':
             self.add_item(RestartButton(instance))
             self.add_item(StopButton(instance))
-            self.add_item(TPSButton(instance, bot))
-            self.add_item(ProfilerButton(instance, bot))
+            profile = get_game_profile(instance)
+            if profile.spark:
+                self.add_item(TPSButton(instance, bot))
+                self.add_item(ProfilerButton(instance, bot))
         else:
             self.add_item(StartButton(instance))
         
@@ -388,7 +392,8 @@ class AMP(commands.Cog):
             except Exception:
                 pass
             emoji = "🟢" if state.lower() == "running" else "🔴" if state.lower() == "stopped" else "🟡"
-            detail = f"Status: **{state}**" + (f" · Players: **{users}**" if users is not None else "")
+            profile = get_game_profile(inst)
+            detail = f"Game: **{profile.label}** · Status: **{state}**" + (f" · Players: **{users}**" if users is not None and profile.player_metrics else "")
             embed.add_field(name=f"{emoji} {name}"[:256], value=detail, inline=False)
         embed.set_footer(text="Live AMP status · use Refresh for current data")
         return embed

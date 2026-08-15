@@ -140,3 +140,27 @@ PUBLIC_SERVER_REFRESH_COOLDOWN_SECONDS = 15
 ## License
 
 This project is provided as-is for educational and personal use.
+## Multi-game AMP support
+
+AMP lifecycle controls and public status/player metrics are game-neutral. Game-specific
+features are declared in `cogs/game_profiles.py`; Dune: Awakening is included and can
+be discovered and controlled through AMP's Generic Module. Spark buttons only appear
+for Minecraft profiles.
+
+Chat bridging is capability-gated. Dune chat is intentionally disabled until a stable,
+verified Dune/AMP console receive format and outbound command are available; CalmBot
+will not send Minecraft `tellraw` commands to it. Future games can normally be added
+with `GAME_PROFILES` and `GAME_INSTANCE_OVERRIDES` configuration rather than cog edits:
+
+```python
+GAME_INSTANCE_OVERRIDES = {
+    "Dune Dedicated": {"profile": "dune_awakening"},
+    # Once a game's protocol is verified:
+    # "Future Server": {"profile": "generic", "label": "Future Game",
+    #                   "chat_send": True, "chat_command_template": "say {message}"},
+}
+```
+
+The existing `/setup_modpack` command already accepts a game name and platform such as
+`Steam`; its created category, channels, connection information, and notification role
+work for Dune and other games. Legacy command names remain for compatibility.
