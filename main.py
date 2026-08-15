@@ -143,7 +143,7 @@ class CalmBot(commands.Bot):
         for filename in sorted(os.listdir(cogs_dir)):
             if not filename.endswith(".py"):
                 continue
-            if filename == "utils.py":  # Skip utility module
+            if filename in {"utils.py", "game_profiles.py"}:  # Skip utility modules
                 continue
             
             cog_name = f"cogs.{filename[:-3]}"
