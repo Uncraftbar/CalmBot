@@ -122,7 +122,7 @@ PUBLIC_SERVER_REFRESH_COOLDOWN_SECONDS = 15
 
 ### Role System
 - `/setup_roles_board` - Create or update the message for role reactions.
-- `/sync_roles_board` - Scan for missing/deleted modpacks and clean up the roles board.
+- `/edit_roles_board` - Remove and rearrange entries on the roles board.
 
 ## Requirements
 
