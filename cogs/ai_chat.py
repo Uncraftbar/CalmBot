@@ -942,6 +942,42 @@ class AIChat(commands.Cog):
             result["tool_calls"] = message["tool_calls"]
         return result
 
+    async def _openai_post(self, url: str, payload: dict) -> dict:
+        """POST to an OpenAI-compatible endpoint with bounded transient retries."""
+        session = await self._http()
+        retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+        last_error = "provider request failed"
+        for attempt in range(3):
+            try:
+                async with session.post(
+                    url, json=payload,
+                    headers={"Authorization": f"Bearer {self._load_openai_key()}"},
+                    timeout=aiohttp.ClientTimeout(total=75),
+                ) as resp:
+                    if resp.status < 400:
+                        try:
+                            return await resp.json(content_type=None)
+                        except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
+                            raise RuntimeError("LLM endpoint returned invalid JSON") from exc
+                    request_id = (resp.headers.get("x-request-id") or resp.headers.get("request-id") or "")[:80]
+                    last_error = f"LLM endpoint returned HTTP {resp.status}"
+                    if request_id:
+                        last_error += f" (request {request_id})"
+                    if resp.status not in retryable_statuses:
+                        raise RuntimeError(last_error)
+                    retry_after = resp.headers.get("Retry-After", "")
+                    try:
+                        delay = min(8.0, max(0.5, float(retry_after)))
+                    except ValueError:
+                        delay = float(2 ** attempt)
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+                last_error = f"LLM connection failed ({type(exc).__name__})"
+                delay = float(2 ** attempt)
+            if attempt < 2:
+                log.warning("%s; retrying in %.1fs", last_error, delay)
+                await asyncio.sleep(delay)
+        raise RuntimeError(last_error)
+
     async def _openai(self, messages, system, runtime: LLMToolRuntime, model: str | None = None):
         url = self._openai_url().rstrip("/")
         if url.endswith("/v1"):
@@ -964,11 +1000,7 @@ class AIChat(commands.Cog):
                     include_status_write=runtime.allow_status_write),
                 "tool_choice": "auto",
             }
-            async with session.post(url, json=payload,
-                                    headers={"Authorization": f"Bearer {self._load_openai_key()}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LLM endpoint returned HTTP {resp.status}")
-                data = await resp.json(content_type=None)
+            data = await self._openai_post(url, payload)
             try:
                 response_message = data["choices"][0]["message"]
             except (KeyError, IndexError, TypeError) as exc:
@@ -995,11 +1027,7 @@ class AIChat(commands.Cog):
             "temperature": float(self._setting("temperature", "AI_CHAT_TEMPERATURE", 0.7)),
             "tool_choice": "none",
         }
-        async with session.post(url, json=payload,
-                                headers={"Authorization": f"Bearer {self._load_openai_key()}"}) as resp:
-            if resp.status >= 400:
-                raise RuntimeError(f"LLM endpoint returned HTTP {resp.status}")
-            data = await resp.json(content_type=None)
+        data = await self._openai_post(url, payload)
         try:
             return str(data["choices"][0]["message"].get("content") or "").strip()
         except (KeyError, IndexError, TypeError) as exc:
@@ -1315,7 +1343,8 @@ class AIChat(commands.Cog):
         except Exception as exc:
             self._usage["failed"] += 1
             self._recent_failures.appendleft({"when": int(time.time()), "type": type(exc).__name__})
-            log.error("LLM response failed (%s)", type(exc).__name__)
+            detail = re.sub(r"(?i)(bearer|token|key|password|secret)\s*[:=]?\s*\S+", r"\1=[REDACTED]", str(exc))[:240]
+            log.error("LLM response failed (%s): %s", type(exc).__name__, detail or "no detail")
             # Only explicit triggers receive an error. Passive conversation traffic
             # stays silent on provider failures instead of interrupting humans.
             try:

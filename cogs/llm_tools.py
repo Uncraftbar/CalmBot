@@ -657,11 +657,23 @@ class LLMToolRuntime:
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with session.get(url, headers=headers, allow_redirects=True,
-                               timeout=15) as response:
-            if response.status != 200:
-                raise RuntimeError(f"web search HTTP {response.status}")
-            body = await response.read()
+        body = None
+        last_status = None
+        for attempt in range(3):
+            async with session.get(url, headers=headers, allow_redirects=True,
+                                   timeout=15) as response:
+                last_status = response.status
+                if response.status == 200:
+                    body = await response.read()
+                    break
+                # DuckDuckGo occasionally returns 202 while throttling automated
+                # HTML searches. Treat it like other transient upstream failures.
+                if response.status not in {202, 429, 500, 502, 503, 504}:
+                    raise RuntimeError(f"web search HTTP {response.status}")
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt)
+        if body is None:
+            raise RuntimeError(f"web search HTTP {last_status} after retries")
         if len(body) > 512_000:
             raise RuntimeError("web search response exceeded size limit")
         parser = _DuckDuckGoResultsParser(limit)

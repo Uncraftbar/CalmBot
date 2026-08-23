@@ -74,6 +74,8 @@ class ChatBridge(commands.Cog):
         self.ws_tasks = {}
         self.ws_connected = set()
         self.ws_entry_queues = {}
+        self.ws_drop_counts = {}
+        self.ws_drop_last_log = {}
         self.last_fallback_poll = {}
         self.ws_base_url = self._make_ws_base_url(self.amp_url)
         self.ws_alerted = set()
@@ -226,7 +228,17 @@ class ChatBridge(commands.Cog):
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            log.warning(f"Dropped oldest queued AMP event for {name}")
+            # A noisy server can send a historical console burst containing
+            # hundreds of thousands of entries. Logging once per dropped entry
+            # amplified that burst enough to starve Discord interaction handling.
+            count = self.ws_drop_counts.get(name, 0) + 1
+            self.ws_drop_counts[name] = count
+            now = datetime.now(timezone.utc).timestamp()
+            last = self.ws_drop_last_log.get(name, 0.0)
+            if now - last >= 30:
+                log.warning("Dropped %s stale queued AMP event(s) for %s in the last interval", count, name)
+                self.ws_drop_counts[name] = 0
+                self.ws_drop_last_log[name] = now
         queue.put_nowait(entry)
 
     @staticmethod

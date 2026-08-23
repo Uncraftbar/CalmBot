@@ -45,7 +45,11 @@ def setup_logging(name: str = "calmbot", level: int = logging.INFO) -> logging.L
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-    
+
+    # Every CalmBot logger owns its formatted console handler. Without this,
+    # child records also bubble through calmbot's handler and every line is
+    # emitted twice (including high-volume bridge warnings).
+    logger.propagate = False
     return logger
 
 
