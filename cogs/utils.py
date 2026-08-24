@@ -378,7 +378,11 @@ async def find_category_by_name(
 _amp_log = get_logger("amp")
 
 
-async def fetch_valid_instances() -> list:
+class AMPDiscoveryError(RuntimeError):
+    """AMP controller discovery failed; distinct from a valid empty result."""
+
+
+async def fetch_valid_instances(*, strict: bool = False) -> list:
     """
     Fetch and filter AMP instances, excluding ADS/Controller.
     
@@ -417,8 +421,26 @@ async def fetch_valid_instances() -> list:
         return valid_instances
         
     except Exception as e:
-        _amp_log.error(f"Failed to fetch AMP instances: {e}")
+        _amp_log.error("Failed to fetch AMP instances (%s)", type(e).__name__)
+        if strict:
+            raise AMPDiscoveryError("AMP instance discovery failed") from e
         return []
+
+
+def get_metric_data(status, metric_name: str) -> dict:
+    """Return one AMP metric as bounded numeric data, regardless of ampapi shape."""
+    metrics = getattr(status, "metrics", None)
+    value = getattr(metrics, metric_name, None) if metrics is not None else None
+    if value is None:
+        return {}
+    source = value if isinstance(value, dict) else {name: getattr(value, name, None) for name in ("raw_value", "max_value", "percent", "units")}
+    result = {}
+    for name in ("raw_value", "max_value", "percent"):
+        item = source.get(name)
+        if isinstance(item, (int, float)) and not isinstance(item, bool): result[name] = item
+    units = source.get("units")
+    if isinstance(units, str) and units: result["units"] = units[:20]
+    return result
 
 
 def get_player_data(status) -> tuple[list[str], Optional[int]]:

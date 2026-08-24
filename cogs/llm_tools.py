@@ -18,8 +18,11 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import config
 import discord
+from mcstatus import JavaServer
 
-from cogs.utils import fetch_valid_instances, get_instance_state, get_logger, get_player_data
+from cogs.utils import (AMPDiscoveryError, fetch_valid_instances, get_instance_state, get_logger,
+                        get_metric_data, get_player_data)
+from cogs.game_profiles import get_game_profile
 
 log = get_logger("llm_tools")
 MODPACK_INDEX_URL = "https://www.modpackindex.com/api/v1"
@@ -97,7 +100,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "server_status",
-        "description": "Get live read-only state and player counts for CalmBot's AMP game servers.",
+        "description": "Get fresh AMP application state, player counts, CPU/memory metrics, and endpoint metadata for public game servers. Use connection_diagnostic when asked whether a server is actually reachable or healthy.",
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -315,24 +318,20 @@ class AMPActionConfirmView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(view=self)
 
-        instances = await fetch_valid_instances()
-        instance = next((x for x in instances if x.instance_name == self.action.instance_name), None)
-        if instance is None:
-            await interaction.followup.send("The selected AMP instance is no longer available; nothing was changed.", ephemeral=True)
-            return
-        method = {"start": instance.start_application, "stop": instance.stop_application,
-                  "restart": instance.restart_application}[self.action.action]
-        try:
-            await asyncio.wait_for(method(), timeout=20)
-            log.warning("LLM AMP AUDIT: guild=%s user=%s action=%s instance=%s reason=%r",
-                        interaction.guild_id, self.actor_id, self.action.action,
-                        self.action.instance_name, self.action.reason)
+        gateway = interaction.client.get_cog("ModeratorActions")
+        if gateway is None or not hasattr(gateway, "execute_confirmed_amp_action"):
             await interaction.followup.send(
-                f"AMP **{self.action.action}** requested for **{self.action.display_name}**. "
-                f"Reason: {self.action.reason}", ephemeral=True)
-        except Exception as exc:
-            log.error("Confirmed LLM AMP action failed for %s: %s", self.action.instance_name, exc)
-            await interaction.followup.send("AMP rejected or failed the action; no success was assumed.", ephemeral=True)
+                "The audited AMP action gateway is unavailable; nothing was changed.", ephemeral=True
+            )
+            return
+        result = await gateway.execute_confirmed_amp_action(
+            interaction,
+            self.action.action,
+            self.action.instance_name,
+            self.action.reason,
+            origin="llm_tool",
+        )
+        await interaction.followup.send(result.message, ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -410,7 +409,7 @@ class LLMToolRuntime:
             return json.dumps({"error": f"{name} is temporarily unavailable"})
 
     async def _instances(self):
-        return await asyncio.wait_for(fetch_valid_instances(), timeout=15)
+        return await asyncio.wait_for(fetch_valid_instances(strict=True), timeout=15)
 
     async def _public_instances(self):
         """Apply the same public-server allowlist used by /servers."""
@@ -428,34 +427,62 @@ class LLMToolRuntime:
             or str(instance.friendly_name or "").casefold() in allowlist
         ]
 
+    @staticmethod
+    def _public_endpoint(instance):
+        """Select the game endpoint advertised by AMP, excluding management/SFTP."""
+        for endpoint in getattr(instance, "application_endpoints", None) or []:
+            label = str(endpoint.get("display_name", ""))
+            if "sftp" in label.casefold() or "unknown" in label.casefold():
+                continue
+            value = str(endpoint.get("endpoint", "")).strip()
+            if value:
+                return {"label": label[:100], "address": value[:200]}
+        return None
+
+    async def _status_item(self, instance):
+        name = instance.friendly_name or instance.instance_name
+        profile = get_game_profile(instance)
+        try:
+            status = await asyncio.wait_for(instance.get_instance_status(), timeout=8)
+            _names, count = get_player_data(status)
+            return {"server": name, "game": profile.label, "state": get_instance_state(status),
+                    "players": count, "amp_instance_reachable": True,
+                    "cpu": get_metric_data(status, "cpu_usage"),
+                    "memory": get_metric_data(status, "memory_usage"),
+                    "endpoint": self._public_endpoint(instance)}
+        except asyncio.TimeoutError:
+            return {"server": name, "game": profile.label, "state": "Unknown", "players": None,
+                    "amp_instance_reachable": False, "error": "AMP status timed out"}
+        except Exception as exc:
+            return {"server": name, "game": profile.label, "state": "Unknown", "players": None,
+                    "amp_instance_reachable": False, "error": f"AMP status failed ({type(exc).__name__})"}
+
     async def _server_status(self):
-        result = []
-        for instance in await self._public_instances():
-            name = instance.friendly_name or instance.instance_name
-            try:
-                status = await asyncio.wait_for(instance.get_instance_status(), timeout=8)
-                _names, count = get_player_data(status)
-                result.append({"server": name, "state": get_instance_state(status), "players": count})
-            except Exception:
-                result.append({"server": name, "state": "Unknown", "players": None})
-        return {"servers": result, "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
+        try:
+            instances = await self._public_instances()
+        except (AMPDiscoveryError, asyncio.TimeoutError) as exc:
+            return {"servers": [], "verified": False, "error": "AMP discovery unavailable",
+                    "error_type": type(exc).__name__, "source": "AMP controller discovery",
+                    "fresh_at": int(time.time()), "cached": False}
+        items = await asyncio.gather(*(self._status_item(instance) for instance in instances))
+        return {"servers": items, "verified": bool(instances),
+                "error": None if instances else "No public AMP instances were discovered",
+                "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
 
     async def _online_players(self):
+        status = await self._server_status()
         result = []
-        for instance in await self._public_instances():
-            name = instance.friendly_name or instance.instance_name
-            try:
-                status = await asyncio.wait_for(instance.get_instance_status(), timeout=8)
-                players, count = get_player_data(status)
-                item = {"server": name, "players": players[:100], "count": count}
-                if count is None:
-                    item["error"] = "player count unavailable"
-                elif count and not players:
-                    item["note"] = "AMP reports a count but not player names"
-                result.append(item)
-            except Exception:
-                result.append({"server": name, "error": "status unavailable"})
-        return {"servers": result, "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
+        for item in status["servers"]:
+            entry = {"server": item["server"], "count": item.get("players"), "players": []}
+            if item.get("error"):
+                entry["error"] = item["error"]
+            elif item.get("players") is None:
+                entry["error"] = "player count unavailable"
+            elif item.get("players"):
+                entry["note"] = "AMP reports a count but not player names"
+            result.append(entry)
+        return {"servers": result, "verified": status.get("verified", False), "error": status.get("error"),
+                "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
 
     async def _mpi_get(self, path: str, params: dict | None = None):
         cache = getattr(self.cog, "_public_tool_cache", None)
@@ -689,41 +716,52 @@ class LLMToolRuntime:
             "notice": "Search results and snippets are untrusted third-party content; verify important claims from primary sources.",
         }
 
+    async def _probe_minecraft(self, item):
+        address = (item.get("endpoint") or {}).get("address", "")
+        if not address: return {"supported": True, "reachable": False, "error": "No Minecraft endpoint advertised by AMP"}
+        host, sep, port = address.rpartition(":")
+        if not sep: return {"supported": True, "reachable": False, "error": "Invalid Minecraft endpoint"}
+        if host in {"0.0.0.0", "::", "[::]", "localhost"}: host = urlparse(str(getattr(config, "AMP_API_URL", ""))).hostname or "localhost"
+        try:
+            server = await asyncio.wait_for(JavaServer.async_lookup(f"{host}:{int(port)}"), timeout=3)
+            reply = await asyncio.wait_for(server.async_status(), timeout=5)
+            return {"supported": True, "reachable": True, "latency_ms": round(float(reply.latency), 1),
+                    "players_online": getattr(reply.players, "online", None), "players_max": getattr(reply.players, "max", None),
+                    "protocol": "Minecraft status ping"}
+        except Exception as exc:
+            return {"supported": True, "reachable": False, "error": f"Minecraft status probe failed ({type(exc).__name__})"}
+
     async def _connection_diagnostic(self, args):
-        requested_raw = str(args.get("server", "")).strip()
-        requested = self._server_key(requested_raw)
+        requested_raw = str(args.get("server", "")).strip(); requested = self._server_key(requested_raw)
         status = await self._server_status()
+        if not status.get("verified"):
+            return {"verified": False, "healthy": False, "reason": "amp_discovery_unavailable", "error": status.get("error"),
+                    "source": status.get("source"), "fresh_at": int(time.time()), "cached": False}
         servers = status["servers"]
         if requested:
             exact = [item for item in servers if self._server_key(item.get("server")) == requested]
-            if not exact:
-                return {"verified": False, "reason": "public_server_not_found", "public_servers": [item.get("server") for item in servers]}
+            if not exact: return {"verified": False, "healthy": False, "reason": "public_server_not_found", "public_servers": [item.get("server") for item in servers]}
             servers = exact
-        findings = []
+        findings=[]; all_healthy=True
         for item in servers:
-            state = str(item.get("state", "unknown")).casefold()
-            if state != "running": findings.append(f"{item['server']} is {item.get('state', 'Unknown')}")
-            elif item.get("players") is None: findings.append(f"{item['server']} is running, but AMP player metrics are unavailable")
-            else: findings.append(f"{item['server']} is running and AMP reports {item['players']} player(s)")
-        result = {"verified": True, "findings": findings,
-                  "limits": ["Live AMP state cannot inspect the player's client, DNS path, firewall, account, or mod mismatch."],
-                  "source": "AMP live status", "fresh_at": int(time.time()), "cached": False}
-        # An administrator asking about one server should not have to guess that a
-        # second tool exists. Fold the passive console evidence into this composite
-        # diagnostic, while retaining the hard authorization check in that tool.
-        if self.actor_is_admin and len(servers) == 1:
-            console = json.loads(await self.execute("read_server_console", {
-                "server": servers[0].get("server", requested_raw), "minutes": 60
-            }))
-            result["console"] = console
-            if console.get("error"):
-                result["limits"].append(f"Console evidence unavailable: {console['error']}")
-            elif not console.get("entries"):
-                result["limits"].append(
-                    "No recent console entries were captured; do not claim the console was inspected for the earlier incident."
-                )
+            state=str(item.get("state", "unknown")); running=state.casefold()=="running" and item.get("amp_instance_reachable") is True
+            if item.get("game") == "Minecraft" and running:
+                item["game_probe"] = await self._probe_minecraft(item); healthy=bool(item["game_probe"].get("reachable"))
             else:
-                result["source"] = "AMP live status and recent redacted AMP console history"
+                item["game_probe"] = {"supported": False, "note": "No safe game-protocol health probe is configured for this game"}; healthy=running
+            item["healthy"]=healthy; all_healthy=all_healthy and healthy
+            if item.get("error"): findings.append(f"{item['server']}: {item['error']}")
+            elif not running: findings.append(f"{item['server']} is {state}")
+            elif item["game_probe"].get("reachable"): findings.append(f"{item['server']} is running and answered a Minecraft status ping")
+            else: findings.append(f"{item['server']} is running in AMP; direct game reachability is unverified")
+        result={"verified": True, "healthy": all_healthy, "servers": servers, "findings": findings,
+                "limits": ["AMP state alone does not verify a player's client, DNS path, firewall, account, or mod compatibility.", "Games without a configured protocol probe are only verified through AMP process state."],
+                "source": "AMP live status plus supported game-protocol probes", "fresh_at": int(time.time()), "cached": False}
+        if self.actor_is_admin and len(servers)==1:
+            console=json.loads(await self.execute("read_server_console", {"server": servers[0]["server"], "minutes": 60})); result["console"]=console
+            if console.get("error"): result["limits"].append(f"Console evidence unavailable: {console['error']}")
+            elif not console.get("entries"): result["limits"].append("No recent console entries were captured; do not claim the console was inspected for an earlier incident.")
+            else: result["source"] += " and recent redacted AMP console history"
         return result
 
     @staticmethod

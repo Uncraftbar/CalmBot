@@ -156,16 +156,15 @@ class ConfirmServerActionModal(discord.ui.Modal):
             return
         await interaction.response.defer(ephemeral=True)
         name = self.instance.friendly_name or self.instance.instance_name
-        method = {"restart": self.instance.restart_application, "stop": self.instance.stop_application,
-                  "start": self.instance.start_application}[self.action]
-        try:
-            await method()
-            reason = str(self.reason).strip()
-            await interaction.followup.send(embed=success_embed(self.action.title() + " requested", f"**{name}**: {reason}"), ephemeral=True)
-            log.warning(f"AMP AUDIT: {interaction.user} requested {self.action} for {name}; reason={reason!r}")
-        except Exception as exc:
-            log.error(f"Failed to {self.action} {name}: {exc}")
-            await interaction.followup.send(embed=error_embed(self.action.title() + " failed", str(exc)), ephemeral=True)
+        gateway = interaction.client.get_cog("ModeratorActions")
+        if gateway is None or not hasattr(gateway, "execute_confirmed_amp_action"):
+            await interaction.followup.send(embed=error_embed("AMP action failed", "The audited action gateway is unavailable; nothing was changed."), ephemeral=True)
+            return
+        result = await gateway.execute_confirmed_amp_action(
+            interaction, self.action, self.instance.instance_name, str(self.reason).strip(), origin="amp_modal"
+        )
+        embed = success_embed(result.title, result.message) if result.ok else error_embed(result.title, result.message)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class RestartButton(discord.ui.Button):
