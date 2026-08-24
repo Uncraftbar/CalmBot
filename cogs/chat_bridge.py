@@ -1279,11 +1279,17 @@ class ChatBridge(commands.Cog):
         active_instances = self._active_instances()
         if not active_instances:
             return
-        self._reconcile_ws_tasks(active_instances)
-        await self._check_stream_health()
+        # Core/GetUpdates and /stream share AMP's per-instance session cursor.
+        # On the deployed AMP version the socket emits Metrics but not ConsoleEntry,
+        # while still consuming the update stream. Do not attach that socket to chat
+        # instances: keep one authoritative GetUpdates consumer for console/chat.
+        for task in self.ws_tasks.values():
+            task.cancel()
+        self.ws_tasks.clear()
+        self.ws_connected.clear()
 
-        # 2. Drain pushed entries immediately. Poll only disconnected streams,
-        # at the old cadence, so socket outages remain transparent.
+        # 2. Drain any already-queued entries, then poll the authoritative console
+        # feed. A single consumer avoids AMP cursor races and missing player chat.
         updates_map = {}
         for name in active_instances:
             queue = self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
@@ -1297,16 +1303,20 @@ class ChatBridge(commands.Cog):
                 updates_map[name] = SimpleNamespace(console_entries=entries)
 
         now = datetime.now(timezone.utc)
-        fallback = []
+        # AMP's event stream carries metrics reliably, but current AMP versions do
+        # not emit ConsoleEntry events on every game instance. Core/GetUpdates is
+        # the authoritative per-session console feed, so poll it even while the
+        # socket is connected. Treating a metrics-only socket as a complete chat
+        # feed silently drops all Minecraft -> Discord messages.
+        console_polls = []
         for name, instance in active_instances.items():
-            if name in self.ws_connected:
-                continue
             last = self.last_fallback_poll.get(name, 0.0)
-            if now.timestamp() - last >= 2.0:
+            interval = 0.75
+            if now.timestamp() - last >= interval:
                 self.last_fallback_poll[name] = now.timestamp()
-                fallback.append(self._fetch_update_safe(name, instance))
-        if fallback:
-            for name, updates in await asyncio.gather(*fallback):
+                console_polls.append(self._fetch_update_safe(name, instance))
+        if console_polls:
+            for name, updates in await asyncio.gather(*console_polls):
                 if updates and getattr(updates, "console_entries", None):
                     existing = updates_map.get(name)
                     if existing:
@@ -1352,13 +1362,15 @@ class ChatBridge(commands.Cog):
 
             # Initialization (High-Water Mark)
             if source_name not in self.high_water_marks:
-                if parsed_entries:
-                    latest_ts, latest_entry = parsed_entries[-1]
-                    latest_hash = hash(f"{str(getattr(latest_entry, 'source', ''))}:{str(getattr(latest_entry, 'contents', ''))}")
-                    self.high_water_marks[source_name] = {'ts': latest_ts, 'hashes': {latest_hash}}
-                else:
-                    self.high_water_marks[source_name] = {'ts': datetime.now(timezone.utc), 'hashes': set()}
-                continue
+                # GetUpdates is session-scoped. The first response can contain chat
+                # that arrived after this bot session was established, so process a
+                # small recent window instead of discarding the entire first batch.
+                # The age limit still suppresses historical console backlog.
+                startup_cutoff = datetime.now(timezone.utc).timestamp() - 15
+                self.high_water_marks[source_name] = {
+                    'ts': datetime.fromtimestamp(startup_cutoff, tz=timezone.utc),
+                    'hashes': set(),
+                }
 
             watermark = self.high_water_marks[source_name]
             valid_new = []
@@ -1573,6 +1585,7 @@ class ChatBridge(commands.Cog):
                     kwargs["avatar_url"] = avatar_url
 
                 await webhook.send(**kwargs)
+                log.info("Relayed game chat to Discord source=%s user=%s channel=%s", source_name, user, channel.id)
             else:
                 # Fallback if webhook creation failed
                 safe_user = discord.utils.escape_markdown(user)
