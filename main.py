@@ -29,9 +29,6 @@ class Config:
     def __init__(self):
         self.bot_token: str = ""
         self.guild_ids: list[int] = []
-        self.amp_api_url: str = ""
-        self.amp_user: str = ""
-        self.amp_pass: str = ""
     
     @classmethod
     def load(cls) -> "Config":
@@ -65,11 +62,6 @@ class Config:
             # Required settings
             config.bot_token = getattr(config_module, 'BOT_TOKEN', '')
             config.guild_ids = getattr(config_module, 'GUILD_IDS', [])
-            
-            # Optional AMP settings
-            config.amp_api_url = getattr(config_module, 'AMP_API_URL', '')
-            config.amp_user = getattr(config_module, 'AMP_USER', '')
-            config.amp_pass = getattr(config_module, 'AMP_PASS', '')
             
             # Validation
             if not config.bot_token:

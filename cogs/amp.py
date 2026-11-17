@@ -204,7 +204,7 @@ class TPSButton(discord.ui.Button):
             await interaction.followup.send("Fetching TPS data...", ephemeral=True)
             bridge = self.bot.get_cog("ChatBridge")
             if bridge is None:
-                raise RuntimeError("Chat bridge event stream is unavailable")
+                raise RuntimeError("Chat bridge console feed is unavailable")
             all_lines = await bridge.run_console_command(
                 self.instance,
                 "spark tps",
@@ -278,7 +278,7 @@ class ProfilerButton(discord.ui.Button):
             )
             bridge = self.bot.get_cog("ChatBridge")
             if bridge is None:
-                raise RuntimeError("Chat bridge event stream is unavailable")
+                raise RuntimeError("Chat bridge console feed is unavailable")
             all_lines = await bridge.run_console_command(
                 self.instance,
                 "spark profiler start --timeout 30",

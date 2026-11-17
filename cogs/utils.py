@@ -402,12 +402,6 @@ def is_elevated_role(role: Any) -> bool:
     return any(getattr(permissions, name, False) for name in ELEVATED_PERMISSIONS)
 
 
-# Legacy function for backwards compatibility
-async def has_admin_or_mod_permissions(interaction: discord.Interaction) -> bool:
-    """Legacy permission check. Use check_permissions() or @admin_only() instead."""
-    return await check_permissions(interaction)
-
-
 # =============================================================================
 # VALIDATION HELPERS
 # =============================================================================

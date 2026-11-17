@@ -802,7 +802,7 @@ class LLMToolRuntime:
                 "Sensitive-looking credentials and IP addresses are redacted before model access.",
                 "No console command was sent.",
             ],
-            "source": "AMP real-time console event stream with polling fallback",
+            "source": "AMP console output, polled by the chat bridge",
             "fresh_at": int(time.time()),
             "cached": False,
         }

@@ -9,11 +9,9 @@ import re
 import time
 import traceback
 from collections import deque
-from types import SimpleNamespace
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote
 
-import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -91,23 +89,13 @@ class ChatBridge(commands.Cog):
         self.send_workers = {}
         self.last_instance_refresh = datetime.min.replace(tzinfo=timezone.utc)
 
-        # AMP pushes console events in real time. Each active instance gets one
-        # socket; the existing GetUpdates path remains as an automatic fallback.
-        self.ws_tasks = {}
-        self.ws_connected = set()
-        self.ws_entry_queues = {}
-        self.ws_drop_counts = {}
-        self.ws_drop_last_log = {}
-        self.last_fallback_poll = {}
+        self.last_console_poll = {}     # name -> timestamp of the last console poll
         # Adaptive console polling (see the POLL_* constants).
         self.last_player_activity = {}  # name -> timestamp of the last player event seen in the console
         self.amp_player_counts = {}     # name -> AMP's (unreliable) player count from the latest poll
         self.instance_running = {}      # name -> whether AMP reports the instance as running
         self.poll_modes = {}            # name -> current polling mode, for change logging
         self._last_sync_error_log = 0.0
-        self.ws_base_url = self._make_ws_base_url(self.amp_url)
-        self.ws_alerted = set()
-        self.ws_disconnect_since = {}
         self.last_health_alert = {}
         self.send_failed = set()
         self.discord_invite_cache = None
@@ -120,12 +108,6 @@ class ChatBridge(commands.Cog):
 
     async def cog_unload(self):
         self.sync_loop.cancel()
-        for task in self.ws_tasks.values():
-            task.cancel()
-        if self.ws_tasks:
-            await asyncio.gather(*self.ws_tasks.values(), return_exceptions=True)
-        self.ws_tasks.clear()
-        self.ws_connected.clear()
         for task in self.send_workers.values():
             task.cancel()
         if self.send_workers:
@@ -133,11 +115,6 @@ class ChatBridge(commands.Cog):
         self.send_workers.clear()
         self.send_queues.clear()
 
-    @staticmethod
-    def _make_ws_base_url(http_url):
-        parsed = urlparse(http_url)
-        scheme = "wss" if parsed.scheme == "https" else "ws"
-        return f"{scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
 
     def _active_instances(self):
         active = {}
@@ -148,68 +125,6 @@ class ChatBridge(commands.Cog):
                 if name in self.instances and self._profile(self.instances[name]).chat_receive:
                     active[name] = self.instances[name]
         return active
-
-    def _reconcile_ws_tasks(self, active_instances):
-        for name in list(self.ws_tasks):
-            task = self.ws_tasks[name]
-            if name not in active_instances or task.done():
-                if not task.done():
-                    task.cancel()
-                self.ws_tasks.pop(name, None)
-                self.ws_connected.discard(name)
-        for name, instance in active_instances.items():
-            if name not in self.ws_tasks:
-                self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
-                self.ws_tasks[name] = asyncio.create_task(
-                    self._amp_ws_worker(name, instance), name=f"amp-ws-{name}"
-                )
-
-    async def _amp_ws_worker(self, name, instance):
-        """Maintain AMP's pushed-event stream, reconnecting with bounded backoff."""
-        delay = 1
-        while True:
-            try:
-                await instance._connect()
-                session = instance._bridge._sessions.get(instance.instance_id)
-                if not session or not getattr(session, "id", None) or session.id == "0":
-                    raise RuntimeError("AMP did not issue a session for the event stream")
-
-                # ADS-managed instances are streamed through the controller URL.
-                ws_url = f"{self.ws_base_url}/stream/{instance.instance_id}/{session.id}"
-                timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=None)
-                async with aiohttp.ClientSession(timeout=timeout) as client:
-                    async with client.ws_connect(ws_url, heartbeat=30, autoping=True) as ws:
-                        self.ws_connected.add(name)
-                        self.failure_counts.pop(name, None)
-                        self.ws_disconnect_since.pop(name, None)
-                        if name in self.ws_alerted:
-                            self.ws_alerted.discard(name)
-                            asyncio.create_task(self._send_health_alert(
-                                f"✅ AMP event stream recovered for **{name}**; real-time delivery is active again."
-                            ))
-                        delay = 1
-                        log.info(f"AMP event stream connected for {name}")
-                        async for message in ws:
-                            if message.type == aiohttp.WSMsgType.TEXT:
-                                try:
-                                    event = json.loads(message.data)
-                                except (TypeError, json.JSONDecodeError):
-                                    continue
-                                if event.get("Message") == "ConsoleEntry":
-                                    self._queue_ws_console_entry(name, event.get("Parameters"))
-                            elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
-                raise ConnectionError("AMP event stream closed")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.ws_connected.discard(name)
-                self.ws_disconnect_since.setdefault(name, datetime.now(timezone.utc))
-                log.warning(f"AMP event stream unavailable for {name}; polling fallback active: {exc}")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
-            finally:
-                self.ws_connected.discard(name)
 
     async def _send_health_alert(self, message):
         settings = self.bridge_data.get("health_alerts", {})
@@ -227,47 +142,6 @@ class ChatBridge(commands.Cog):
             await channel.send(message)
         except Exception as exc:
             log.warning(f"Failed to send bridge health alert: {exc}")
-
-    async def _check_stream_health(self):
-        now = datetime.now(timezone.utc)
-        for name, since in list(self.ws_disconnect_since.items()):
-            if name in self.ws_connected:
-                self.ws_disconnect_since.pop(name, None)
-                continue
-            if name not in self.ws_alerted and (now - since).total_seconds() >= 60:
-                self.ws_alerted.add(name)
-                await self._send_health_alert(
-                    f"⚠️ AMP event stream unavailable for **{name}** for 60 seconds; polling fallback remains active."
-                )
-
-    def _queue_ws_console_entry(self, name, data):
-        if not isinstance(data, dict):
-            return
-        # AMP's websocket uses PascalCase; ampapi's dataclasses use snake_case.
-        entry = SimpleNamespace(
-            timestamp=data.get("Timestamp") or data.get("timestamp"),
-            source=data.get("Source") or data.get("source") or "",
-            contents=data.get("Contents") or data.get("contents") or "",
-            type=data.get("Type") or data.get("type") or "",
-        )
-        queue = self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
-        if queue.full():
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            # A noisy server can send a historical console burst containing
-            # hundreds of thousands of entries. Logging once per dropped entry
-            # amplified that burst enough to starve Discord interaction handling.
-            count = self.ws_drop_counts.get(name, 0) + 1
-            self.ws_drop_counts[name] = count
-            now = datetime.now(timezone.utc).timestamp()
-            last = self.ws_drop_last_log.get(name, 0.0)
-            if now - last >= 30:
-                log.warning("Dropped %s stale queued AMP event(s) for %s in the last interval", count, name)
-                self.ws_drop_counts[name] = 0
-                self.ws_drop_last_log[name] = now
-        queue.put_nowait(entry)
 
     @staticmethod
     def _console_timestamp(value):
@@ -325,7 +199,7 @@ class ChatBridge(commands.Cog):
         return result
 
     async def run_console_command(self, instance, command, pattern, timeout=10.0, quiet_period=0.5):
-        """Register a pushed-event listener before sending a console command."""
+        """Register a console listener before sending a console command."""
         source_name = instance.friendly_name or instance.instance_name
         collector = asyncio.create_task(
             self.collect_console(source_name, pattern, timeout=timeout, quiet_period=quiet_period)
@@ -339,7 +213,7 @@ class ChatBridge(commands.Cog):
         return await collector
 
     async def collect_console(self, source_name, pattern, timeout=10.0, quiet_period=0.5):
-        """Collect pushed console lines until a match, then wait briefly for trailing lines."""
+        """Collect polled console lines until a match, then wait briefly for trailing lines."""
         regex = re.compile(pattern) if isinstance(pattern, str) else pattern
         queue = asyncio.Queue()
         future = asyncio.get_running_loop().create_future()
@@ -1378,63 +1252,33 @@ class ChatBridge(commands.Cog):
         refresh_after = self._instance_refresh_interval()
         if refresh_after is not None and (
                 datetime.now(timezone.utc) - self.last_instance_refresh).total_seconds() >= refresh_after:
-            for task in self.ws_tasks.values():
-                task.cancel()
-            self.ws_tasks.clear()
-            self.ws_connected.clear()
             await self._refresh_instances()
 
-        # 1. Keep one pushed-event stream per unique active server.
+        # 1. Bridged servers that AMP lists and that can relay chat.
         active_instances = self._active_instances()
         if not active_instances:
             return
-        # Core/GetUpdates and /stream share AMP's per-instance session cursor.
-        # On the deployed AMP version the socket emits Metrics but not ConsoleEntry,
-        # while still consuming the update stream. Do not attach that socket to chat
-        # instances: keep one authoritative GetUpdates consumer for console/chat.
-        for task in self.ws_tasks.values():
-            task.cancel()
-        self.ws_tasks.clear()
-        self.ws_connected.clear()
 
-        # 2. Drain any already-queued entries, then poll the authoritative console
-        # feed. A single consumer avoids AMP cursor races and missing player chat.
         updates_map = {}
-        for name in active_instances:
-            queue = self.ws_entry_queues.setdefault(name, asyncio.Queue(maxsize=1000))
-            entries = []
-            while len(entries) < 500:
-                try:
-                    entries.append(queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            if entries:
-                updates_map[name] = SimpleNamespace(console_entries=entries)
 
         now = datetime.now(timezone.utc)
         now_ts = now.timestamp()
-        # AMP's event stream carries metrics reliably, but current AMP versions do
-        # not emit ConsoleEntry events on every game instance. Core/GetUpdates is
-        # the authoritative per-session console feed, so poll it even while the
-        # socket is connected. Treating a metrics-only socket as a complete chat
-        # feed silently drops all Minecraft -> Discord messages.
-        # Each server is polled at its own cadence (see _poll_interval): fast while
-        # players are active, slowly while it looks empty, never not at all.
+        # 2. Poll each server's console (Core/GetUpdates) at its own cadence (see
+        # _poll_interval): fast while players are active, slowly while it looks
+        # empty, never not at all. AMP's /stream websocket is no alternative on
+        # this AMP version: it sends metrics but no console lines, and it consumes
+        # the same per-session cursor (tried and removed in Aug 2026).
         console_polls = []
         for name, instance in active_instances.items():
             if self.instance_running.get(name) is False:
-                continue  # stopped in AMP; the instance re-list below notices when it is back
-            if now_ts - self.last_fallback_poll.get(name, 0.0) >= self._poll_interval(name, now_ts):
-                self.last_fallback_poll[name] = now_ts
+                continue  # stopped in AMP; the instance re-list above notices when it is back
+            if now_ts - self.last_console_poll.get(name, 0.0) >= self._poll_interval(name, now_ts):
+                self.last_console_poll[name] = now_ts
                 console_polls.append(self._fetch_update_safe(name, instance))
         if console_polls:
             for name, updates in await asyncio.gather(*console_polls):
                 if updates and getattr(updates, "console_entries", None):
-                    existing = updates_map.get(name)
-                    if existing:
-                        existing.console_entries.extend(updates.console_entries)
-                    else:
-                        updates_map[name] = updates
+                    updates_map[name] = updates
 
         # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
         new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
