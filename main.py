@@ -13,7 +13,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
-from cogs.utils import setup_logging, get_logger
+from cogs.utils import setup_logging, get_logger, configure_root_logging
 import amp_http
 
 # =============================================================================
@@ -209,7 +209,8 @@ class CalmBot(commands.Bot):
     
     async def on_disconnect(self):
         """Called when disconnected from Discord."""
-        log.warning("Disconnected from Discord gateway")
+        # Routine: discord.py reconnects and resumes on its own (on_resumed logs that).
+        log.debug("Disconnected from Discord gateway")
     
     async def on_resumed(self):
         """Called when session is resumed."""
@@ -224,6 +225,7 @@ def main():
     """Main entry point."""
     # Set up root logging
     setup_logging("calmbot", logging.INFO)
+    configure_root_logging()  # discord.py/asyncio warnings in CalmBot's format
     
     # Also configure discord.py logging
     discord_log = logging.getLogger("discord")

@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.utils import get_logger, admin_only, warning_embed
+from cogs.utils import get_logger, administrator_only, warning_embed
 
 log = get_logger("nuke")
 
@@ -19,7 +19,7 @@ class Nuke(commands.Cog):
         log.info("Nuke cog initialized")
 
     @app_commands.command(name="nuke", description="IMMEDIATELY shuts down the bot")
-    @admin_only()
+    @administrator_only()
     async def nuke(self, interaction: discord.Interaction):
         """Immediately stops the bot process."""
         log.warning(f"Nuke command initiated by {interaction.user} (ID: {interaction.user.id})")

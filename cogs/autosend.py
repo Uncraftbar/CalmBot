@@ -658,7 +658,12 @@ class AutoSend(commands.Cog):
         
         # Check 'hourly' triggers at minute 0
         if now.minute == 0:
-            await self._process_time_triggers("hourly")
+            # tasks.loop stops for good on most exceptions; one failed send
+            # (Forbidden, a Discord 5xx, a rejected embed) must not end all autosends.
+            try:
+                await self._process_time_triggers("hourly")
+            except Exception:
+                log.exception("Hourly autosend triggers failed; retrying next hour")
 
     @time_loop.before_loop
     async def before_time_loop(self):

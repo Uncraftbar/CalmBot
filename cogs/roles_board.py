@@ -13,6 +13,7 @@ from cogs.utils import (
     save_json,
     check_permissions,
     admin_only,
+    is_elevated_role,
     success_embed,
     error_embed,
     warning_embed,
@@ -439,6 +440,9 @@ class RolesBoard(commands.Cog):
             except Exception:
                 return
         
+        if is_elevated_role(role):
+            log.warning("Refusing to self-assign staff role %s to %s from the roles board", role.name, member)
+            return
         try:
             await member.add_roles(role, reason="Reaction role from roles board")
             log.debug(f"Added role {role.name} to {member}")
@@ -515,6 +519,9 @@ class RolesBoard(commands.Cog):
         if not member:
             return
         
+        if add and is_elevated_role(role):
+            log.warning("Refusing to self-assign staff role %s to %s via a reaction role", role.name, member)
+            return
         try:
             if add:
                 await member.add_roles(role, reason="Reaction role")

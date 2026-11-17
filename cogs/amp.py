@@ -163,7 +163,7 @@ class ConfirmServerActionModal(discord.ui.Modal):
         result = await gateway.execute_confirmed_amp_action(
             interaction, self.action, self.instance.instance_name, str(self.reason).strip(), origin="amp_modal"
         )
-        embed = success_embed(result.title, result.message) if result.ok else error_embed(result.title, result.message)
+        embed = success_embed(result.title, result.message) if result.success else error_embed(result.title, result.message)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 

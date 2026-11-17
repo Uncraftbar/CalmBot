@@ -21,7 +21,7 @@ import discord
 from mcstatus import JavaServer
 
 from cogs.utils import (AMPDiscoveryError, fetch_valid_instances, get_instance_state, get_logger,
-                        get_metric_data, get_player_data)
+                        get_metric_data, get_player_data, is_administrator)
 from cogs.game_profiles import get_game_profile
 
 log = get_logger("llm_tools")
@@ -263,14 +263,6 @@ def responses_tools(include_write: bool, *, include_conversation_control: bool =
                     include_status_write: bool = False) -> list[dict]:
     names = _available_tool_names(include_write, include_conversation_control, include_status_write)
     return [{"type": "function", **item, "strict": False} for item in TOOL_DEFINITIONS if item["name"] in names]
-
-
-def is_administrator(member: Any) -> bool:
-    """Deliberately stricter than general CalmBot moderation checks for writes."""
-    guild = getattr(member, "guild", None)
-    if guild is None:
-        return False
-    return bool(guild.owner_id == member.id or getattr(member.guild_permissions, "administrator", False))
 
 
 @dataclass(frozen=True)

@@ -84,6 +84,9 @@ class StatusRotator(commands.Cog):
             await self.bot.change_presence(
                 activity=discord.CustomActivity(name=status)
             )
+        except ConnectionResetError:
+            # The gateway is reconnecting; the next rotation catches up.
+            log.debug("Skipped status change while the gateway reconnects")
         except Exception as e:
             log.error(f"Failed to change status: {e}")
     

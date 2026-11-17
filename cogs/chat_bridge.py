@@ -6,6 +6,7 @@ Bridges chat between multiple Minecraft servers and Discord.
 import asyncio
 import json
 import re
+import time
 import traceback
 from collections import deque
 from types import SimpleNamespace
@@ -49,6 +50,14 @@ POLL_COMMAND_SECONDS = 0.75       # a command is waiting for its console output
 POLL_MAX_BACKOFF_SECONDS = 60.0   # ceiling for servers whose polls keep failing
 ACTIVITY_WINDOW_SECONDS = 600.0   # stay at the active cadence this long after activity
 INSTANCE_RECHECK_SECONDS = 120.0  # min gap between instance re-lists (stopped/failing servers)
+INSTANCE_RETRY_SECONDS = 30.0             # re-list cadence while AMP has not listed anything yet
+INSTANCE_MISSING_RECHECK_SECONDS = 600.0  # a bridged server is missing from AMP's list
+INSTANCE_LIST_TIMEOUT_SECONDS = 20.0
+
+# A line in the bridge's own relay format, "[Server] <Player> text", echoed back.
+RELAY_ECHO_RE = re.compile(r"^\[[^\]]{1,64}\] <[^>]{1,64}> ")
+# Game chat may ping Discord users by name, never @everyone/@here or roles.
+GAME_CHAT_MENTIONS = discord.AllowedMentions(users=True, roles=False, everyone=False)
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -95,6 +104,7 @@ class ChatBridge(commands.Cog):
         self.amp_player_counts = {}     # name -> AMP's (unreliable) player count from the latest poll
         self.instance_running = {}      # name -> whether AMP reports the instance as running
         self.poll_modes = {}            # name -> current polling mode, for change logging
+        self._last_sync_error_log = 0.0
         self.ws_base_url = self._make_ws_base_url(self.amp_url)
         self.ws_alerted = set()
         self.ws_disconnect_since = {}
@@ -353,7 +363,7 @@ class ChatBridge(commands.Cog):
         # re-listed on every 0.25 s loop tick.
         self.last_instance_refresh = datetime.now(timezone.utc)
         try:
-            fetched_instances = await fetch_valid_instances()
+            fetched_instances = await asyncio.wait_for(fetch_valid_instances(), timeout=INSTANCE_LIST_TIMEOUT_SECONDS)
 
             if not fetched_instances:
                 log.debug("No instances returned from API")
@@ -377,11 +387,23 @@ class ChatBridge(commands.Cog):
                              else "stopped; pausing console polling")
 
         except Exception as e:
-            log.error(f"Error refreshing instances: {e}")
+            log.error("Error refreshing instances: %s", e or type(e).__name__)
 
     def _bridged_server_names(self):
         return {name for group in self.bridge_data.get("groups", {}).values()
                 if group.get("active", True) for name in group.get("servers", [])}
+
+    def _instance_refresh_interval(self):
+        """Seconds between instance re-lists in the current state, or None if none is needed."""
+        if not self.instances:
+            return INSTANCE_RETRY_SECONDS  # AMP has not listed anything yet (e.g. down at startup)
+        bridged = self._bridged_server_names()
+        if any(count >= 3 for count in self.failure_counts.values()) or any(
+                self.instance_running.get(name) is False for name in bridged):
+            return INSTANCE_RECHECK_SECONDS
+        if any(name not in self.instances for name in bridged):
+            return INSTANCE_MISSING_RECHECK_SECONDS  # renamed, deleted, or missing from one listing
+        return None
 
     def _poll_interval(self, name, now_ts):
         """Seconds between console polls for one server, by how likely chat is right now."""
@@ -1334,7 +1356,33 @@ class ChatBridge(commands.Cog):
 
     @tasks.loop(seconds=0.25)
     async def sync_loop(self):
+        # tasks.loop ends for good on any exception outside its short list of
+        # retried network errors; one bad tick must not stop the whole bridge.
+        try:
+            await self._sync_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            now = time.monotonic()
+            if now - getattr(self, "_last_sync_error_log", 0.0) >= 60:
+                self._last_sync_error_log = now
+                log.exception("Chat bridge tick failed; the bridge keeps running")
+
+    async def _sync_tick(self):
         if not self.bridge_data.get("groups"): return
+
+        # Re-list AMP instances when due: AMP has not listed anything yet (e.g. it
+        # was down at startup), a bridged server is missing or stopped, or polls
+        # keep failing. This must run before the early return below, which would
+        # otherwise keep an empty instance list empty forever.
+        refresh_after = self._instance_refresh_interval()
+        if refresh_after is not None and (
+                datetime.now(timezone.utc) - self.last_instance_refresh).total_seconds() >= refresh_after:
+            for task in self.ws_tasks.values():
+                task.cancel()
+            self.ws_tasks.clear()
+            self.ws_connected.clear()
+            await self._refresh_instances()
 
         # 1. Keep one pushed-event stream per unique active server.
         active_instances = self._active_instances()
@@ -1387,17 +1435,6 @@ class ChatBridge(commands.Cog):
                         existing.console_entries.extend(updates.console_entries)
                     else:
                         updates_map[name] = updates
-
-        # AMP handles go stale after instance restarts, and stopped instances need
-        # re-checking to notice when they are back. Re-list instances, rate-limited.
-        needs_refresh = any(count >= 3 for count in self.failure_counts.values()) or any(
-            self.instance_running.get(name) is False for name in active_instances)
-        if needs_refresh and (now - self.last_instance_refresh).total_seconds() >= INSTANCE_RECHECK_SECONDS:
-            for task in self.ws_tasks.values():
-                task.cancel()
-            self.ws_tasks.clear()
-            self.ws_connected.clear()
-            await self._refresh_instances()
 
         # 3. First Pass: Identify TRULY NEW messages for each server and update watermarks
         new_messages_per_server = {} # { "server_name": [(user, msg), ...] }
@@ -1486,7 +1523,7 @@ class ChatBridge(commands.Cog):
                             channel = self.bot.get_channel(group_data.get("channel_id"))
                             if channel:
                                 alias = self.bridge_data.get("instance_settings", {}).get(source_name, {}).get("alias", source_name)
-                                asyncio.create_task(channel.send(f"**[{alias}]** {msg}"))
+                                asyncio.create_task(channel.send(f"**[{alias}]** {msg}", allowed_mentions=discord.AllowedMentions.none()))
                             break
                     continue
 
@@ -1514,8 +1551,9 @@ class ChatBridge(commands.Cog):
                 else:
                     user = entry_source
 
-                if re.match(r"^\\[.+?\\] <.+?> .+", msg): continue
-                if msg.startswith("[") and "]" in msg: continue
+                # Skip echoes of the bridge's own "[Server] <Player> text" relays. Other
+                # bracketed chat ("[AFK] brb") is real player chat and is kept.
+                if RELAY_ECHO_RE.match(msg): continue
                 if len(user) < 1 or len(user) > 32: continue
                 
                 msg_lower = msg.lower()
@@ -1649,8 +1687,8 @@ class ChatBridge(commands.Cog):
                     "content": safe_msg,
                     "embed": embed,
                     "username": f"{user} [{source_name}]",
-                    # ENABLE MENTIONS: Allow "users" to be pinged, but block "everyone" and "roles"
-                    "allowed_mentions": discord.AllowedMentions(users=True, roles=False, everyone=False)
+                    # Allow "users" to be pinged, but block "everyone" and "roles"
+                    "allowed_mentions": GAME_CHAT_MENTIONS
                 }
                 if avatar_url:
                     kwargs["avatar_url"] = avatar_url
@@ -1662,21 +1700,25 @@ class ChatBridge(commands.Cog):
                 safe_user = discord.utils.escape_markdown(user)
                 prefix = f"**[{source_name}]** <{safe_user}>"
                 if embed:
-                    await channel.send(content=prefix, embed=embed)
+                    await channel.send(content=prefix, embed=embed, allowed_mentions=GAME_CHAT_MENTIONS)
                 else:
-                    await channel.send(f"{prefix} {safe_msg}")
+                    await channel.send(f"{prefix} {safe_msg}", allowed_mentions=GAME_CHAT_MENTIONS)
 
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, discord.NotFound):
+                # The cached webhook was deleted: forget it so the next message finds
+                # or creates a fresh one instead of always taking this fallback.
+                self.webhook_cache.pop(getattr(channel, "id", None), None)
             # Fallback for any other error (permissions, rate limits)
             try:
                 log.debug(f"Webhook failed for {channel.id}, falling back to standard message")
                 safe_user = discord.utils.escape_markdown(user)
                 prefix = f"**[{source_name}]** <{safe_user}>"
                 if embed:
-                    await channel.send(content=prefix, embed=embed)
+                    await channel.send(content=prefix, embed=embed, allowed_mentions=GAME_CHAT_MENTIONS)
                 else:
                     safe_msg = discord.utils.escape_markdown(msg) if msg else ""
-                    await channel.send(f"{prefix} {safe_msg}")
+                    await channel.send(f"{prefix} {safe_msg}", allowed_mentions=GAME_CHAT_MENTIONS)
             except Exception:
                 log.warning(f"Failed to send message to Discord channel {channel.id}")
 

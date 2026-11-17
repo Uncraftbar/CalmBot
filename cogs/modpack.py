@@ -13,6 +13,8 @@ from cogs.utils import (
     save_json,
     check_permissions,
     admin_only,
+    administrator_only,
+    is_elevated_role,
     find_category_by_name,
     success_embed,
     error_embed,
@@ -242,7 +244,7 @@ class Modpack(commands.Cog):
     
     @app_commands.command(name="delete_modpack", description="Delete a modpack category and its role")
     @app_commands.describe(category_name="Name of the modpack (with or without [MODLOADER])")
-    @admin_only()
+    @administrator_only()
     async def delete_modpack(self, interaction: discord.Interaction, category_name: str):
         """Delete a modpack category, channels, and associated role."""
         guild = interaction.guild
@@ -371,7 +373,7 @@ class Modpack(commands.Cog):
         connection_ip="Connection IP or URL",
         role_emoji="Emoji for the role"
     )
-    @admin_only()
+    @administrator_only()
     async def migrate_modpack(
         self,
         interaction: discord.Interaction,
@@ -450,8 +452,11 @@ class Modpack(commands.Cog):
             # Add to roles board
             self._reload_roles_board()
             
+            # Never put staff roles on the public, self-service roles board.
+            if is_elevated_role(role):
+                role_message += f"\n⛔ **{role.name}** is a staff role, so it was not added to the roles board."
             # Check if already in board
-            if any(rd["role_id"] == role.id for rd in self.roles_board["roles"]):
+            elif any(rd["role_id"] == role.id for rd in self.roles_board["roles"]):
                 role_message += f"\n⚠️ Role already on roles board."
             elif self.roles_board.get("channel_id") and self.roles_board.get("message_id"):
                 try:

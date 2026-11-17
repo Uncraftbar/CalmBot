@@ -5,8 +5,10 @@ Provides logging, permissions, embed helpers, and common functions.
 
 import json
 import os
+import stat
 import logging
 import functools
+import tempfile
 from enum import Enum
 from typing import Optional, Any, Callable
 from datetime import datetime
@@ -18,6 +20,36 @@ from ampapi import AMPControllerInstance
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
+
+def _log_formatter() -> logging.Formatter:
+    return logging.Formatter(
+        fmt="%(asctime)s │ %(levelname)-8s │ %(name)-20s │ %(message)s",
+        datefmt="%H:%M:%S"
+    )
+
+
+def _not_from_ampapi(record: logging.LogRecord) -> bool:
+    # cc-ampapi logs through the root logger: failures the bot already reports
+    # itself, "DEBUG ..." lines at ERROR level, and raw tracebacks.
+    return f"{os.sep}ampapi{os.sep}" not in (record.pathname or "")
+
+
+def configure_root_logging(level: int = logging.WARNING) -> None:
+    """Give library warnings (discord.py, asyncio) CalmBot's log format.
+
+    Without a root handler they go to Python's bare last-resort handler, so
+    crashes in buttons, modals and background tasks are easy to miss.
+    """
+    root = logging.getLogger()
+    if any(getattr(h, "calmbot_root", False) for h in root.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(_log_formatter())
+    handler.addFilter(_not_from_ampapi)
+    handler.calmbot_root = True
+    root.addHandler(handler)
+    root.setLevel(level)
+
 
 def setup_logging(name: str = "calmbot", level: int = logging.INFO) -> logging.Logger:
     """
@@ -38,12 +70,7 @@ def setup_logging(name: str = "calmbot", level: int = logging.INFO) -> logging.L
         # Console handler with formatting
         handler = logging.StreamHandler()
         handler.setLevel(level)
-        
-        formatter = logging.Formatter(
-            fmt="%(asctime)s │ %(levelname)-8s │ %(name)-20s │ %(message)s",
-            datefmt="%H:%M:%S"
-        )
-        handler.setFormatter(formatter)
+        handler.setFormatter(_log_formatter())
         logger.addHandler(handler)
 
     # Every CalmBot logger owns its formatted console handler. Without this,
@@ -101,7 +128,15 @@ def load_json(filename: str, default: Any = None) -> Any:
         with open(filename, 'r', encoding='utf-8') as f:
             return json.load(f)
     except json.JSONDecodeError as e:
-        _json_log.error(f"Invalid JSON in {filename}: {e}")
+        # Keep the damaged file for recovery instead of letting the next save
+        # silently overwrite it with defaults.
+        root, ext = os.path.splitext(filename)
+        aside = f"{root}.corrupt-{datetime.now():%Y%m%d-%H%M%S}{ext}"
+        try:
+            os.replace(filename, aside)
+            _json_log.error(f"Invalid JSON in {filename} ({e}); moved it to {aside} and using defaults")
+        except OSError:
+            _json_log.error(f"Invalid JSON in {filename}: {e}")
         return default
     except OSError as e:
         _json_log.error(f"Cannot read {filename}: {e}")
@@ -110,25 +145,45 @@ def load_json(filename: str, default: Any = None) -> Any:
 
 def save_json(filename: str, data: Any) -> bool:
     """
-    Safely save data to a JSON file.
-    
+    Save data to a JSON file atomically.
+
+    Serializes first, writes a temporary file in the same directory, fsyncs it
+    and renames it over the original, so a crash, a full disk or unserializable
+    data never leaves a truncated file behind.
+
     Args:
         filename: Path to JSON file
         data: Data to serialize
-        
+
     Returns:
         True if successful, False otherwise
     """
+    tmp_path = None
     try:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        directory = os.path.dirname(filename) or '.'
+        os.makedirs(directory, exist_ok=True)
+        payload = json.dumps(data, indent=2)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(filename)}.", suffix=".tmp")
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp_path, stat.S_IMODE(os.stat(filename).st_mode))  # keep the file's mode
+        except FileNotFoundError:
+            pass  # new file: keep mkstemp's private 0600
+        os.replace(tmp_path, filename)
+        tmp_path = None
         return True
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
         _json_log.error(f"Cannot write {filename}: {e}")
         return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # =============================================================================
@@ -294,8 +349,57 @@ def admin_only():
     """
     async def predicate(interaction: discord.Interaction) -> bool:
         return await check_permissions(interaction)
-    
+
     return app_commands.check(predicate)
+
+
+def is_administrator(member: Any) -> bool:
+    """Server owner or the Administrator permission.
+
+    Deliberately stricter than has_mod_permissions (which also passes Manage
+    Channels and mod-named roles): use it for anything that can hand out power,
+    destroy data or redirect secrets.
+    """
+    guild = getattr(member, "guild", None)
+    if guild is None:
+        return False
+    return bool(guild.owner_id == member.id or getattr(member.guild_permissions, "administrator", False))
+
+
+async def check_administrator(interaction: discord.Interaction) -> bool:
+    """Like check_permissions, but for server administrators only."""
+    if is_administrator(interaction.user):
+        return True
+    _perm_log.debug(f"Administrator check denied {interaction.user} on /{interaction.command.name if interaction.command else 'unknown'}")
+    embed = error_embed("Permission Denied", "This command requires the **Administrator** permission.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    return False
+
+
+def administrator_only():
+    """Decorator for app commands that only server administrators may use."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return await check_administrator(interaction)
+
+    return app_commands.check(predicate)
+
+
+# Permissions that make a role a staff role. Such roles must never be
+# self-assignable (reaction boards and similar).
+ELEVATED_PERMISSIONS = (
+    "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_webhooks",
+    "manage_messages", "manage_threads", "manage_nicknames", "manage_expressions",
+    "manage_events", "kick_members", "ban_members", "moderate_members", "mention_everyone",
+    "view_audit_log", "move_members", "mute_members", "deafen_members",
+)
+
+
+def is_elevated_role(role: Any) -> bool:
+    """True for roles with staff permissions or a staff name (see has_mod_permissions)."""
+    if getattr(role, "name", None) in MOD_ROLE_NAMES:
+        return True
+    permissions = getattr(role, "permissions", None)
+    return any(getattr(permissions, name, False) for name in ELEVATED_PERMISSIONS)
 
 
 # Legacy function for backwards compatibility

@@ -21,7 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from cogs.utils import admin_only, get_logger, load_json, save_json
+from cogs.utils import admin_only, administrator_only, get_logger, load_json, save_json
 from cogs.llm_tools import AMPActionConfirmView, LLMToolRuntime, openai_tools, responses_tools
 from cogs.ai_chat_input import collect_attachments
 from cogs.ai_pending_context import PendingBatch, PendingContext
@@ -68,6 +68,50 @@ def bounded(value: Any, low: int, high: int, default: int) -> int:
         return max(low, min(high, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+def is_responses_api_url(url: str) -> bool:
+    """OpenAI-style /responses endpoints reject the Chat Completions payloads CalmBot sends."""
+    from urllib.parse import urlsplit
+    try:
+        path = urlsplit(url).path.rstrip("/")
+    except ValueError:
+        return False
+    return path.endswith("/responses")
+
+
+def redact_error(exc: BaseException, limit: int = 240) -> str:
+    """Error text for logs, with anything that looks like a credential masked."""
+    return re.sub(r"(?i)(bearer|token|key|password|secret)\s*[:=]?\s*\S+", r"\1=[REDACTED]", str(exc))[:limit]
+
+
+class LLMHTTPError(RuntimeError):
+    """A provider answered with an HTTP error; ``status`` lets callers spot auth failures."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+async def provider_error_text(resp: Any, limit: int = 300) -> str:
+    """Best-effort one-line error message from a provider's error response body."""
+    try:
+        raw = (await resp.content.read(4096)).decode("utf-8", errors="replace")
+        text = raw
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+            text = match.group(1) if match else raw
+        else:
+            error = data.get("error", data) if isinstance(data, dict) else data
+            if isinstance(error, dict):
+                text = str(error.get("message") or error.get("detail") or error.get("code") or raw)
+            elif isinstance(error, str):
+                text = error
+        return " ".join(text.split())[:limit]
+    except Exception:
+        return ""
 
 
 class OpenAIKeyModal(discord.ui.Modal, title="Configure OpenAI-compatible credentials"):
@@ -128,6 +172,11 @@ class ModelConfigModal(discord.ui.Modal, title="LLM model and endpoint"):
             if not re.match(r"^https?://", endpoint) or len(endpoint) > 500:
                 await interaction.response.send_message(
                     "OpenAI-compatible providers require a valid HTTP(S) endpoint.", ephemeral=True)
+                return
+            if is_responses_api_url(endpoint):
+                await interaction.response.send_message(
+                    "That is a Responses API endpoint, but CalmBot sends Chat Completions requests. "
+                    "Use the provider's `/v1/chat/completions` URL (or its `/v1` base URL).", ephemeral=True)
                 return
             self.cog.settings["api_url"] = endpoint
         self.cog.settings["model"] = model
@@ -743,21 +792,30 @@ class AIChat(commands.Cog):
     async def _dispatch_loop(self):
         try:
             while True:
-                await self._queue_wake.wait()
-                while True:
-                    self._queue_wake.clear()
-                    message, retry_in = await self._take_ready()
-                    if message is not None:
-                        task = asyncio.create_task(self._process_message(message), name=f"llm-response-{message.id}")
-                        self._response_tasks.add(task)
-                        task.add_done_callback(self._response_tasks.discard)
-                        continue
-                    if retry_in is None:
-                        break
-                    try:
-                        await asyncio.wait_for(self._queue_wake.wait(), timeout=retry_in)
-                    except asyncio.TimeoutError:
-                        self._queue_wake.set()
+                try:
+                    await self._queue_wake.wait()
+                    while True:
+                        self._queue_wake.clear()
+                        message, retry_in = await self._take_ready()
+                        if message is not None:
+                            task = asyncio.create_task(self._process_message(message), name=f"llm-response-{message.id}")
+                            self._response_tasks.add(task)
+                            task.add_done_callback(self._response_tasks.discard)
+                            continue
+                        if retry_in is None:
+                            break
+                        try:
+                            await asyncio.wait_for(self._queue_wake.wait(), timeout=retry_in)
+                        except asyncio.TimeoutError:
+                            self._queue_wake.set()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Without this, one unexpected error would leave every later
+                    # LLM request queued forever.
+                    log.exception("LLM dispatcher error; recovering")
+                    self._queue_wake.set()
+                    await asyncio.sleep(5)
         except asyncio.CancelledError:
             pass
 
@@ -947,6 +1005,7 @@ class AIChat(commands.Cog):
         session = await self._http()
         retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
         last_error = "provider request failed"
+        last_status = None
         for attempt in range(3):
             try:
                 async with session.post(
@@ -960,11 +1019,15 @@ class AIChat(commands.Cog):
                         except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
                             raise RuntimeError("LLM endpoint returned invalid JSON") from exc
                     request_id = (resp.headers.get("x-request-id") or resp.headers.get("request-id") or "")[:80]
+                    detail = await provider_error_text(resp)
+                    last_status = resp.status
                     last_error = f"LLM endpoint returned HTTP {resp.status}"
+                    if detail:
+                        last_error += f": {detail}"
                     if request_id:
                         last_error += f" (request {request_id})"
                     if resp.status not in retryable_statuses:
-                        raise RuntimeError(last_error)
+                        raise LLMHTTPError(last_error, resp.status)
                     retry_after = resp.headers.get("Retry-After", "")
                     try:
                         delay = min(8.0, max(0.5, float(retry_after)))
@@ -976,7 +1039,7 @@ class AIChat(commands.Cog):
             if attempt < 2:
                 log.warning("%s; retrying in %.1fs", last_error, delay)
                 await asyncio.sleep(delay)
-        raise RuntimeError(last_error)
+        raise LLMHTTPError(last_error, last_status)
 
     async def _openai(self, messages, system, runtime: LLMToolRuntime, model: str | None = None):
         url = self._openai_url().rstrip("/")
@@ -1057,7 +1120,9 @@ class AIChat(commands.Cog):
                         headers["ChatGPT-Account-Id"] = str(account)
                     continue
                 if resp.status >= 400:
-                    raise RuntimeError(f"Codex endpoint returned HTTP {resp.status}")
+                    detail = await provider_error_text(resp)
+                    raise LLMHTTPError(f"Codex endpoint returned HTTP {resp.status}" + (f": {detail}" if detail else ""),
+                                       resp.status)
                 async for raw in resp.content:
                     line = raw.decode(errors="replace").strip()
                     if not line.startswith("data: ") or line == "data: [DONE]":
@@ -1230,11 +1295,13 @@ class AIChat(commands.Cog):
             if provider == "codex":
                 return await self._codex(messages, system, runtime)
             return await self._openai(messages, system, runtime)
-        except Exception:
+        except Exception as exc:
             fallback = self.settings.get("fallback_model", "")
             if not fallback or fallback == self._model():
                 raise
-            log.warning("Primary LLM model failed; trying configured fallback model")
+            if getattr(exc, "status", None) in (401, 403):
+                raise  # same credential and endpoint: the fallback model would be refused too
+            log.warning("Primary LLM model failed (%s); trying fallback model %s", redact_error(exc), fallback)
             if provider == "codex":
                 return await self._codex(messages, system, runtime, fallback)
             return await self._openai(messages, system, runtime, fallback)
@@ -1343,7 +1410,7 @@ class AIChat(commands.Cog):
         except Exception as exc:
             self._usage["failed"] += 1
             self._recent_failures.appendleft({"when": int(time.time()), "type": type(exc).__name__})
-            detail = re.sub(r"(?i)(bearer|token|key|password|secret)\s*[:=]?\s*\S+", r"\1=[REDACTED]", str(exc))[:240]
+            detail = redact_error(exc)
             log.error("LLM response failed (%s): %s", type(exc).__name__, detail or "no detail")
             # Only explicit triggers receive an error. Passive conversation traffic
             # stays silent on provider failures instead of interrupting humans.
@@ -1480,13 +1547,13 @@ class AIChat(commands.Cog):
             await interaction.followup.send(text, ephemeral=True)
 
     @llm_group.command(name="dashboard", description="Open the complete LLM configuration dashboard")
-    @admin_only()
+    @administrator_only()
     async def dashboard(self, interaction: discord.Interaction):
         view = LLMDashboardView(self, interaction.user.id)
         await interaction.response.send_message(embed=self._dashboard_embed(), view=view, ephemeral=True)
 
     @llm_group.command(name="limits", description="Change one or more LLM limits; omitted values stay unchanged")
-    @admin_only()
+    @administrator_only()
     async def limits(self, interaction: discord.Interaction,
                      user_cooldown: app_commands.Range[int, 0, 3600] | None = None,
                      global_per_minute: app_commands.Range[int, 1, 120] | None = None,
@@ -1578,9 +1645,15 @@ class AIChat(commands.Cog):
                 else: keep.append(item)
             self._pending = keep
         for item in removed:
-            self._clocked_requests.discard(item.id)
-            try: await item.remove_reaction("🕒", self.bot.user)
-            except (discord.HTTPException, discord.NotFound, discord.Forbidden): pass
+            # The queue UI (clock reaction, /ask "thinking" state) belongs to the
+            # batch's first message, not to its newest trigger.
+            anchor = getattr(item, "anchor", item)
+            self._clocked_requests.discard(anchor.id)
+            try: await anchor.remove_reaction("🕒", self.bot.user)
+            except discord.HTTPException: pass
+            if isinstance(anchor, AskMessage):
+                try: await anchor.interaction.edit_original_response(content="Request cancelled.")
+                except discord.HTTPException: pass
         self._queue_wake.set()
         await interaction.response.send_message("Queued request cancelled." if removed else "You have no queued request in this channel. Running requests cannot be interrupted safely.", ephemeral=True)
 
