@@ -54,6 +54,10 @@ INSTANCE_LIST_TIMEOUT_SECONDS = 20.0
 
 # A line in the bridge's own relay format, "[Server] <Player> text", echoed back.
 RELAY_ECHO_RE = re.compile(r"^\[[^\]]{1,64}\] <[^>]{1,64}> ")
+# IPv6 addresses (optionally bracketed, zoned or with a port), but not clock times
+# such as 12:34:56: require "::" or at least four hex groups.
+IPV6_RE = re.compile(r"(?<![\w:.])\[?(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){4})"
+                     r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[\w.]+)?\]?(?::\d{1,5})?(?![\w:])")
 # Game chat may ping Discord users by name, never @everyone/@here or roles.
 GAME_CHAT_MENTIONS = discord.AllowedMentions(users=True, roles=False, everyone=False)
 
@@ -163,6 +167,11 @@ class ChatBridge(commands.Cog):
                        r"\1=[REDACTED]", value)
         value = re.sub(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]+=*", r"\1 [REDACTED]", value)
         value = re.sub(r"(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?", "[IP REDACTED]", value)
+        value = IPV6_RE.sub("[IP REDACTED]", value)
+        # Space-separated secrets, and auth-plugin commands echoed to the console.
+        value = re.sub(r"(?i)\b(password|passwd|pwd)\s+(?!=|\[REDACTED\])\S+", r"\1 [REDACTED]", value)
+        value = re.sub(r"(?i)(/(?:login|l|register|reg|changepassword|changepass|cp)\b)(?:\s+\S+)+",
+                       r"\1 [REDACTED]", value)
         return value
 
     def _remember_console_entries(self, source_name, entries):

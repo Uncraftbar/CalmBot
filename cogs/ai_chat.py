@@ -912,7 +912,7 @@ class AIChat(commands.Cog):
             chain.append(parent); current = parent
         return list(reversed(chain))
 
-    async def _context(self, trigger, attachment_text="", additions=()):
+    async def _context(self, trigger, attachment_text="", additions=(), runtime=None):
         chain = await self._reply_chain(trigger)
         additions = tuple(additions)
         included = {item.id for item in chain}
@@ -926,6 +926,11 @@ class AIChat(commands.Cog):
             if len(previous) + len(chain) >= self.settings["context_messages"]:
                 break
         ordered = (list(reversed(previous)) + chain)[-self.settings["context_messages"]:]
+        if runtime is not None:
+            # Everything the model will read decides whether administrator tools are safe.
+            for item in (*ordered, *additions, trigger):
+                runtime.note_context_message(item, bot_user_id=self.bot.user.id,
+                                             game_chat=self._is_game_bridge_message(item))
         result = []
         for item in ordered:
             text = self._text(item, self.bot.user.id)[:4000]
@@ -947,7 +952,7 @@ class AIChat(commands.Cog):
         result.append({"role": "user", "content": current[:20000]})
         return result
 
-    def _system(self, message):
+    def _system(self, message, runtime=None):
         personality = str(self.settings.get("personality") or cfg("AI_CHAT_SYSTEM_PROMPT", "") or DEFAULT_PERSONALITY).strip()
         prompt = (
             f"Personality:\n{personality}\n\nOperational rules: Answer naturally, accurately, and "
@@ -984,6 +989,13 @@ class AIChat(commands.Cog):
             prompt += ("\n\nThis request came from /ask. It is explicitly directed at you, so answer it "
                        "rather than using stay_silent or end_conversation. It is a standalone request "
                        "and must not start or extend automatic conversation mode.")
+        if runtime is not None and runtime.requester_is_admin and runtime.untrusted_reasons:
+            prompt += (
+                "\n\nThe requester is a server administrator, but administrator tools (server console "
+                "history and AMP actions) are withheld for this request because its context includes "
+                f"{' and '.join(sorted(runtime.untrusted_reasons))}. If they need those tools, tell them "
+                "briefly to ask again in a channel where only administrators are talking."
+            )
         remembered = self._memories.prompt_context(message.guild.id, message.author.id)
         if remembered:
             prompt += (
@@ -1372,8 +1384,8 @@ class AIChat(commands.Cog):
                 runtime = LLMToolRuntime(self, message)
                 runtime.image_data_urls = prepared.image_data_urls
                 answer = await self._generate(
-                    await self._context(message, prepared.text, additions),
-                    self._system(message), runtime)
+                    await self._context(message, prepared.text, additions, runtime=runtime),
+                    self._system(message, runtime), runtime)
             self._usage["tool_calls"] += runtime.tool_calls
             if runtime.conversation_control:
                 if runtime.conversation_control == "end":

@@ -84,6 +84,10 @@ READ_TOOL_NAMES = {"server_status", "online_players", "search_modpacks", "get_mo
 ADMIN_READ_TOOL_NAMES = {"read_server_console"}
 WRITE_TOOL_NAMES = {"request_amp_action"}
 STATUS_WRITE_TOOL_NAMES = {"add_status_line"}
+# Tools whose results carry third-party text (web pages, wiki pages, mod
+# descriptions). Once one has run, the rest of the request counts as untrusted.
+EXTERNAL_CONTENT_TOOL_NAMES = {"web_search", "search_community_docs", "search_modpacks", "get_modpack",
+                               "query_modpack_index", "check_modpack_contains_mod"}
 
 TOOL_DEFINITIONS = [
     {
@@ -344,14 +348,50 @@ class LLMToolRuntime:
         self.allow_conversation_control = not getattr(message, "_standalone_ask", False)
         self.allow_status_write = bool(getattr(message, "_status_request", False))
         self.status_added: str | None = None
+        # Why administrator tools are withheld for this request, if they are.
+        self.untrusted_reasons: set[str] = set()
+
+    def note_context_message(self, item: Any, *, bot_user_id: int | None, game_chat: bool) -> None:
+        """Record who wrote a message the model will see in this request."""
+        if game_chat:
+            self.untrusted_reasons.add("relayed game chat")
+        elif getattr(getattr(item, "author", None), "id", None) == bot_user_id:
+            return
+        elif not is_administrator(getattr(item, "author", None)):
+            self.untrusted_reasons.add("messages from non-administrators")
+
+    @property
+    def requester_is_admin(self) -> bool:
+        return is_administrator(self.message.author)
 
     @property
     def actor_is_admin(self) -> bool:
-        # This is only used to decide which schema the model sees. Confirmation performs
-        # a fresh REST fetch and checks again; this cached object never authorizes a write.
-        return is_administrator(self.message.author)
+        # Administrator tools need an administrator requester AND a context nobody
+        # else could have written into: other people's messages, relayed game chat
+        # or third-party tool results could carry prompt injection that would
+        # otherwise borrow the administrator's privileges. This decides which schema
+        # the model sees and gates execution; AMP confirmations still re-check
+        # permissions with a fresh REST fetch.
+        return self.requester_is_admin and not self.untrusted_reasons
+
+    def _denied_elevated(self, what: str) -> dict:
+        if self.requester_is_admin and self.untrusted_reasons:
+            reasons = " and ".join(sorted(self.untrusted_reasons))
+            log.info("LLM %s withheld for an administrator: guild=%s user=%s reasons=%s", what,
+                     getattr(self.message.guild, "id", None), self.message.author.id, reasons)
+            return {"error": (f"Withheld: administrator tools are unavailable because this request includes "
+                              f"{reasons}. Ask again in a channel where only administrators are talking.")}
+        log.warning("LLM %s permission denied: guild=%s user=%s", what,
+                    getattr(self.message.guild, "id", None), self.message.author.id)
+        return {"error": "Denied: Discord Administrator permission is required"}
 
     async def execute(self, name: str, arguments: Any) -> str:
+        result = await self._execute_tool(name, arguments)
+        if name in EXTERNAL_CONTENT_TOOL_NAMES:
+            self.untrusted_reasons.add(f"{name} results")
+        return result
+
+    async def _execute_tool(self, name: str, arguments: Any) -> str:
         self.tool_calls += 1
         try:
             args = arguments if isinstance(arguments, dict) else json.loads(arguments or "{}")
@@ -754,6 +794,9 @@ class LLMToolRuntime:
             if console.get("error"): result["limits"].append(f"Console evidence unavailable: {console['error']}")
             elif not console.get("entries"): result["limits"].append("No recent console entries were captured; do not claim the console was inspected for an earlier incident.")
             else: result["source"] += " and recent redacted AMP console history"
+        elif self.requester_is_admin and len(servers) == 1:
+            # Say so explicitly, so the model never implies it inspected the console.
+            result["limits"].append(self._denied_elevated("console evidence")["error"])
         return result
 
     @staticmethod
@@ -764,9 +807,7 @@ class LLMToolRuntime:
         # Console output can contain private operational data. Authorization is
         # enforced here in ordinary code; model output alone can never bypass it.
         if not self.actor_is_admin:
-            log.warning("LLM console permission denied: guild=%s user=%s",
-                        getattr(self.message.guild, "id", None), self.message.author.id)
-            return {"error": "Denied: Discord Administrator permission is required"}
+            return self._denied_elevated("console access")
         requested = self._server_key(str(args.get("server", ""))[:100])
         if not requested:
             return {"error": "A public server name is required"}
@@ -829,9 +870,7 @@ class LLMToolRuntime:
     async def _request_amp_action(self, args):
         # Hard authorization gate in ordinary code, independent of model instructions.
         if not self.actor_is_admin:
-            log.warning("LLM AMP permission denied at request: guild=%s user=%s",
-                        self.message.guild.id, self.message.author.id)
-            return {"error": "Denied: Discord Administrator permission is required"}
+            return self._denied_elevated("AMP action")
         action = str(args.get("action", "")).lower()
         requested = str(args.get("server", "")).strip()
         reason = str(args.get("reason", "")).strip()[:200]
