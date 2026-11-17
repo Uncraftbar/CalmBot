@@ -14,6 +14,7 @@ import discord
 from discord.ext import commands
 
 from cogs.utils import setup_logging, get_logger
+import amp_http
 
 # =============================================================================
 # CONFIGURATION
@@ -125,8 +126,13 @@ class CalmBot(commands.Bot):
     
     async def setup_hook(self):
         """Called when the bot is starting up."""
+        amp_http.install()  # before any cog talks to AMP
         await self._load_cogs()
         await self._sync_commands()
+
+    async def close(self):
+        await super().close()
+        await amp_http.close()
     
     async def _load_cogs(self):
         """Load all cogs from the cogs directory."""

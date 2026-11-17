@@ -29,6 +29,7 @@ from cogs.utils import (
     admin_only,
     check_permissions,
     fetch_valid_instances,
+    get_player_data,
     info_embed,
     success_embed,
     error_embed,
@@ -36,6 +37,18 @@ from cogs.utils import (
 )
 
 log = get_logger("bridge")
+
+# Console polling cadence per bridged server, in seconds. AMP's player count is
+# unreliable (especially on modded servers), so it may only speed polling up:
+# no server is ever left unpolled. Quiet servers are still polled, just slowly,
+# and AMP's per-session cursor keeps every console line in between.
+POLL_ACTIVE_SECONDS = 3.0         # player chat/join/leave/death seen recently
+POLL_PLAYERS_HINT_SECONDS = 10.0  # AMP reports players (or no count), nothing seen yet
+POLL_QUIET_SECONDS = 30.0         # no sign of players
+POLL_COMMAND_SECONDS = 0.75       # a command is waiting for its console output
+POLL_MAX_BACKOFF_SECONDS = 60.0   # ceiling for servers whose polls keep failing
+ACTIVITY_WINDOW_SECONDS = 600.0   # stay at the active cadence this long after activity
+INSTANCE_RECHECK_SECONDS = 120.0  # min gap between instance re-lists (stopped/failing servers)
 
 class ChatBridge(commands.Cog):
     def __init__(self, bot):
@@ -77,6 +90,11 @@ class ChatBridge(commands.Cog):
         self.ws_drop_counts = {}
         self.ws_drop_last_log = {}
         self.last_fallback_poll = {}
+        # Adaptive console polling (see the POLL_* constants).
+        self.last_player_activity = {}  # name -> timestamp of the last player event seen in the console
+        self.amp_player_counts = {}     # name -> AMP's (unreliable) player count from the latest poll
+        self.instance_running = {}      # name -> whether AMP reports the instance as running
+        self.poll_modes = {}            # name -> current polling mode, for change logging
         self.ws_base_url = self._make_ws_base_url(self.amp_url)
         self.ws_alerted = set()
         self.ws_disconnect_since = {}
@@ -331,28 +349,71 @@ class ChatBridge(commands.Cog):
                 self.console_listeners.remove(listener)
 
     async def _refresh_instances(self):
+        # Stamp the attempt, not just success, so an unreachable panel is not
+        # re-listed on every 0.25 s loop tick.
+        self.last_instance_refresh = datetime.now(timezone.utc)
         try:
             fetched_instances = await fetch_valid_instances()
-            
+
             if not fetched_instances:
                 log.debug("No instances returned from API")
                 return
 
+            previous_running = self.instance_running
             self.instances = {}
+            self.instance_running = {}
             for inst in fetched_instances:
                 name = inst.friendly_name or inst.instance_name
                 self.instances[name] = inst
-            self.last_instance_refresh = datetime.now(timezone.utc)
+                self.instance_running[name] = bool(getattr(inst, "running", True))
             self.failure_counts.clear()
-            log.info(f"Refreshed {len(self.instances)} AMP instance(s)")
-            
+            log_refresh = log.info if self.instance_running != previous_running else log.debug
+            log_refresh(f"Refreshed {len(self.instances)} AMP instance(s)")
+            for name in sorted(self._bridged_server_names()):
+                running = self.instance_running.get(name)
+                if running is not None and running != previous_running.get(name, True):
+                    log.info("AMP instance %s is %s", name,
+                             "running again; resuming console polling" if running
+                             else "stopped; pausing console polling")
+
         except Exception as e:
             log.error(f"Error refreshing instances: {e}")
+
+    def _bridged_server_names(self):
+        return {name for group in self.bridge_data.get("groups", {}).values()
+                if group.get("active", True) for name in group.get("servers", [])}
+
+    def _poll_interval(self, name, now_ts):
+        """Seconds between console polls for one server, by how likely chat is right now."""
+        failures = self.failure_counts.get(name, 0)
+        if failures < 3 and any(listener.get("source") == name for listener in self.console_listeners):
+            return POLL_COMMAND_SECONDS  # a command is waiting for its console output
+        if now_ts - self.last_player_activity.get(name, 0.0) < ACTIVITY_WINDOW_SECONDS:
+            mode, interval = "active", POLL_ACTIVE_SECONDS
+        elif name not in self.amp_player_counts:
+            mode, interval = None, POLL_ACTIVE_SECONDS  # no successful poll yet
+        elif self.amp_player_counts[name] != 0:
+            # AMP reports players, or no count at all. Its count is wrong at times
+            # in both directions, so it only earns a middle cadence.
+            mode, interval = "players reported", POLL_PLAYERS_HINT_SECONDS
+        else:
+            mode, interval = "quiet", POLL_QUIET_SECONDS
+        if mode and self.poll_modes.get(name) != mode:
+            log.info("Console polling for %s: %s -> %s (every %.0fs; AMP reports %s player(s))",
+                     name, self.poll_modes.get(name, "startup"), mode, interval,
+                     self.amp_player_counts.get(name, "?"))
+            self.poll_modes[name] = mode
+        if failures:
+            backoff = POLL_ACTIVE_SECONDS * 2 ** min(failures - 1, 6)
+            interval = max(interval, min(POLL_MAX_BACKOFF_SECONDS, backoff))
+        return interval
 
     async def _fetch_update_safe(self, name, instance):
         try:
             updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=10.0)
             self.failure_counts.pop(name, None)
+            # A polling hint only; see _poll_interval.
+            self.amp_player_counts[name] = get_player_data(getattr(updates, "status", None))[1]
             return name, updates
         except asyncio.TimeoutError:
             self.failure_counts[name] = self.failure_counts.get(name, 0) + 1
@@ -1303,17 +1364,20 @@ class ChatBridge(commands.Cog):
                 updates_map[name] = SimpleNamespace(console_entries=entries)
 
         now = datetime.now(timezone.utc)
+        now_ts = now.timestamp()
         # AMP's event stream carries metrics reliably, but current AMP versions do
         # not emit ConsoleEntry events on every game instance. Core/GetUpdates is
         # the authoritative per-session console feed, so poll it even while the
         # socket is connected. Treating a metrics-only socket as a complete chat
         # feed silently drops all Minecraft -> Discord messages.
+        # Each server is polled at its own cadence (see _poll_interval): fast while
+        # players are active, slowly while it looks empty, never not at all.
         console_polls = []
         for name, instance in active_instances.items():
-            last = self.last_fallback_poll.get(name, 0.0)
-            interval = 0.75
-            if now.timestamp() - last >= interval:
-                self.last_fallback_poll[name] = now.timestamp()
+            if self.instance_running.get(name) is False:
+                continue  # stopped in AMP; the instance re-list below notices when it is back
+            if now_ts - self.last_fallback_poll.get(name, 0.0) >= self._poll_interval(name, now_ts):
+                self.last_fallback_poll[name] = now_ts
                 console_polls.append(self._fetch_update_safe(name, instance))
         if console_polls:
             for name, updates in await asyncio.gather(*console_polls):
@@ -1324,8 +1388,11 @@ class ChatBridge(commands.Cog):
                     else:
                         updates_map[name] = updates
 
-        # AMP handles go stale after instance restarts; periodically reacquire them.
-        if any(count >= 3 for count in self.failure_counts.values()) and (now - self.last_instance_refresh).total_seconds() >= 60:
+        # AMP handles go stale after instance restarts, and stopped instances need
+        # re-checking to notice when they are back. Re-list instances, rate-limited.
+        needs_refresh = any(count >= 3 for count in self.failure_counts.values()) or any(
+            self.instance_running.get(name) is False for name in active_instances)
+        if needs_refresh and (now - self.last_instance_refresh).total_seconds() >= INSTANCE_RECHECK_SECONDS:
             for task in self.ws_tasks.values():
                 task.cancel()
             self.ws_tasks.clear()
@@ -1410,6 +1477,9 @@ class ChatBridge(commands.Cog):
                 # as an event merely because somebody typed "joined the game".
                 event_kind = None if "chat" in msg_type else self._classify_server_event(msg)
                 if event_kind:
+                    # Joins, leaves, deaths and advancements prove players are on,
+                    # whatever AMP's player count says.
+                    self.last_player_activity[source_name] = now_ts
                     for group_name, group_data in self.bridge_data.get("groups", {}).items():
                         enabled = group_data.get("events", {})
                         if source_name in group_data.get("servers", []) and enabled.get(event_kind, False):
@@ -1459,6 +1529,7 @@ class ChatBridge(commands.Cog):
             
             if valid_new:
                 new_messages_per_server[source_name] = valid_new
+                self.last_player_activity[source_name] = now_ts
 
         # 3.5 Intercept Commands
         for source_name, messages in list(new_messages_per_server.items()):

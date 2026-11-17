@@ -392,9 +392,12 @@ async def fetch_valid_instances(*, strict: bool = False) -> list:
     try:
         ads = AMPControllerInstance()
         
-        # Force session clear to prevent server-side caching
+        # Use a fresh controller session for the instance list (guards against
+        # server-side caching). Drop only the controller's own session: the
+        # per-instance sessions hold the chat bridge's console cursors, and
+        # wiping them forced a re-login for every bridged server on each call.
         if hasattr(ads, '_bridge') and hasattr(ads._bridge, '_sessions'):
-            ads._bridge._sessions.clear()
+            ads._bridge._sessions.pop(ads.instance_id, None)
 
         fetched_instances = await ads.get_instances(format_data=True)
         
