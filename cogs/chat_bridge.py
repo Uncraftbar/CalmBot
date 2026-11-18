@@ -39,8 +39,20 @@ log = get_logger("bridge")
 
 # Console polling cadence per bridged server, in seconds. AMP's player count is
 # unreliable (especially on modded servers), so it may only speed polling up:
-# no server is ever left unpolled. Quiet servers are still polled, just slowly,
-# and AMP's per-session cursor keeps every console line in between.
+# no server is ever left unpolled. Quiet servers are still polled, just slowly.
+#
+# AMP does NOT keep every console line between polls: Core/GetUpdates returns
+# only the newest AMP_CONSOLE_WINDOW lines since the previous call and silently
+# drops older ones (measured on this panel, Nov 2026). Busy modded consoles (mod
+# error spam, per-dimension TPS reports) print that much in well under 30 s, so
+# each server's cadence also follows its own console volume (_note_console_volume).
+AMP_CONSOLE_WINDOW = 40
+CONSOLE_LINE_BUDGET = 15.0        # lines per poll to aim for, leaving room for bursts
+CONSOLE_RATE_SMOOTHING = 0.25     # weight of the newest sample in the lines/s estimate
+POLL_MIN_SECONDS = 1.5            # fastest cadence a busy console can demand
+OVERFLOW_LOG_SECONDS = 3600.0     # report dropped console lines at most this often per server
+CONSOLE_DENIED_RETRY_SECONDS = 600.0  # retry an instance whose console AMP refused this often
+CONSOLE_DENIED_LOG_SECONDS = 3600.0
 POLL_ACTIVE_SECONDS = 3.0         # player chat/join/leave/death seen recently
 POLL_PLAYERS_HINT_SECONDS = 10.0  # AMP reports players (or no count), nothing seen yet
 POLL_QUIET_SECONDS = 30.0         # no sign of players
@@ -54,6 +66,12 @@ INSTANCE_LIST_TIMEOUT_SECONDS = 20.0
 
 # A line in the bridge's own relay format, "[Server] <Player> text", echoed back.
 RELAY_ECHO_RE = re.compile(r"^\[[^\]]{1,64}\] <[^>]{1,64}> ")
+# Chat that AMP did not tag as chat, read from the console text instead. Both must
+# start the line, so stack traces and mod output cannot match.
+# Comp mode (per server): "<[Rank]: Name> text" or "<[Rank] Name> text".
+COMP_CHAT_RE = re.compile(r"^(?:\[Not Secure\]: )?<\[.+?\](?: |: )(.+?)> (.+)$")
+# Any server: plain vanilla "<Name> text", optionally "[Not Secure] " first.
+UNTAGGED_CHAT_RE = re.compile(r"^(?:\[Not Secure\]:? )?<([A-Za-z0-9_.*]{1,20})> (.+)$")
 # IPv6 addresses (optionally bracketed, zoned or with a port), but not clock times
 # such as 12:34:56: require "::" or at least four hex groups.
 IPV6_RE = re.compile(r"(?<![\w:.])\[?(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){4})"
@@ -99,6 +117,12 @@ class ChatBridge(commands.Cog):
         self.amp_player_counts = {}     # name -> AMP's (unreliable) player count from the latest poll
         self.instance_running = {}      # name -> whether AMP reports the instance as running
         self.poll_modes = {}            # name -> current polling mode, for change logging
+        self.console_rates = {}         # name -> estimated console lines per second
+        self._console_overflows = {}    # name -> dropped-line incidents since the last report
+        self._last_overflow_log = {}    # name -> when dropped lines were last reported
+        self.console_denied = {}        # name -> when AMP last refused CalmBot that console
+        self._untagged_chat_servers = set()  # servers whose chat AMP has left untagged
+        self._last_denied_log = {}
         self._last_sync_error_log = 0.0
         self.last_health_alert = {}
         self.send_failed = set()
@@ -303,22 +327,63 @@ class ChatBridge(commands.Cog):
             mode, interval = "players reported", POLL_PLAYERS_HINT_SECONDS
         else:
             mode, interval = "quiet", POLL_QUIET_SECONDS
+        rate = self.console_rates.get(name, 0.0)
+        if rate > 0:
+            # Collect at most ~CONSOLE_LINE_BUDGET lines per poll, so AMP's 40-line
+            # window does not overflow and drop chat, whatever the mode says.
+            interval = min(interval, max(POLL_MIN_SECONDS, CONSOLE_LINE_BUDGET / rate))
         if mode and self.poll_modes.get(name) != mode:
-            log.info("Console polling for %s: %s -> %s (every %.0fs; AMP reports %s player(s))",
+            log.info("Console polling for %s: %s -> %s (every %.1fs; AMP reports %s player(s); "
+                     "console ~%.1f lines/s)",
                      name, self.poll_modes.get(name, "startup"), mode, interval,
-                     self.amp_player_counts.get(name, "?"))
+                     self.amp_player_counts.get(name, "?"), rate)
             self.poll_modes[name] = mode
         if failures:
             backoff = POLL_ACTIVE_SECONDS * 2 ** min(failures - 1, 6)
             interval = max(interval, min(POLL_MAX_BACKOFF_SECONDS, backoff))
         return interval
 
-    async def _fetch_update_safe(self, name, instance):
+    @staticmethod
+    def _amp_session_id(instance):
+        """The cc-ampapi session id this instance's calls use, if known."""
+        sessions = getattr(getattr(instance, "_bridge", None), "_sessions", None)
+        if not isinstance(sessions, dict):
+            return None
+        return getattr(sessions.get(getattr(instance, "instance_id", None)), "id", None)
+
+    def _note_console_volume(self, name, lines, elapsed):
+        """Track a console's lines per second, and notice when AMP dropped lines."""
+        if elapsed is None or elapsed < 1.0:
+            return  # a session's first batch is old backlog; back-to-back polls are noise
+        sample = lines / elapsed
+        previous = self.console_rates.get(name)
+        if lines < AMP_CONSOLE_WINDOW:
+            self.console_rates[name] = sample if previous is None else (
+                previous + CONSOLE_RATE_SMOOTHING * (sample - previous))
+            return
+        # The window overflowed: AMP dropped the older lines, so the real rate was
+        # higher than measured. Speed up at once and say so (chat may be lost).
+        self.console_rates[name] = max(previous or 0.0, 2 * sample)
+        self._console_overflows[name] = self._console_overflows.get(name, 0) + 1
+        now = time.monotonic()
+        if now - self._last_overflow_log.get(name, -OVERFLOW_LOG_SECONDS) >= OVERFLOW_LOG_SECONDS:
+            log.warning("AMP dropped console lines for %s (%d time(s) since the last report): more than %d "
+                        "arrived between two polls (%.0fs apart), so chat among them was lost. Polling it "
+                        "faster; a quieter console (fewer errors/TPS reports) avoids this.",
+                        name, self._console_overflows[name], AMP_CONSOLE_WINDOW, elapsed)
+            self._last_overflow_log[name] = now
+            self._console_overflows[name] = 0
+
+    async def _fetch_update_safe(self, name, instance, elapsed=None):
         try:
+            session_before = self._amp_session_id(instance)
             updates = await asyncio.wait_for(instance.get_updates(format_data=True), timeout=10.0)
             self.failure_counts.pop(name, None)
             # A polling hint only; see _poll_interval.
             self.amp_player_counts[name] = get_player_data(getattr(updates, "status", None))[1]
+            if self._amp_session_id(instance) != session_before:
+                elapsed = None  # logged in anew: this batch is the new session's backlog
+            self._note_console_volume(name, len(getattr(updates, "console_entries", None) or ()), elapsed)
             return name, updates
         except asyncio.TimeoutError:
             self.failure_counts[name] = self.failure_counts.get(name, 0) + 1
@@ -1281,9 +1346,11 @@ class ChatBridge(commands.Cog):
         for name, instance in active_instances.items():
             if self.instance_running.get(name) is False:
                 continue  # stopped in AMP; the instance re-list above notices when it is back
-            if now_ts - self.last_console_poll.get(name, 0.0) >= self._poll_interval(name, now_ts):
+            previous_poll = self.last_console_poll.get(name)
+            if now_ts - (previous_poll or 0.0) >= self._poll_interval(name, now_ts):
                 self.last_console_poll[name] = now_ts
-                console_polls.append(self._fetch_update_safe(name, instance))
+                elapsed = now_ts - previous_poll if previous_poll is not None else None
+                console_polls.append(self._fetch_update_safe(name, instance, elapsed))
         if console_polls:
             for name, updates in await asyncio.gather(*console_polls):
                 if updates and getattr(updates, "console_entries", None):
@@ -1363,9 +1430,25 @@ class ChatBridge(commands.Cog):
                 entry_source = str(getattr(entry, 'source', ''))
                 if not entry_source or not msg: continue
 
+                is_chat = "chat" in msg_type
+                is_info = "info" in msg_type or "info" in entry_source.lower()
+                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
+                console_chat = None
+                if not is_chat and is_info:
+                    # AMP tags chat inconsistently on modded servers: read chat-shaped
+                    # INFO lines from the console text too.
+                    if settings.get("comp_mode", False):
+                        console_chat = COMP_CHAT_RE.match(msg)
+                    if console_chat is None:
+                        console_chat = UNTAGGED_CHAT_RE.match(msg)
+                        if console_chat and source_name not in self._untagged_chat_servers:
+                            self._untagged_chat_servers.add(source_name)
+                            log.info("AMP is not tagging chat from %s as chat; reading it from the console "
+                                     "text instead", source_name)
+
                 # Optional low-noise server event relay. Never classify actual player chat
-                # as an event merely because somebody typed "joined the game".
-                event_kind = None if "chat" in msg_type else self._classify_server_event(msg)
+                # as an event merely because somebody typed "joined the game" or "I fell".
+                event_kind = None if is_chat or console_chat else self._classify_server_event(msg)
                 if event_kind:
                     # Joins, leaves, deaths and advancements prove players are on,
                     # whatever AMP's player count says.
@@ -1380,29 +1463,12 @@ class ChatBridge(commands.Cog):
                             break
                     continue
 
-                # Check Comp Mode
-                settings = self.bridge_data.get("instance_settings", {}).get(source_name, {})
-                comp_mode = settings.get("comp_mode", False)
-                
-                is_chat = "chat" in msg_type
-                is_info = "info" in msg_type or "info" in entry_source.lower()
-
-                if not is_chat:
-                    if comp_mode and is_info:
-                        # Regex check for specific format: <[title]: username> message
-                        # Example: <[Member]: Player1> Hello World
-                        # Also supports optional "[Not Secure]: " prefix
-                        # Support both "<[Rank]: Name>" and "<[Rank] Name>"
-                        match = re.match(r"^(?:\[Not Secure\]: )?<\[.+?\](?: |: )(.+?)> (.+)$", msg)
-                        if match:
-                            user = match.group(1)
-                            msg = match.group(2)
-                        else:
-                            continue # Info message didn't match pattern
-                    else:
-                        continue # Not chat, and not (comp_mode + info)
-                else:
+                if is_chat:
                     user = entry_source
+                elif console_chat:
+                    user, msg = console_chat.group(1), console_chat.group(2)
+                else:
+                    continue  # ordinary console output
 
                 # Skip echoes of the bridge's own "[Server] <Player> text" relays. Other
                 # bracketed chat ("[AFK] brb") is real player chat and is kept.
@@ -1630,13 +1696,27 @@ class ChatBridge(commands.Cog):
         except asyncio.CancelledError:
             raise
 
+    def _note_console_denied(self, target_name, error):
+        now = time.monotonic()
+        self.console_denied[target_name] = now
+        if now - self._last_denied_log.get(target_name, -CONSOLE_DENIED_LOG_SECONDS) >= CONSOLE_DENIED_LOG_SECONDS:
+            self._last_denied_log[target_name] = now
+            log.warning("AMP refused CalmBot's bridge message to %s twice, the second time on a fresh login "
+                        "(%s). CalmBot's AMP account lacks console permission on that instance; until an AMP "
+                        "admin grants it, bridge messages to it are dropped. Retrying every %.0f min.",
+                        target_name, error, CONSOLE_DENIED_RETRY_SECONDS / 60)
+
     async def _send_message_safe(self, target, cmd, target_name):
         # Serialize each target and retry one transient AMP failure.
+        denied_at = self.console_denied.get(target_name)
+        if denied_at is not None and time.monotonic() - denied_at < CONSOLE_DENIED_RETRY_SECONDS:
+            return False  # AMP refused this console moments ago; see _note_console_denied
         lock = self.send_locks.setdefault(("amp", target_name), asyncio.Lock())
         async with lock:
             for attempt in range(1, 3):
                 try:
                     await asyncio.wait_for(target.send_console_message(cmd), timeout=15.0)
+                    self.console_denied.pop(target_name, None)
                     if target_name in self.send_failed:
                         self.send_failed.discard(target_name)
                         asyncio.create_task(self._send_health_alert(
@@ -1645,7 +1725,12 @@ class ChatBridge(commands.Cog):
                     return True
                 except Exception as e:
                     if attempt == 2:
-                        log.warning(f"Failed to send message to {target_name} after {attempt} attempts: {e}")
+                        if isinstance(e, PermissionError):
+                            # cc-ampapi re-logs in after a refusal, so this was refused
+                            # on a fresh session too: a missing AMP permission.
+                            self._note_console_denied(target_name, e)
+                        else:
+                            log.warning(f"Failed to send message to {target_name} after {attempt} attempts: {e}")
                         if target_name not in self.send_failed:
                             self.send_failed.add(target_name)
                             asyncio.create_task(self._send_health_alert(

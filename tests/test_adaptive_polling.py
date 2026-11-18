@@ -22,6 +22,7 @@ def make_bridge(**state):
     bridge.last_player_activity = {}
     bridge.amp_player_counts = {}
     bridge.poll_modes = {}
+    bridge.console_rates = {}
     for name, value in state.items():
         setattr(bridge, name, value)
     return bridge
